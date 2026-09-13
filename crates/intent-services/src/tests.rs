@@ -176,6 +176,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
+        membership: None,
     }
 }
 
@@ -1201,6 +1202,7 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
         if row.archived {
             row.agent_summary = None;
         }
+        svc.attach_workspace_membership(row).await;
     }
 
     let actual = svc.list_workspaces(true).await.unwrap();
@@ -26669,6 +26671,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Create a mock agent session with sandbox fields
@@ -26816,6 +26819,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -26954,6 +26958,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -27087,6 +27092,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         let agent_session = intent_core::AgentSession {
@@ -27219,6 +27225,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -27356,6 +27363,7 @@ mod rules {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -28216,6 +28224,7 @@ mod known_repo {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 

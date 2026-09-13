@@ -12705,6 +12705,7 @@ mod role_reminder_tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
         }
     }
 
@@ -16090,6 +16091,7 @@ mod agent_retry_tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            membership: None,
             task_stats: None,
         }
     }
