@@ -7543,6 +7543,7 @@ mod wsapi3_bindings_tests {
                     note_id,
                     status: parsed,
                     note,
+                    advisory: None,
                 })
             })
         }
