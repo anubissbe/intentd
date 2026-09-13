@@ -2149,6 +2149,78 @@ mod tests {
             path
         }
 
+        /// `run_behavior` for a stub child that stays alive until the test
+        /// calls [`release_stub_child`] — a crash at a moment the TEST picks
+        /// (after startup completed) instead of a fixed wall-clock lifetime,
+        /// which scheduling delays under suite load could consume before
+        /// `ensure_endpoint` even finished probing (intent-hq/intent#4885).
+        /// A release is one-shot: the child consumes the flag on its way
+        /// out, so a respawned child from the same stub waits for its own.
+        fn run_until_released(dir: &Path) -> String {
+            let flag = release_flag(dir);
+            format!(
+                "while [ ! -e '{flag}' ]; do sleep 0.02; done; rm -f '{flag}'",
+                flag = flag.display()
+            )
+        }
+
+        fn release_flag(dir: &Path) -> PathBuf {
+            dir.join("release-stub-child")
+        }
+
+        /// Let a [`run_until_released`] stub child exit. The caller still has
+        /// to synchronize on the exit itself (e.g. [`wait_for_child_exit`] or
+        /// a blocking `waitpid`).
+        fn release_stub_child(dir: &Path) {
+            std::fs::write(release_flag(dir), b"").expect("release stub child");
+        }
+
+        /// Block until the manager's owned child has exited, as observed
+        /// through the same `try_wait` probe `ensure_endpoint` uses to
+        /// notice a dead child.
+        async fn wait_for_child_exit(mgr: &UnslothServerManager) {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let alive = mgr
+                        .state
+                        .lock()
+                        .await
+                        .as_mut()
+                        .is_some_and(ManagedServer::is_alive);
+                    if !alive {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("stub child exits after release");
+        }
+
+        /// Reap `pid` directly (the test process is its true OS parent) once
+        /// it exits — bounded `WNOHANG` polling, so a broken release
+        /// handshake fails with a diagnosable message instead of hanging
+        /// until nextest kills the test.
+        async fn reap_stub_child(pid: u32) {
+            use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+            let pid = nix::unistd::Pid::from_raw(pid.cast_signed());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => return,
+                    Ok(WaitStatus::StillAlive) => {}
+                    Ok(other) => panic!("unexpected stub child wait status: {other:?}"),
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => panic!("waitpid on stub child failed: {e}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "stub child did not exit within 30s of release"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
         /// Stub Hugging Face API on an ephemeral loopback port: answers every
         /// request with 200 + `body` and counts hits (for cache assertions).
         async fn spawn_stub_hf(body: &'static str) -> (u16, Arc<AtomicUsize>) {
@@ -2502,9 +2574,14 @@ mod tests {
         async fn dead_child_respawn_does_not_warn_even_with_live_agents() {
             let dir = tempfile::tempdir().expect("tempdir");
             let port = spawn_stub_http("sk-unsloth-test-key").await;
-            // `run` exits shortly after startup completes, standing in for a
-            // server that crashed while agents were attached.
-            let binary = write_stub_binary(dir.path(), dir.path(), port, Some("sleep 0.3"));
+            // `run` exits once released after startup completes, standing in
+            // for a server that crashed while agents were attached.
+            let binary = write_stub_binary(
+                dir.path(),
+                dir.path(),
+                port,
+                Some(&run_until_released(dir.path())),
+            );
             let mgr = UnslothServerManager::with_config(test_config(
                 binary,
                 dir.path().to_path_buf(),
@@ -2514,8 +2591,8 @@ mod tests {
             mgr.ensure_endpoint(REPO, None, 1, &|_, _| {})
                 .await
                 .expect("cold start");
-            // Wait for the stubbed server child to exit.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            release_stub_child(dir.path());
+            wait_for_child_exit(&mgr).await;
 
             let messages: Arc<Mutex<Vec<(StatusLevel, String)>>> = Arc::new(Mutex::new(Vec::new()));
             let m2 = messages.clone();
@@ -2861,9 +2938,15 @@ mod tests {
             // relying on a race with the kernel's own reaping.)
             let dir = tempfile::tempdir().expect("tempdir");
             let port = spawn_stub_http("sk-unsloth-test-key").await;
-            // `run` exits shortly after startup completes, standing in for a
-            // server that crashes post-ready without the daemon noticing yet.
-            let binary = write_stub_binary(dir.path(), dir.path(), port, Some("sleep 0.3"));
+            // `run` exits once released after startup completes, standing in
+            // for a server that crashes post-ready without the daemon
+            // noticing yet.
+            let binary = write_stub_binary(
+                dir.path(),
+                dir.path(),
+                port,
+                Some(&run_until_released(dir.path())),
+            );
             let mgr = UnslothServerManager::with_config(test_config(
                 binary,
                 dir.path().to_path_buf(),
@@ -2878,10 +2961,12 @@ mod tests {
                 .and_then(|s| s.pid)
                 .expect("pid while running");
 
-            // Reap the child directly (this test process is its true OS
-            // parent), forcing the terminal "exited and reaped" state that a
-            // signal-0 probe can actually observe.
-            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid.cast_signed()), None);
+            // Let the child exit, then reap it directly (this test process is
+            // its true OS parent; the reap is the exit synchronization),
+            // forcing the terminal "exited and reaped" state that a signal-0
+            // probe can actually observe.
+            release_stub_child(dir.path());
+            reap_stub_child(pid).await;
 
             assert!(
                 mgr.status_snapshot().await.is_none(),
