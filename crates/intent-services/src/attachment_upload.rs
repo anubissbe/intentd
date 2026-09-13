@@ -20,11 +20,12 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use intent_core::{Error, Result, WorkspaceId};
 use sha2::Digest as _;
+use tokio::time::Instant;
 
 use crate::Services;
 
@@ -81,7 +82,10 @@ pub(crate) struct AttachmentUploadSession {
     pub committing: bool,
     /// Last begin/chunk/commit activity — the idle-TTL clock. A committing
     /// session never expires (the flag guards it), and a failed commit
-    /// refreshes the clock so the retry window restarts.
+    /// refreshes the clock so the retry window restarts. A
+    /// [`tokio::time::Instant`] — identical to `std::time::Instant` in
+    /// production — so expiry tests can age a session with the paused runtime
+    /// clock instead of the wall clock.
     pub last_activity: Instant,
     /// Client-minted idempotency key from `begin` (intent-hq/intent#4691),
     /// bound at commit like a keyed `file.placeAttachment`.
@@ -1597,12 +1601,18 @@ mod tests {
     /// Regression (#1841 review): a keyed `begin` replay is activity. A
     /// session idle just under the TTL that is replayed must not be swept
     /// by the caller's very next op — the replay refreshes `last_activity`.
+    ///
+    /// Idle time is synthesized by advancing the paused runtime clock
+    /// (intent-hq/intent#4880): the replayed `begin` awaits the store before
+    /// its sweep reads `last_activity`, so a wall-clock backdate to "just
+    /// inside" a millisecond TTL expired the session under package load.
     #[tokio::test]
     async fn keyed_begin_replay_refreshes_last_activity() {
         let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
             "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
-            "100",
+            "3600000",
         )]);
+        let ttl = super::attachment_upload_idle_ttl();
         let ws = WorkspaceId("ws-up-keyed-refresh".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
@@ -1623,15 +1633,13 @@ mod tests {
             .await
             .expect("keyed begin");
         let upload_id = first["uploadId"].as_str().unwrap().to_string();
-        // Backdate to just inside the TTL: still live for the replay's
-        // sweep, but expired by the next op unless the replay refreshes.
-        {
-            let mut uploads = svc.attachment_uploads.lock().unwrap();
-            let session = uploads.get_mut(&upload_id).unwrap();
-            session.last_activity = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis(80))
-                .expect("backdate");
-        }
+        // Idle to just inside the TTL: still live for the replay's sweep,
+        // but expired by the next op's jump below unless the replay
+        // refreshes. The clock is handed back before each service call (the
+        // store's pool-acquire timeouts are tokio timers).
+        tokio::time::pause();
+        tokio::time::advance(ttl * 3 / 4).await;
+        tokio::time::resume();
         let again = svc
             .file_attachment_upload_begin_op(
                 ws.clone(),
@@ -1653,11 +1661,13 @@ mod tests {
             .expect("session still live")
             .last_activity
             .elapsed();
-        assert!(
-            idle < std::time::Duration::from_millis(50),
-            "not refreshed: {idle:?}"
-        );
+        assert!(idle < ttl / 4, "not refreshed: {idle:?}");
 
+        // Total idle since the original begin is now past the TTL; only the
+        // refreshed clock keeps the next op from sweeping the session.
+        tokio::time::pause();
+        tokio::time::advance(ttl / 2).await;
+        tokio::time::resume();
         svc.file_attachment_upload_chunk_op(upload_id.clone(), 0, b64(&payload))
             .await
             .expect("chunk after replay");
@@ -2083,7 +2093,7 @@ mod tests {
                 declared_sha256: "a".repeat(64),
                 chunk_sizes: std::collections::HashMap::new(),
                 committing: false,
-                last_activity: std::time::Instant::now(),
+                last_activity: tokio::time::Instant::now(),
                 idempotency_key: None,
             },
         );
@@ -2150,14 +2160,20 @@ mod tests {
 
     /// Regression (monorepo#2275): a session idle past the TTL is dropped —
     /// its staging dir swept — and subsequent chunk/commit calls get a clear
-    /// caller error instead of operating on reclaimed state. The TTL is
-    /// pinned tiny via the `INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS` seam.
+    /// caller error instead of operating on reclaimed state.
+    ///
+    /// The TTL is pinned generous via the `INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS`
+    /// seam and the idle period is synthesized by advancing the paused
+    /// runtime clock (intent-hq/intent#4880): with a millisecond TTL on the
+    /// wall clock, a stall between `begin` and the first `chunk` expired the
+    /// session before the test reached the expiry step.
     #[tokio::test]
     async fn idle_session_expires_and_subsequent_ops_fail_cleanly() {
         let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
             "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
-            "50",
+            "3600000",
         )]);
+        let ttl = super::attachment_upload_idle_ttl();
         let ws = WorkspaceId("ws-up-ttl".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
@@ -2174,7 +2190,12 @@ mod tests {
             .join(&upload_id);
         assert!(staging.exists());
 
-        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        // Idle past the TTL on the runtime clock, then hand the clock back
+        // before the service calls (the store's pool-acquire timeouts are
+        // tokio timers a paused clock would auto-advance).
+        tokio::time::pause();
+        tokio::time::advance(ttl * 2).await;
+        tokio::time::resume();
 
         // The expired session fails cleanly and its staging dir is swept.
         let err = svc
@@ -2319,12 +2340,18 @@ mod tests {
     /// the `committing` claim — without that, the claim-time timestamp is
     /// already past the TTL and the next op (or a `begin` sweep) expires
     /// the session instead of allowing the documented retry.
+    ///
+    /// The TTL is generous and the claim is aged by advancing the paused
+    /// runtime clock (intent-hq/intent#4880): with a millisecond TTL measured
+    /// against the wall clock, a scheduling stall between any two steps
+    /// expired the session under package load.
     #[tokio::test]
     async fn failed_commit_outliving_ttl_still_gets_fresh_retry_window() {
         let _env = crate::agent_manager::tests::EnvGuard::set_all(&[(
             "INTENTD_ATTACHMENT_UPLOAD_IDLE_TTL_MS",
-            "100",
+            "3600000",
         )]);
+        let ttl = super::attachment_upload_idle_ttl();
         let ws = WorkspaceId("ws-up-slow-commit".to_string());
         let ws_root = TempDir::new("attach-up-root");
         let checkout = TempDir::new("attach-up-co");
@@ -2336,17 +2363,30 @@ mod tests {
             .await
             .expect("chunk");
         // Simulate a commit claimed well over one TTL ago and still in
-        // flight: `committing` held, claim-time `last_activity` long stale.
+        // flight: hold `committing`, then jump the clock past the TTL so the
+        // claim-time `last_activity` is long stale.
+        svc.attachment_uploads
+            .lock()
+            .unwrap()
+            .get_mut(&upload_id)
+            .unwrap()
+            .committing = true;
+        tokio::time::pause();
+        tokio::time::advance(ttl * 2).await;
         {
-            let mut uploads = svc.attachment_uploads.lock().unwrap();
-            let session = uploads.get_mut(&upload_id).unwrap();
-            session.committing = true;
-            session.last_activity = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(2))
-                .expect("backdate claim time");
+            let uploads = svc.attachment_uploads.lock().unwrap();
+            let session = uploads.get(&upload_id).unwrap();
+            assert!(
+                session.last_activity.elapsed() >= ttl,
+                "claim aged past the TTL"
+            );
+            assert!(!session.expired(ttl), "a committing session never expires");
         }
         // The slow commit fails; its failure path releases the claim.
         svc.release_failed_commit_claim(&upload_id);
+        // Back to the real clock before the retry: the store's pool-acquire
+        // timeouts are tokio timers, which a paused clock would auto-advance.
+        tokio::time::resume();
         // The session must NOT be instantly expired: the retry window
         // restarts at the failure, so an immediate retry succeeds.
         svc.file_attachment_upload_commit_op(upload_id)
