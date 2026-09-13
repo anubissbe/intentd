@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.51] - 2026-09-13
+
+### 🐛 Bug Fixes
+
+- Prune copied submodule worktrees the sandbox tip does not track ([#1831](https://github.com/intent-hq/intentd/pull/1831))
+
+### 🔧 Refactor
+
+- *(git)* Single repo-cache path helper plus test-side guard ([#1837](https://github.com/intent-hq/intentd/pull/1837))
+
+### 📚 Documentation
+
+- *(acp)* Align ws.browser docs with mount-on-demand capture contract ([#1838](https://github.com/intent-hq/intentd/pull/1838))
+
+### 🧪 Testing
+
+- *(events)* Bound and deflake the notify-watcher tests that hang to the nextest kill ([#1830](https://github.com/intent-hq/intentd/pull/1830))
+
+
 ## [0.9.50] - 2026-09-13
 
 ### 🔧 Refactor
