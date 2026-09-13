@@ -8746,6 +8746,9 @@ struct SetContentMerge {
     base: Option<String>,
     outcome: &'static str,
     conflicting_spans: usize,
+    /// Checkbox lines whose conflicting marker was collapsed back to one
+    /// valid marker after the merge (intent-hq/intent#4930).
+    repaired_markers: usize,
 }
 
 /// Resolve what a `note.setContent` write persists on top of the stored
@@ -8780,6 +8783,7 @@ async fn merge_set_content(
                 base: None,
                 outcome: "exact",
                 conflicting_spans: 0,
+                repaired_markers: 0,
             })
         }
     };
@@ -8790,11 +8794,20 @@ async fn merge_set_content(
     {
         Some(base) => {
             let merged = note_merge::three_way_merge(&base, current, incoming);
+            // Only a conflicting span can concatenate two marker variants;
+            // clean merges persist the merged text verbatim, and the repair
+            // is scoped to the spans that actually conflicted.
+            let (text, repaired_markers) = if merged.conflicting_spans > 0 {
+                note_merge::repair_checkbox_markers(&merged.text, &merged.conflict_ranges)
+            } else {
+                (merged.text, 0)
+            };
             Ok(SetContentMerge {
-                text: merged.text,
+                text,
                 base: Some(base),
                 outcome: "merged",
                 conflicting_spans: merged.conflicting_spans,
+                repaired_markers,
             })
         }
         None => Ok(SetContentMerge {
@@ -8802,6 +8815,7 @@ async fn merge_set_content(
             base: None,
             outcome: "lww-no-base",
             conflicting_spans: 0,
+            repaired_markers: 0,
         }),
     }
 }
@@ -8842,8 +8856,10 @@ fn check_set_content_reduction(
 /// text it persists.
 #[derive(Clone, Copy)]
 enum ContentWritePolicy {
-    /// `note.setContent`: the reduction guard (measured against the writer's
-    /// base when known, else the stored current) then the set-content cleaner.
+    /// `note.setContent`: the set-content normalizer runs once on the
+    /// writer's text before any merge, then each attempt applies the
+    /// reduction guard (measured against the writer's base when known, else
+    /// the stored current) and validates the merged text before persisting.
     SetContent { confirm_replacement: bool },
     /// `note.add` / `note.edit` / `note.editLines`: the surgical transform
     /// already ran against the content the caller read; the merged text
@@ -8895,6 +8911,15 @@ struct ContentWrite<'a> {
 /// gated on the rev it read via [`persist_note_content`] — so a write that
 /// lands in between is merged into on the next attempt rather than
 /// overwritten. The last attempt's `Conflict` propagates unchanged.
+///
+/// The `SetContent` cleaner is split around the merge: normalization
+/// (quote strip, JSON-value extraction) runs on `incoming` once, before any
+/// merge, so the merge (and the checkbox repair) sees the shape that will
+/// persist — a quoted payload no longer hides a bullet behind its quote —
+/// while current text that legitimately starts with a quote is not stripped
+/// by someone else's write. Validation (empty / truncated) runs on the
+/// merged text of each attempt, since a zero-conflict merge of two partial
+/// deletions can empty a note neither side emptied.
 async fn persist_merged_content(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -8909,6 +8934,14 @@ async fn persist_merged_content(
         author,
         op,
     } = write;
+    let normalized;
+    let merge_input = match policy {
+        ContentWritePolicy::SetContent { .. } => {
+            normalized = note_ops::normalize_set_content(incoming);
+            normalized.as_str()
+        }
+        ContentWritePolicy::Surgical => incoming,
+    };
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -8923,23 +8956,22 @@ async fn persist_merged_content(
             workspace_id,
             note_id,
             &note,
-            incoming,
+            merge_input,
             expected_version,
         )
         .await?;
-        let text = match policy {
-            ContentWritePolicy::SetContent {
+        if let ContentWritePolicy::SetContent {
+            confirm_replacement,
+        } = policy
+        {
+            check_set_content_reduction(
+                merge.base.as_deref().unwrap_or(&old_content),
+                incoming,
                 confirm_replacement,
-            } => {
-                check_set_content_reduction(
-                    merge.base.as_deref().unwrap_or(&old_content),
-                    incoming,
-                    confirm_replacement,
-                )?;
-                note_ops::clean_set_content(&merge.text)?
-            }
-            ContentWritePolicy::Surgical => merge.text,
-        };
+            )?;
+            note_ops::validate_set_content(&merge.text)?;
+        }
+        let text = merge.text;
         tracing::debug!(
             note = %note_id.0,
             op,
@@ -8948,6 +8980,7 @@ async fn persist_merged_content(
             expected_version,
             outcome = merge.outcome,
             conflicting_spans = merge.conflicting_spans,
+            repaired_markers = merge.repaired_markers,
             "note content merge"
         );
         let mut plan = reanchor_note_comments(store, workspace_id, note_id, text).await?;

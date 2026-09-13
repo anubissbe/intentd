@@ -2473,6 +2473,48 @@ async fn set_content_future_expected_version_conflicts_without_writing() {
     );
 }
 
+/// The future-rev `Conflict` wins over the set-content guards: normalization
+/// of the incoming text is error-free and the empty / truncation validation
+/// runs on the merged text, after the merge has already raised `Conflict`,
+/// so `expectedVersion` above the stored rev is `-32005` even when the
+/// payload is an empty quoted string or a short `...` fragment. Nothing is
+/// written either way.
+#[tokio::test]
+async fn set_content_future_expected_version_conflicts_before_content_guards() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
+        .await
+        .expect("bump to rev 1");
+
+    for payload in ["\"\"", "short..."] {
+        let r = svc
+            .set_note_content(
+                ws.clone(),
+                id.clone(),
+                payload.into(),
+                false,
+                Some(999),
+                None,
+            )
+            .await;
+        match r {
+            Err(Error::Conflict { current }) => {
+                assert_eq!(current["rev"], serde_json::json!(1), "{payload:?}");
+                assert_eq!(
+                    current["content"],
+                    serde_json::json!("body v1"),
+                    "{payload:?}"
+                );
+            }
+            other => panic!("{payload:?}: future expectedVersion must be Conflict, got {other:?}"),
+        }
+    }
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "body v1", "nothing persisted");
+    assert_eq!(stored.rev, 1, "rev unchanged");
+}
+
 /// The read-merge-persist loop is bounded: when every attempt's gated UPDATE
 /// misses (a `RAISE(IGNORE)` trigger makes the note row unconditionally
 /// unmatchable, counting each attempt), `note.setContent` stops after exactly
@@ -2792,6 +2834,20 @@ async fn surgical_write_races_user_save<T>(
     op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, intent_core::Result<T>>,
 ) -> (T, Note) {
     let (tmp, svc, ws, id) = setup_versioned(base).await;
+    surgical_write_races_user_save_in(&tmp, &svc, &ws, &id, user, op).await
+}
+
+/// [`surgical_write_races_user_save`] over an already-prepared versioned
+/// store, for tests that seed extra rows (a linked task note) before the race
+/// or keep asserting against `svc` after it.
+async fn surgical_write_races_user_save_in<T>(
+    tmp: &TempDb,
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &NoteId,
+    user: &str,
+    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, intent_core::Result<T>>,
+) -> (T, Note) {
     let other = Store::open(&tmp.path).await.expect("open second store");
     let other_svc = Services::new(other.clone());
 
@@ -2802,9 +2858,9 @@ async fn surgical_write_races_user_save<T>(
         .acquire()
         .await
         .expect("hold write conn");
-    let mut fut = op(&svc, ws.clone(), id.clone());
+    let mut fut = op(svc, ws.clone(), id.clone());
     let parked = poll_until(&mut fut, 20, || async {
-        svc.store.get_note(&ws, &id).await.expect("get note");
+        svc.store.get_note(ws, id).await.expect("get note");
         false
     })
     .await;
@@ -2818,14 +2874,14 @@ async fn surgical_write_races_user_save<T>(
     drop(held);
 
     let result = fut.await.expect("surgical write");
-    let stored = other.get_note(&ws, &id).await.expect("final note");
+    let stored = other.get_note(ws, id).await.expect("final note");
     assert_eq!(
         stored.rev, 2,
         "surgical write lands on top of the user save"
     );
     assert_eq!(
         other
-            .get_note_version_content_by_rev(&ws, &id, 2)
+            .get_note_version_content_by_rev(ws, id, 2)
             .await
             .expect("lookup"),
         Some(stored.content.clone()),
@@ -2975,6 +3031,327 @@ async fn task_update_status_merges_onto_completed_user_save() {
     .await;
     assert!(result.ok);
     assert_eq!(stored.content, "- [x] alpha\nbeta TYPED\ngamma");
+}
+
+/// Regression for intent-hq/intent#4930 on a plain checkbox: `task.updateStatus`
+/// (`[ ]` → `[x]`) races a user save that flipped the same marker to `[/]`.
+/// The retry's three-way merge conflicts inside the brackets and, unrepaired,
+/// persisted `- [/x] alpha`, which `match_task_line` no longer recognizes.
+/// The persisted marker is one valid character — the current (user) side's —
+/// and `note.listTasks` still parses the line.
+#[tokio::test]
+async fn task_update_status_conflicting_marker_persists_a_valid_checkbox() {
+    let (tmp, svc, ws, id) = setup_versioned("- [ ] alpha\nbeta\ngamma").await;
+    let (result, stored) = surgical_write_races_user_save_in(
+        &tmp,
+        &svc,
+        &ws,
+        &id,
+        "- [/] alpha\nbeta\ngamma",
+        |svc, ws, id| svc.task_update_status(ws, id, "alpha".into(), "done".into(), None),
+    )
+    .await;
+    assert!(result.ok);
+    assert_eq!(stored.content, "- [/] alpha\nbeta\ngamma");
+
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].line_number, 1);
+    assert_eq!(rows[0].text, "alpha");
+    assert_eq!(rows[0].status, "in-progress");
+    assert_eq!(rows[0].task_note_id, None);
+}
+
+/// Regression for intent-hq/intent#4930 on a line linking a real task note.
+/// `task.updateStatus` on a linked line never merges (it redirects to the
+/// task note and materializes), so the merge-exposed write here is a
+/// `note.edit` that flips the marker to `[x]` while the user's save flipped
+/// it to `[/]`. The repaired line keeps its link (`note.listTasks` row carries
+/// `taskNoteId`) and the next `task.updateNoteStatus` materializes onto it.
+#[tokio::test]
+async fn linked_checkbox_conflicting_marker_stays_linked_and_materializes() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    const TASK: &str = "t4930";
+    let line = |marker: &str| format!("- {marker} [T](intent://local/task/{TASK})");
+    let (tmp, svc, ws, id) = setup_versioned(&format!("{}\nbeta\ngamma", line("[ ]"))).await;
+    let mut task_note = note(&ws, TASK, "body");
+    task_note.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        ..Default::default()
+    });
+    svc.store
+        .insert_note(&task_note)
+        .await
+        .expect("insert task note");
+
+    let (result, stored) = surgical_write_races_user_save_in(
+        &tmp,
+        &svc,
+        &ws,
+        &id,
+        &format!("{}\nbeta\ngamma", line("[/]")),
+        |svc, ws, id| {
+            svc.edit_note(
+                ws,
+                id,
+                NoteEditInput {
+                    old: line("[ ]"),
+                    new: line("[x]"),
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, format!("{}\nbeta\ngamma", line("[/]")));
+    assert_eq!(result.new_content, stored.content);
+
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].status, "in-progress");
+    assert_eq!(rows[0].task_note_id.as_deref(), Some(TASK));
+
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from(TASK),
+        "complete".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("updateNoteStatus");
+    let parent = svc.store.get_note(&ws, &id).await.expect("get parent");
+    assert_eq!(parent.content, format!("{}\nbeta\ngamma", line("[x]")));
+    assert_eq!(parent.rev, 3, "materialization is one versioned write");
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows[0].status, "done");
+    assert_eq!(rows[0].task_note_id.as_deref(), Some(TASK));
+}
+
+/// Regression for intent-hq/intent#4930 via `note.setContent` with a stale
+/// `expectedVersion`: the stale writer flipped the marker to `[x]` (and
+/// appended `delta`), the current text has `[/]`. The non-conflicting append
+/// merges in, and the conflicting marker collapses to the current side's
+/// character instead of persisting `- [/x] alpha`.
+#[tokio::test]
+async fn set_content_stale_expected_version_repairs_conflicting_marker() {
+    let (_tmp, svc, ws, id) = setup_versioned("- [ ] alpha\nbeta\ngamma").await;
+
+    let b = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "- [/] alpha\nbeta\ngamma".into(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let a = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "- [x] alpha\nbeta\ngamma\ndelta".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("stale expectedVersion merges");
+    assert_eq!(a.new_content, "- [/] alpha\nbeta\ngamma\ndelta");
+    assert_eq!(a.rev, 2);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "- [/] alpha\nbeta\ngamma\ndelta");
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].text, "alpha");
+    assert_eq!(rows[0].status, "in-progress");
+}
+
+/// Same stale-`expectedVersion` race with the incoming text wrapped in the
+/// quotes the set-content cleaner strips. The cleaner runs before the merge,
+/// so the bullet is visible to the conflict-scoped repair and the persisted
+/// line is `- [/] alpha`, not `- [/x] alpha`.
+#[tokio::test]
+async fn set_content_quoted_stale_expected_version_repairs_conflicting_marker() {
+    let (_tmp, svc, ws, id) = setup_versioned("- [ ] alpha\nbeta\ngamma").await;
+
+    let b = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "- [/] alpha\nbeta\ngamma".into(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let a = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "\"- [x] alpha\nbeta\ngamma\ndelta\"".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("quoted stale expectedVersion merges");
+    assert_eq!(a.new_content, "- [/] alpha\nbeta\ngamma\ndelta");
+    assert_eq!(a.rev, 2);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "- [/] alpha\nbeta\ngamma\ndelta");
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].text, "alpha");
+    assert_eq!(rows[0].status, "in-progress");
+}
+
+/// Controls for the pre-merge cleaner: an exact-rev quoted write still
+/// persists the unquoted text byte-for-byte, and a non-conflicting stale
+/// merge onto current text that legitimately starts with a quote keeps that
+/// quote — only the writer's own payload is cleaned.
+#[tokio::test]
+async fn set_content_cleaner_runs_once_on_the_incoming_text() {
+    let (_tmp, svc, ws, id) = setup_versioned("alpha\nbeta\ngamma").await;
+
+    let exact = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "\"alpha\nbeta\ngamma\ndelta\"".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("exact quoted write");
+    assert_eq!(exact.new_content, "alpha\nbeta\ngamma\ndelta");
+    assert_eq!(exact.rev, 1);
+
+    // The surgical path does not clean, so the current text can start with a
+    // quote the set-content cleaner would otherwise strip.
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: "\"quoted\" lead".into(),
+            heading: None,
+            position: Some("start".into()),
+        },
+        None,
+    )
+    .await
+    .expect("prepend");
+    let current = svc.store.get_note(&ws, &id).await.expect("get").content;
+    assert!(current.starts_with('"'), "{current:?}");
+
+    let stale = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "alpha\nbeta\ngamma\ndelta\nepsilon".into(),
+            false,
+            Some(1),
+            None,
+        )
+        .await
+        .expect("stale expectedVersion merges");
+    assert_eq!(stale.new_content, format!("{current}\nepsilon"));
+    assert_eq!(stale.rev, 3);
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, format!("{current}\nepsilon"));
+}
+
+/// The empty guard applies to the merged text, not just the writer's own:
+/// two zero-conflict partial deletions (`ab` → `a` and `ab` → `b`, each
+/// exactly 50 % so the unconfirmed reduction guard passes) merge to the empty
+/// string, which is rejected with the existing message and persists nothing.
+#[tokio::test]
+async fn set_content_stale_merge_that_empties_the_note_is_rejected() {
+    let (_tmp, svc, ws, id) = setup_versioned("ab").await;
+
+    let b = svc
+        .set_note_content(ws.clone(), id.clone(), "a".into(), false, None, None)
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let denied = svc
+        .set_note_content(ws.clone(), id.clone(), "b".into(), false, Some(0), None)
+        .await;
+    match denied {
+        Err(Error::Internal(msg)) => assert_eq!(msg, "Content cannot be empty."),
+        other => panic!("expected the empty guard, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 1, "a rejected merge persists nothing");
+    assert_eq!(stored.content, "a");
+}
+
+/// Same for the truncation guard: neither side's text looks truncated, but
+/// the merged text (`one two\nthree...` minus ` two` minus `\n`) is a short
+/// single line ending in `...`, and is rejected without a write.
+#[tokio::test]
+async fn set_content_stale_merge_that_looks_truncated_is_rejected() {
+    let (_tmp, svc, ws, id) = setup_versioned("one two\nthree...").await;
+
+    let b = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "one\nthree...".into(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let denied = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "one twothree...".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await;
+    match denied {
+        Err(Error::Internal(msg)) => {
+            assert!(msg.starts_with("Content appears to be truncated"), "{msg}");
+        }
+        other => panic!("expected the truncation guard, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 1, "a rejected merge persists nothing");
+    assert_eq!(stored.content, "one\nthree...");
 }
 
 /// Same race for `task.update` on a plain checkbox line: the line edit
