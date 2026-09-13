@@ -14,7 +14,6 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -46,13 +45,6 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// In-memory [`TokenStore`] so tests never touch the real OS keychain.
 #[derive(Default)]
@@ -182,7 +174,6 @@ fn sample_issue() -> Issue {
 /// Branch listings record the `(prefix, cursor)` pair the engine saw so the
 /// `github.branches.list` `prefix` threading is assertable end-to-end.
 #[derive(Default)]
-#[allow(clippy::struct_field_names)] // fields mirror the recorded query kinds
 struct RecordingForge {
     pr_queries: Mutex<Vec<PrQuery>>,
     issue_queries: Mutex<Vec<IssueQuery>>,
@@ -367,15 +358,14 @@ struct Fixture {
     port: u16,
     cfg: Arc<ClientConfig>,
     forge: Arc<RecordingForge>,
-    _dir: TempDir,
+    _dir: tempfile::TempDir,
 }
 
 /// Boot a TLS + bearer-auth WSS listener whose services carry the recording
 /// stub forge.
 async fn boot() -> Fixture {
-    let short = uuid::Uuid::new_v4().simple().to_string();
-    let dir = std::env::temp_dir().join(format!("intentd-gh-search-{}", &short[..8]));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = common::test_tempdir("intentd-gh-search-");
+    let dir = dir_guard.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
     let bus = EventBus::new(store.clone());
     let workspaces_root = dir.join("workspaces");
@@ -406,7 +396,7 @@ async fn boot() -> Fixture {
         port,
         cfg,
         forge,
-        _dir: TempDir(dir),
+        _dir: dir_guard,
     }
 }
 
@@ -601,8 +591,24 @@ async fn issues_get_returns_issue_with_author_and_timestamps() {
     .await;
     assert_eq!(env["error"]["code"], json!(-32602), "envelope: {env}");
 
+    // Mixed-case addressing reaches the engine with its casing intact.
+    let r3 = wss_rpc(
+        &mut ws,
+        3,
+        "github.issues.get",
+        json!({ "owner": "Intent-HQ", "repo": "IntentD", "number": 9 }),
+    )
+    .await;
+    assert_eq!(r3["issue"]["number"], 9);
+
+    // `RepoRef` equality is case-insensitive, so compare the recorded fields
+    // directly to prove the addressing was forwarded verbatim.
     let gets = fx.forge.issue_gets.lock().unwrap();
-    assert_eq!(*gets, vec![(RepoRef::new("o", "r"), 7)]);
+    let recorded: Vec<(&str, &str, u64)> = gets
+        .iter()
+        .map(|(repo, number)| (repo.owner.as_str(), repo.name.as_str(), *number))
+        .collect();
+    assert_eq!(recorded, vec![("o", "r", 7), ("Intent-HQ", "IntentD", 9)]);
 }
 
 /// `github.issues.search` rejects the PR-only `review-requested` filter with

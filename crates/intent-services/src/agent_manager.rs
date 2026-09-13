@@ -43,7 +43,9 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::agent_ops::{new_message_id, user_message_blocks, QueuedMessage, MAX_MESSAGE_ID_LEN};
+use crate::agent_ops::{
+    new_message_id, user_message_blocks, DrainingGuard, QueuedMessage, MAX_MESSAGE_ID_LEN,
+};
 use crate::agent_session::{
     agent_actor, InterruptFlushOutcome, InterruptReason, InterruptedBy, ThoughtLevelOption,
 };
@@ -106,6 +108,15 @@ pub(crate) const AUTO_UNARCHIVE_NOTICE_TEXT: &str =
 /// wording). Never replayed on later turns.
 pub(crate) const AUTO_UNARCHIVE_PROMPT_NOTICE: &str =
     "[SYSTEM NOTICE] This workspace was archived; it has been automatically unarchived because this message was sent.";
+
+/// Queued-message size (chars) above which a turn failing with a
+/// context-size error (HTTP 413, [`crate::is_context_size_error`]) is
+/// treated as the MESSAGE being too large rather than the accumulated
+/// context: `publish_error_status_and_requeue` then re-queues a short
+/// recovery marker in place of the payload so the retry can succeed instead
+/// of re-failing forever (intent-hq/intent#4703). Matches the hook dispatch
+/// message cap. Entries at or under the threshold re-queue unchanged.
+pub(crate) const CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS: usize = 32 * 1024;
 
 /// [`DEQUEUE_WAIT_ANNOTATION_MIN_MS`] with an `INTENTD_DEQUEUE_WAIT_MIN_MS`
 /// env override (whole milliseconds). Primarily for tests/CI — the e2e
@@ -187,6 +198,51 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
             );
         }
     }
+}
+
+/// Drain identity link ([intent-hq/intentd#1783](https://github.com/intent-hq/intentd/pull/1783)):
+/// the drained entry's `messageMetadata` is stamped with the queue entry id
+/// it was drained from — `queueInfo.queuedMessageId` (PROTOCOL §5.5) — so
+/// the persisted user row (and its `agent:message` echo) can be matched to
+/// the `agent:queue:updated` entry that is still listed until the shrunk
+/// snapshot lands (§6.5 drain ordering). The row keeps its own freshly
+/// minted id; this stamp is the only link. Runs on every drain arm and on
+/// `agent.sendQueuedMessageNow`, after [`annotate_dequeue_wait`] (which
+/// creates `queueInfo` when the wait crosses the threshold). Unlike the wait
+/// and batch stamps this one always writes: the stamp names the entry that
+/// is delivering NOW, so a requeue that re-drains under a fresh entry id
+/// re-links to that id. The only skip is a `persisted: true` requeue (row
+/// already durable, never rewritten). `queueInfo` is daemon-reserved: an
+/// absent / null / non-object value is replaced by a fresh object carrying
+/// the link (and the wire path already rejects a non-object
+/// `messageMetadata` with `-32602`; should one reach a drain arm anyway it
+/// is replaced the same way), an object is merged into — so EVERY drained
+/// row names its entry.
+pub(crate) fn stamp_queued_message_id(msg: &mut QueuedMessage) {
+    if msg.persisted {
+        return;
+    }
+    let metadata = msg.message_metadata.get_or_insert_with(|| json!({}));
+    if !metadata.is_object() {
+        tracing::warn!(
+            id = %msg.id,
+            "queuedMessageId stamp: replacing non-object messageMetadata"
+        );
+        *metadata = json!({});
+    }
+    let map = metadata.as_object_mut().expect("object ensured above");
+    let queue_info = map.entry("queueInfo").or_insert_with(|| json!({}));
+    if !queue_info.is_object() {
+        tracing::warn!(
+            id = %msg.id,
+            "queuedMessageId stamp: replacing non-object queueInfo"
+        );
+        *queue_info = json!({});
+    }
+    queue_info
+        .as_object_mut()
+        .expect("object ensured above")
+        .insert("queuedMessageId".to_string(), Value::String(msg.id.clone()));
 }
 
 /// Batch-flush grouping stamp: when a flush delivers two or more entries as
@@ -453,6 +509,15 @@ pub struct TurnOptions {
     /// failure requeue) inserts it with interrupt priority — front of the
     /// queue, behind earlier interrupts (user decision, spec §Decisions).
     pub interrupt_priority: bool,
+    /// The individual queue entries a combined flush turn
+    /// ([`prepare_flush_turn`]) delivered as ONE prompt, in message order,
+    /// each carrying its post-flush `persisted` state. Set ONLY by the flush
+    /// path (`None` everywhere else) so a terminal-failure requeue can hand
+    /// the entries back individually instead of parking the wire-only
+    /// combined prompt as a single entry — which is what a context-size
+    /// failure needs: replace only the oversized entries with a recovery
+    /// marker and keep the small siblings intact (intent-hq/intent#4703).
+    pub(crate) flushed_entries: Option<Vec<QueuedMessage>>,
 }
 
 impl TurnOptions {
@@ -1857,6 +1922,7 @@ const INTENTD_MCP_BRIDGE_ADDR_ENV: &str = "INTENTD_MCP_BRIDGE_ADDR";
 
 /// Bundled pi extension source (MCP bridge client + tool registration),
 /// embedded at build time and written to a per-agent temp file at spawn.
+#[cfg(unix)]
 const PI_MCP_EXTENSION_SOURCE: &str = include_str!("pi_mcp_extension.ts");
 
 /// Per-agent pi-extension MCP delivery files: the bundled extension plus a
@@ -1943,6 +2009,7 @@ fn pi_extension_delivery(
 
 /// Single-quote a string for inert interpolation into a `sh` script: quotes
 /// suppress all expansion, and embedded `'` uses the standard `'\''` escape.
+#[cfg(unix)]
 fn sh_squote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -2211,6 +2278,19 @@ pub struct AgentManager {
     /// session row would close this; not done here to keep parity with the
     /// existing replaceMessages semantics.
     force_recreate: Arc<Mutex<HashSet<AgentId>>>,
+    /// The provider id [`AgentManager::ensure_started`] resolved for an
+    /// agent's in-flight spawn attempt. Recorded before the child spawn / ACP
+    /// session setup can fail; removed when the attempt succeeds, consumed by
+    /// the spawn-failure publisher on any failure, and dropped by `detach`
+    /// when a teardown cancels the attempt — so no record outlives its
+    /// attempt. Read so a quota-stamped `agent:failed` names the provider
+    /// whose `session/new` was actually rejected.
+    /// `last_turn_provider` is the wrong source there: an `agent.setModel`
+    /// switch commits the new identity only once the new child is up
+    /// (`maybe_persist_model_change_notice` runs after `start_session`), so
+    /// during a failed startup on B it still names A — the previous provider,
+    /// and the one the client should be steered TOWARD, not away from.
+    spawn_attempt_provider: Arc<Mutex<HashMap<AgentId, String>>>,
     /// Agents fenced off from the lazy-spawn paths because a batch teardown
     /// ([`AgentManager::stop_many`]) is in flight and their session rows are
     /// about to be cascade-deleted (`workspace.delete`). While an agent is in
@@ -2314,6 +2394,7 @@ impl AgentManager {
             interrupt_ids: Arc::new(Mutex::new(HashMap::new())),
             stop_redelivery: Arc::new(Mutex::new(HashMap::new())),
             force_recreate: Arc::new(Mutex::new(HashSet::new())),
+            spawn_attempt_provider: Arc::new(Mutex::new(HashMap::new())),
             stopping: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
@@ -2923,6 +3004,9 @@ impl AgentManager {
                 .agent_log_root
                 .as_ref()
                 .map(|root| root.join(&agent_id.0)),
+            // Diagnostics only: lets an unparseable stdout line name the agent
+            // whose child emitted it.
+            agent_id: Some(agent_id.0.clone()),
         };
         // Pre-first-token turn-startup hint: the child process is about to be
         // spawned for this agent, so surface the `launch` phase before the
@@ -3100,7 +3184,7 @@ impl AgentManager {
     /// requires the `providers.claudeCodeOauthToken` sensitive setting, and
     /// any provider the image manifest does not include is rejected. A
     /// backend failure is a hard spawn error — no silent host fallback.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn spawn_in_microvm(
         &self,
         agent_id: &AgentId,
@@ -4566,10 +4650,18 @@ impl AgentManager {
         if !self.take_recreated(agent_id) {
             return content.to_string();
         }
+        // The per-block cap is read live so a `config.toml` edit applies to
+        // the next replay without a daemon restart. The bounded replay read
+        // splices every externalized tool body — full row or retention-pruned
+        // `*_replay` row alike — in as the replay-preview block already
+        // truncated to the cap, so the whole transcript's full bodies are
+        // never materialized at once.
+        let tool_content_chars =
+            crate::settings::history_replay_tool_content_chars(&self.services.effective_settings());
         let messages = self
             .services
             .store
-            .get_agent_messages(agent_id, None)
+            .get_agent_messages_for_replay(agent_id, tool_content_chars)
             .await
             .unwrap_or_default();
         // The current user message was already appended → render everything
@@ -4585,8 +4677,11 @@ impl AgentManager {
         if prior.is_empty() {
             return content.to_string();
         }
-        let history_xml =
-            crate::history_xml::format_history_as_xml(prior, crate::history_xml::MAX_HISTORY_CHARS);
+        let history_xml = crate::history_xml::format_history_as_xml(
+            prior,
+            crate::history_xml::MAX_HISTORY_CHARS,
+            tool_content_chars,
+        );
         format!("{history_xml}\n\n{content}")
     }
 
@@ -4769,6 +4864,9 @@ impl AgentManager {
         // visible before `end_turn` frees the busy slot.
         self.recreated.lock().unwrap().remove(agent_id);
         self.prepend_pending.lock().unwrap().remove(agent_id);
+        // A spawn attempt cancelled by this teardown never reaches the
+        // spawn-failure publisher that would consume its provider record.
+        self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         // Same staleness terms for the streaming path's persisted terminal-
         // error stash (monorepo#2050): the abort above may have landed between
         // `run_prompt_turn`'s stash and the terminal-failure handler's take,
@@ -5621,7 +5719,7 @@ impl AgentManager {
     /// `list_busy` (both maps mutated under the `busy` lock, busy → `agent_ws`
     /// order). Returns `None` when the agent was not busy, otherwise the
     /// removed `agent_ws` entry.
-    #[allow(clippy::option_option)] // outer = was-busy, inner = the removed entry
+    #[expect(clippy::option_option)] // outer = was-busy, inner = the removed entry
     fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
         let mut busy = self.busy.lock().unwrap();
         if !busy.remove(agent_id) {
@@ -5904,7 +6002,7 @@ impl AgentManager {
     /// the `agent.retry` Error-clear (see [`AgentManager::persist_retry_status`])
     /// persists a non-active status without any turn having run, so it passes
     /// `false` and must not bump `lastActivity` (§10.1 turn-boundary policy).
-    #[allow(clippy::option_option)] // the nesting IS the untouched/clear/set tri-state
+    #[expect(clippy::option_option)] // the nesting IS the untouched/clear/set tri-state
     async fn persist_status_with_stop_reason(
         &self,
         agent_id: &AgentId,
@@ -6048,7 +6146,7 @@ impl AgentManager {
                 stop_reason = session.stop_reason.as_deref().unwrap_or(""),
                 "session is quarantined (poisoned); parking message in queue instead of driving a turn"
             );
-            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+            let (queued, position) = self.services.enqueue_message_with_id(
                 &agent_id,
                 Some(message_id.clone()),
                 content,
@@ -6057,7 +6155,7 @@ impl AgentManager {
                 options.message_metadata.clone(),
                 options.queued_prepend(),
                 options.interrupt_priority,
-                options.origin.is_user(),
+                options.origin,
             );
             let result = json!({
                 "success": true,
@@ -6100,7 +6198,7 @@ impl AgentManager {
         if !options.origin.is_user() && !workspace_id.is_chief() {
             match self.services.store.get_workspace(&workspace_id).await {
                 Ok(ws) if ws.archived => {
-                    let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+                    let (queued, position) = self.services.enqueue_message_with_id(
                         &agent_id,
                         Some(message_id.clone()),
                         content,
@@ -6109,7 +6207,7 @@ impl AgentManager {
                         options.message_metadata.clone(),
                         options.queued_prepend(),
                         options.interrupt_priority,
-                        false,
+                        options.origin,
                     );
                     let result = json!({
                         "success": true,
@@ -6177,7 +6275,7 @@ impl AgentManager {
                 Ok(ws) if ws.archived
             )
         {
-            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+            let (queued, position) = self.services.enqueue_message_with_id(
                 &agent_id,
                 Some(message_id.clone()),
                 content,
@@ -6186,7 +6284,7 @@ impl AgentManager {
                 options.message_metadata.clone(),
                 options.queued_prepend(),
                 options.interrupt_priority,
-                true,
+                options.origin,
             );
             let result = json!({
                 "success": true,
@@ -6201,7 +6299,7 @@ impl AgentManager {
             return Ok(result);
         }
         if !self.try_begin(&agent_id, &workspace_id).await {
-            let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+            let (queued, position) = self.services.enqueue_message_with_id(
                 &agent_id,
                 Some(message_id.clone()),
                 content,
@@ -6210,7 +6308,7 @@ impl AgentManager {
                 options.message_metadata.clone(),
                 options.queued_prepend(),
                 options.interrupt_priority,
-                options.origin.is_user(),
+                options.origin,
             );
             let result = json!({
                 "success": true,
@@ -6307,7 +6405,7 @@ impl AgentManager {
                         agent_id.0
                     )));
                 }
-                let (queued, position) = self.services.enqueue_message_with_id_and_origin(
+                let (queued, position) = self.services.enqueue_message_with_id(
                     &agent_id,
                     Some(message_id.clone()),
                     content,
@@ -6316,7 +6414,7 @@ impl AgentManager {
                     options.message_metadata.clone(),
                     options.queued_prepend(),
                     options.interrupt_priority,
-                    options.origin.is_user(),
+                    options.origin,
                 );
                 let result = json!({
                     "success": true,
@@ -6530,11 +6628,11 @@ impl AgentManager {
         // existing single-entry path unchanged.
         {
             let mode = self.services.flush_queued_messages_mode();
-            if let Some(batch) =
+            if let Some((batch, draining)) =
                 self.services
-                    .dequeue_flush_batch(&agent_id, mode, archived_drain, 2)
+                    .dequeue_flush_batch_draining(&agent_id, mode, archived_drain, 2)
             {
-                match prepare_flush_turn(&self, &agent_id, &workspace_id, batch).await {
+                match prepare_flush_turn(&self, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn { content, options } => {
                         self.spawn_worker(agent_id, workspace_id, content, *options, true);
                     }
@@ -6551,11 +6649,12 @@ impl AgentManager {
         // Under the archived-workspace exemption only a user-origin entry
         // may drain; the normal path pops the queue head as before.
         let dequeued = if archived_drain {
-            self.services.dequeue_user_origin_message(&agent_id)
+            self.services
+                .dequeue_user_origin_message_draining(&agent_id)
         } else {
-            self.services.dequeue_message(&agent_id)
+            self.services.dequeue_message_draining(&agent_id)
         };
-        let Some(mut next) = dequeued else {
+        let Some((mut next, draining)) = dequeued else {
             // Raced with another mutation (e.g. remove) that emptied the
             // ready-to-send queue between the check above and the dequeue.
             self.end_turn(&agent_id).await;
@@ -6571,13 +6670,9 @@ impl AgentManager {
                 .await;
             return;
         };
-        self.services
-            .publish_queue_updated_for(
-                &agent_id,
-                &workspace_id,
-                self.services.queue_snapshot(&agent_id),
-            )
-            .await;
+        // Durable shrink now; the shrunk `agent:queue:updated` is published
+        // only after the user row below is persisted (§6.5 drain ordering).
+        self.services.persist_queue_snapshot(&agent_id).await;
         // Stale-redrive check (#576) BEFORE the transcript append so the
         // annotated content reaches both the persisted user row and the
         // provider prompt.
@@ -6585,6 +6680,8 @@ impl AgentManager {
         // Dequeue-wait note: same placement contract — the persisted row and
         // the provider prompt both carry the enqueue time + wait.
         annotate_dequeue_wait(&mut next);
+        // Identity link: the persisted row names the entry it drained from.
+        stamp_queued_message_id(&mut next);
         // Delivery-time unblocked hints (monorepo#2044): resolved NOW, at
         // render time, from the trigger ids the wake stamped at enqueue.
         annotate_unblocked_hints(&self.services, &agent_id, std::slice::from_mut(&mut next)).await;
@@ -6650,6 +6747,10 @@ impl AgentManager {
             self.release_in_flight_slot(&agent_id);
             return;
         }
+        drop(draining);
+        self.services
+            .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+            .await;
         self.spawn_worker(
             agent_id,
             workspace_id,
@@ -6718,10 +6819,11 @@ impl AgentManager {
             }));
         }
         // Atomic dequeue under the queue lock: no concurrent drain can
-        // deliver the same entry twice.
-        let mut entry = self
+        // deliver the same entry twice. The entry stays listed in queue
+        // snapshots (§6.5 drain ordering) until `draining` is dropped.
+        let (mut entry, draining) = self
             .services
-            .take_queued_message(&agent_id, &message_id)
+            .take_queued_message_draining(&agent_id, &message_id)
             .ok_or_else(|| {
                 Error::InvalidParams(format!("queued message not found: {message_id}"))
             })?;
@@ -6732,18 +6834,15 @@ impl AgentManager {
         // Dequeue-wait note: parity with the drain paths — the "send now"
         // delivery tells the target when the entry was enqueued.
         annotate_dequeue_wait(&mut entry);
+        // Identity link: parity with the drain paths.
+        stamp_queued_message_id(&mut entry);
         // Delivery-time unblocked hints (monorepo#2044): parity with the
         // drain paths — resolved at render time.
         annotate_unblocked_hints(&self.services, &agent_id, std::slice::from_mut(&mut entry)).await;
-        // Publish the shrunk snapshot (write-through persist inside) so
-        // clients see the entry leave the queue before the turn starts.
-        self.services
-            .publish_queue_updated_for(
-                &agent_id,
-                &workspace_id,
-                self.services.queue_snapshot(&agent_id),
-            )
-            .await;
+        // Durable shrink now; the shrunk `agent:queue:updated` is published
+        // only after the user row below is persisted (§6.5 drain ordering),
+        // still before the turn starts.
+        self.services.persist_queue_snapshot(&agent_id).await;
         // Queue-drained turns carry no per-turn prompt hints of their own;
         // the entry's captured attachments and metadata ride along, same as
         // `try_drain_queue`.
@@ -6777,6 +6876,7 @@ impl AgentManager {
             entry.user_origin = true;
             let restored = entry.to_value(0);
             self.services.requeue_front(&agent_id, entry);
+            drop(draining);
             self.services.publish_queue_updated(&agent_id).await;
             return Ok(json!({
                 "success": true,
@@ -6819,6 +6919,7 @@ impl AgentManager {
                     // re-attempts the append), then surface the failure.
                     self.end_turn(&agent_id).await;
                     self.services.requeue_front(&agent_id, entry);
+                    drop(draining);
                     self.services.publish_queue_updated(&agent_id).await;
                     return Err(append_err);
                 }
@@ -6852,6 +6953,10 @@ impl AgentManager {
                     .await;
             }
         }
+        drop(draining);
+        self.services
+            .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+            .await;
         let entry_id = entry.id.clone();
         let turn_id = entry.turn_id.clone();
         self.spawn_worker(agent_id, workspace_id, entry.content, options, true);
@@ -6913,7 +7018,7 @@ impl AgentManager {
         self.stop(&agent_id).await;
         if self.services.clear_queue(&agent_id) {
             self.services
-                .publish_queue_updated_for(&agent_id, &workspace_id, Vec::new())
+                .publish_queue_updated_for(&agent_id, &workspace_id)
                 .await;
         }
         // Until the truncation actually lands, a failure must DISARM the
@@ -7248,19 +7353,35 @@ impl AgentManager {
         // the prepend TEXT (`history_covers_prepend`), same as the
         // preemption path; attachments are still emitted (history is
         // text-only).
+        // A combined flush turn also carries its entries for the per-entry
+        // context-size requeue (`flushed_entries`, intent-hq/intent#4703);
+        // that path restores the ENTRIES, not the aggregate options, so the
+        // payload is merged into the LAST entry as well — an individual
+        // restore then redelivers it exactly once, and the retry's next
+        // flush rebuilds the same aggregate order as this turn (entry
+        // prepends in entry order, then the stop redelivery) instead of
+        // losing it with the discarded aggregate prepend.
         let armed = self.stop_redelivery.lock().unwrap().remove(&agent_id);
         let consumed_redelivery = armed.is_some();
         if let Some(armed) = armed {
-            if let Some(text) = armed.content.filter(|t| !t.is_empty()) {
-                options.prepend_content = Some(match options.prepend_content.take() {
-                    Some(existing) if !existing.is_empty() => format!("{existing}\n\n{text}"),
-                    _ => text,
-                });
+            if let Some(last) = options
+                .flushed_entries
+                .as_mut()
+                .and_then(|entries| entries.last_mut())
+            {
+                merge_prepend_payload(
+                    &mut last.prepend_content,
+                    &mut last.prepend_image_blocks,
+                    &mut last.prepend_file_blocks,
+                    armed.clone(),
+                );
             }
-            options.prepend_image_blocks =
-                merge_block_arrays(options.prepend_image_blocks.take(), armed.image_blocks);
-            options.prepend_file_blocks =
-                merge_block_arrays(options.prepend_file_blocks.take(), armed.file_blocks);
+            merge_prepend_payload(
+                &mut options.prepend_content,
+                &mut options.prepend_image_blocks,
+                &mut options.prepend_file_blocks,
+                armed,
+            );
         }
         let mgr = self.clone();
         let id = agent_id.clone();
@@ -8198,6 +8319,14 @@ impl AgentManager {
         // Commit identity for `git commit` run by the agent's own tools
         // (intent-hq/intent#4142) — ungated: identity is not a secret.
         inject_git_identity_env(&mut opts.extra_env, opts.cwd);
+        // Record the identity this attempt runs under BEFORE anything below
+        // can fail: a spawn or session-setup failure is attributed to the
+        // provider that was actually tried, not to whatever the last committed
+        // turn ran on. Cleared on success at the end of this method.
+        self.spawn_attempt_provider
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone(), resolved.provider.id.to_string());
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
             // frontmatter (SP-B); falls back to the default interactive type so
@@ -8250,6 +8379,7 @@ impl AgentManager {
         // never blocks the turn.
         self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
             .await;
+        self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
     }
 
@@ -8434,7 +8564,7 @@ impl AgentManager {
     /// sweep: `try_claim` check-and-claims into `reap_claims` under the
     /// `busy` lock, `release` drops the claim and records the id for the
     /// post-sweep drain kick ([`Self::kick_released`]).
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     fn reap_claim_fns(
         &self,
     ) -> (
@@ -8731,7 +8861,7 @@ const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const KILL_SWEEP_REAP_GRACE: Duration = Duration::from_millis(500);
 
-#[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
+#[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
 /// Terminate a spawned provider's WHOLE process tree (§5.6). The child is its
 /// own process-group leader (`process_group(0)` at spawn), so `killpg(pgid,…)`
 /// reaches every descendant — `kill_on_drop` alone only reaps the direct child,
@@ -8766,11 +8896,12 @@ async fn kill_child_tree(mut child: Child, spawn_pid: Option<u32>) {
 /// Non-unix fallback: no process groups, so fall back to killing the direct
 /// child (`kill_on_drop` remains the safety net on drop).
 #[cfg(not(unix))]
+#[expect(clippy::unused_async)] // signature mirrors the unix variant so call sites stay identical
 async fn kill_child_tree(mut child: Child, _spawn_pid: Option<u32>) {
     let _ = child.start_kill();
 }
 
-#[allow(clippy::similar_names)] // pid/pgid are the POSIX terms
+#[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
 /// Parallel shutdown kill sweep: terminate MANY provider process trees under
 /// ONE shared grace window. Every group is `SIGTERMed` up-front, then a single
 /// [`PROCESS_GROUP_TERM_GRACE`] window covers the whole batch, then every
@@ -9084,6 +9215,26 @@ fn merge_block_arrays(first: Option<Value>, second: Option<Value>) -> Option<Val
     }
 }
 
+/// Merge a consumed zero-output stop-redelivery payload
+/// (intent-hq/monorepo#1757) into a `prepend_*` triple: an existing prepend
+/// text stays FIRST (the armed row is the newest prepend payload) and the
+/// block arrays concatenate in the same order.
+fn merge_prepend_payload(
+    prepend_content: &mut Option<String>,
+    prepend_image_blocks: &mut Option<Value>,
+    prepend_file_blocks: &mut Option<Value>,
+    armed: crate::agent_ops::QueuedPrepend,
+) {
+    if let Some(text) = armed.content.filter(|t| !t.is_empty()) {
+        *prepend_content = Some(match prepend_content.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}\n\n{text}"),
+            _ => text,
+        });
+    }
+    *prepend_image_blocks = merge_block_arrays(prepend_image_blocks.take(), armed.image_blocks);
+    *prepend_file_blocks = merge_block_arrays(prepend_file_blocks.take(), armed.file_blocks);
+}
+
 /// Push one `image` content block per well-formed `{ data, mimeType }` entry.
 fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value>) {
     if let Some(imgs) = image_blocks.and_then(Value::as_array) {
@@ -9119,6 +9270,55 @@ pub(crate) fn attachment_reference_notice(
     id: &str,
 ) -> String {
     crate::harness::latest().attachment_reference_notice(name, mime, size, id)
+}
+
+/// The recovery marker that replaces an oversized queue entry after a
+/// context-size turn failure (see [`CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`]).
+/// Wording owned by the harness (H6).
+pub(crate) fn context_size_requeue_marker(original_chars: usize) -> String {
+    crate::harness::latest().context_size_requeue_marker(original_chars)
+}
+
+/// The `(content, persisted, prepend_content)` a queue entry re-queues with
+/// after a context-size turn failure (intent-hq/intent#4703). `content` and
+/// `prepend_content` are measured SEPARATELY against
+/// [`CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`]: an oversized `content` becomes
+/// the recovery marker with `persisted` forced to `false` (the retry drain
+/// must append the marker as the turn's user row); an oversized
+/// `prepend_content` becomes the marker with `persisted` untouched (the
+/// prepend is prompt-only, its row is already durable). Payloads at or
+/// under the threshold pass through verbatim.
+fn requeue_payload_after_context_failure(
+    agent_id: &AgentId,
+    content: &str,
+    persisted: bool,
+    prepend_content: Option<&str>,
+) -> (String, bool, Option<String>) {
+    let content_chars = content.chars().count();
+    let (content, persisted) = if content_chars > CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS {
+        tracing::warn!(
+            agent = %agent_id,
+            chars = content_chars,
+            "context-size turn failure on an oversized queued message; requeueing a recovery marker instead of the payload"
+        );
+        (context_size_requeue_marker(content_chars), false)
+    } else {
+        (content.to_string(), persisted)
+    };
+    let prepend_content = prepend_content.map(|prepend| {
+        let prepend_chars = prepend.chars().count();
+        if prepend_chars > CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS {
+            tracing::warn!(
+                agent = %agent_id,
+                chars = prepend_chars,
+                "context-size turn failure on an oversized prepended message; requeueing a recovery marker instead of the payload"
+            );
+            context_size_requeue_marker(prepend_chars)
+        } else {
+            prepend.to_string()
+        }
+    });
+    (content, persisted, prepend_content)
 }
 
 /// Push one content block per well-formed file entry: inline
@@ -10265,8 +10465,11 @@ async fn run_message_worker(
         // unchanged.
         {
             let mode = mgr.services.flush_queued_messages_mode();
-            if let Some(batch) = mgr.services.dequeue_flush_batch(&agent_id, mode, false, 2) {
-                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+            if let Some((batch, draining)) = mgr
+                .services
+                .dequeue_flush_batch_draining(&agent_id, mode, false, 2)
+            {
+                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn {
                         content: c,
                         options: o,
@@ -10286,14 +10489,11 @@ async fn run_message_worker(
                 }
             }
         }
-        if let Some(mut next) = mgr.services.dequeue_message(&agent_id) {
-            mgr.services
-                .publish_queue_updated_for(
-                    &agent_id,
-                    &workspace_id,
-                    mgr.services.queue_snapshot(&agent_id),
-                )
-                .await;
+        if let Some((mut next, draining)) = mgr.services.dequeue_message_draining(&agent_id) {
+            // Durable shrink now; the shrunk `agent:queue:updated` is
+            // published only after the user row below is persisted (§6.5
+            // drain ordering).
+            mgr.services.persist_queue_snapshot(&agent_id).await;
             // Stale-redrive check (#576) BEFORE the transcript append so the
             // annotated content reaches both the persisted user row and the
             // provider prompt. Runs before the next iteration's report clear,
@@ -10301,6 +10501,8 @@ async fn run_message_worker(
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
             // Dequeue-wait note: same placement contract as the stale check.
             annotate_dequeue_wait(&mut next);
+            // Identity link: same placement as the single-entry drain arm.
+            stamp_queued_message_id(&mut next);
             // Delivery-time unblocked hints (monorepo#2044): resolved at
             // render time, same placement as the single-entry drain arm.
             annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
@@ -10360,6 +10562,10 @@ async fn run_message_worker(
                 mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
+            drop(draining);
+            mgr.services
+                .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+                .await;
             continue;
         }
         // Queue drained: release the slot, then re-check for a message that
@@ -10368,13 +10574,15 @@ async fn run_message_worker(
         // goes idle while ready-to-send messages remain — each re-claim of the
         // slot continues `'outer` and re-enters the drain at the top. The
         // popped entry travels as a batch so the slot-race failure below
-        // hands it back unchanged (`requeue_front_batch`).
+        // hands it back unchanged (`requeue_front_batch`); its draining guard
+        // (§6.5 drain ordering) rides in `raced_draining` and retires the
+        // entry from queue snapshots at every exit of this arm.
         mgr.end_turn(&agent_id).await;
-        let mut raced: Vec<QueuedMessage> = mgr
-            .services
-            .dequeue_message(&agent_id)
-            .into_iter()
-            .collect();
+        let (mut raced, mut raced_draining): (Vec<QueuedMessage>, Option<DrainingGuard>) =
+            match mgr.services.dequeue_message_draining(&agent_id) {
+                Some((next, guard)) => (vec![next], Some(guard)),
+                None => (Vec::new(), None),
+            };
         if raced.is_empty() {
             // monorepo#1297: heal a busy-misclassified terminal idle. The
             // turn's `agent:idle` is published while this worker still holds
@@ -10449,6 +10657,7 @@ async fn run_message_worker(
                 }
             }
             let mut next = raced.pop().expect("raced batch non-empty");
+            let mut draining = raced_draining.take().expect("raced batch guard");
             // Batch flush (`agents.flushQueuedMessages`): the single `next`
             // was popped before the slot re-claim, so fold any FURTHER
             // eligible entries in behind it and run them as one combined
@@ -10460,21 +10669,23 @@ async fn run_message_worker(
             // single-entry path below also runs unchanged.
             let mode = mgr.services.flush_queued_messages_mode();
             let extra_batch = match mode {
-                intent_core::FlushQueuedMessagesMode::All => {
-                    mgr.services.dequeue_ready_batch(&agent_id, false, 1)
-                }
+                intent_core::FlushQueuedMessagesMode::All => mgr
+                    .services
+                    .dequeue_ready_batch_draining(&agent_id, false, 1),
                 intent_core::FlushQueuedMessagesMode::SystemOnly => {
                     if next.user_origin {
                         None
                     } else {
-                        mgr.services.dequeue_system_only_batch(&agent_id, 1)
+                        mgr.services
+                            .dequeue_system_only_batch_draining(&agent_id, 1)
                     }
                 }
                 intent_core::FlushQueuedMessagesMode::Off => None,
             };
-            if let Some(mut batch) = extra_batch {
+            if let Some((mut batch, extra_draining)) = extra_batch {
                 batch.insert(0, next);
-                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch).await {
+                draining.merge(extra_draining);
+                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn {
                         content: c,
                         options: o,
@@ -10493,19 +10704,18 @@ async fn run_message_worker(
                     }
                 }
             }
-            mgr.services
-                .publish_queue_updated_for(
-                    &agent_id,
-                    &workspace_id,
-                    mgr.services.queue_snapshot(&agent_id),
-                )
-                .await;
+            // Durable shrink now; the shrunk `agent:queue:updated` is
+            // published only after the user row below is persisted (§6.5
+            // drain ordering).
+            mgr.services.persist_queue_snapshot(&agent_id).await;
             // Stale-redrive check (#576): same contract as the pre-release
             // drain arm. Runs only after the slot is re-claimed so a message
             // handed back via `requeue_front` below is never annotated here.
             let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
             // Dequeue-wait note: same placement contract as the stale check.
             annotate_dequeue_wait(&mut next);
+            // Identity link: same contract as the pre-release drain arm.
+            stamp_queued_message_id(&mut next);
             // Delivery-time unblocked hints (monorepo#2044): same contract
             // as the pre-release drain arm.
             annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
@@ -10559,12 +10769,17 @@ async fn run_message_worker(
                 mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
+            drop(draining);
+            mgr.services
+                .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+                .await;
             continue 'outer;
         }
         // A concurrent send won the slot; hand the message(s) back to it in
         // original order and exit — that worker's own drain loop will pick
         // them up.
         mgr.services.requeue_front_batch(&agent_id, raced);
+        drop(raced_draining);
         break 'outer;
     }
     mgr.clear_worker(&agent_id);
@@ -10643,9 +10858,10 @@ enum FlushPrep {
 /// sequence once per entry — stale-redrive (#576) + dequeue-wait annotation,
 /// then the transcript row append (`persist_user`; entries already persisted
 /// by a terminal-failure requeue are not re-appended) — while emitting ONE
-/// `agent:queue:updated` (the fully-shrunk queue) and ONE
 /// `agent:queue:processing` (the head entry, whose `turn_id` is the combined
-/// turn's id). Each row persist emits its normal `agent:message`, so clients
+/// turn's id) and, AFTER every row is persisted, ONE `agent:queue:updated`
+/// (the fully-shrunk queue; §6.5 drain ordering — the durable shrink itself
+/// happens up front). Each row persist emits its normal `agent:message`, so clients
 /// render N stacked user rows — and every row echo carries the COMBINED
 /// turn's `turn_id` (the head entry's), not the entry's own, so all N echoes
 /// correlate with the single `agent:queue:processing`/`agent:stream:*`
@@ -10669,19 +10885,21 @@ enum FlushPrep {
 /// requeued around it in original order — entries whose rows already
 /// persisted carry `persisted: true` so the retry drain never
 /// double-appends. Returns [`FlushPrep::Parked`].
+///
+/// `draining` is the batch's [`DrainingGuard`] (§6.5 drain ordering): it is
+/// dropped right before the settled snapshot is published, and at scope exit
+/// on the parked paths (after the requeues, so no snapshot ever misses an
+/// entry in between).
 async fn prepare_flush_turn(
     mgr: &AgentManager,
     agent_id: &AgentId,
     workspace_id: &WorkspaceId,
     mut entries: Vec<QueuedMessage>,
+    draining: DrainingGuard,
 ) -> FlushPrep {
-    mgr.services
-        .publish_queue_updated_for(
-            agent_id,
-            workspace_id,
-            mgr.services.queue_snapshot(agent_id),
-        )
-        .await;
+    // Durable shrink now; the ONE shrunk `agent:queue:updated` is published
+    // only after every row below is persisted (§6.5 drain ordering).
+    mgr.services.persist_queue_snapshot(agent_id).await;
     // Per-entry annotations, same order as the single-entry drain arms: the
     // stale check before the wait note, both before the row persist so the
     // persisted row and the provider prompt carry the same content.
@@ -10689,6 +10907,9 @@ async fn prepare_flush_turn(
     for entry in &mut entries {
         let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
         annotate_dequeue_wait(entry);
+        // Identity link: each row names its own entry (the batchId below
+        // groups them; this distinguishes them).
+        stamp_queued_message_id(entry);
         stale_flags.push(stale);
     }
     // Batch grouping stamp — after the wait stamps (it creates `queueInfo`
@@ -10755,14 +10976,14 @@ async fn prepare_flush_turn(
         // The handler's queue publish preceded the head requeue: re-publish
         // so clients see the fully-restored queue.
         mgr.services
-            .publish_queue_updated_for(
-                agent_id,
-                workspace_id,
-                mgr.services.queue_snapshot(agent_id),
-            )
+            .publish_queue_updated_for(agent_id, workspace_id)
             .await;
         return FlushPrep::Parked;
     }
+    drop(draining);
+    mgr.services
+        .publish_queue_updated_after_drain_persist(agent_id, workspace_id)
+        .await;
     let content = flush_combined_prompt(&entries);
     let mut image_blocks = None;
     let mut file_blocks = None;
@@ -10795,6 +11016,9 @@ async fn prepare_flush_turn(
         turn_id: Some(entries[0].turn_id.clone()),
         interrupt_priority: entries[0].interrupt_priority,
         origin: origin_from_user_flag(entries.iter().any(|m| m.user_origin)),
+        // Every entry is `persisted: true` here (the loop above either set
+        // it or returned Parked), so a per-entry requeue never re-appends.
+        flushed_entries: Some(entries),
         ..TurnOptions::default()
     };
     FlushPrep::Turn {
@@ -10831,7 +11055,7 @@ async fn prepare_flush_turn(
 /// queue entry's `user_origin` flag): only those appends schedule the
 /// debounced `lastActivity` event (§10.1) — internal wakes, agent-to-agent
 /// deliveries and system-injected turns are not workspace-ordering activity.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn persist_user(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -11009,7 +11233,7 @@ fn spawn_backoff_from(env_val: Option<&str>) -> (Vec<u64>, bool) {
 /// rather than pulling in a `rand` dependency.
 // Intentional lossy float math: the mantissa mask keeps `r` exact in f64,
 // delays are far below 2^53, and the final float→int cast saturates.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
@@ -11227,6 +11451,111 @@ async fn retry_spawn(
         .unwrap_or_else(|| Error::Internal("spawn retry loop exhausted without error".to_string())))
 }
 
+/// Machine-readable `errorCode` stamped on `agent:failed` when the turn died
+/// because the provider's usage allowance is spent (HTTP 429, an upstream
+/// `rate_limit_error`, an exhausted plan quota — see
+/// [`intent_acp::is_quota_exceeded`]). Before this, the only signal was the
+/// opaque rendered `error` prose, so a client wanting to offer "retry on
+/// another provider" had to pattern-match provider wording that changes
+/// without notice.
+pub(crate) const QUOTA_EXCEEDED_ERROR_CODE: &str = "quota-exceeded";
+
+/// Stamp the additive quota signal onto an `agent:failed` payload: an
+/// `errorCode` naming the machine-readable failure class, plus the
+/// `providerId` whose allowance ran out so the client knows which provider to
+/// steer AWAY from (omitted when the session's provider cannot be resolved —
+/// never `null`).
+///
+/// Strictly additive, on the same terms as `sessionCorrupted` on
+/// `agent:status-changed`: every existing field is untouched, and a
+/// non-quota failure emits byte-identically to before because callers only
+/// reach this after classifying. Shared by BOTH `agent:failed` publishers —
+/// the streaming path's own terminal emit in `agent_session.rs` and
+/// [`publish_terminal_failure_events`] here — so the two can never drift on
+/// field names or the code's spelling.
+pub(crate) fn stamp_quota_failure(data: &mut Value, provider_id: Option<&str>) {
+    data["errorCode"] = json!(QUOTA_EXCEEDED_ERROR_CODE);
+    if let Some(provider_id) = provider_id {
+        data["providerId"] = json!(provider_id);
+    }
+}
+
+#[cfg(test)]
+mod quota_failure_stamp_tests {
+    //! Wire-shape pins for the additive quota signal on `agent:failed`
+    //! ([`super::stamp_quota_failure`]), shared by both publishers.
+
+    use super::*;
+
+    /// The exact payload a quota failure emits: every field the event carried
+    /// before is byte-identical, with `errorCode` + `providerId` appended.
+    #[test]
+    fn stamps_error_code_and_provider_additively() {
+        let mut data =
+            json!({ "agentId": "a1", "error": "session/prompt failed: 429", "turnId": "t1" });
+        stamp_quota_failure(&mut data, Some("claude-code"));
+        assert_eq!(
+            data,
+            json!({
+                "agentId": "a1",
+                "error": "session/prompt failed: 429",
+                "turnId": "t1",
+                "errorCode": "quota-exceeded",
+                "providerId": "claude-code",
+            })
+        );
+    }
+
+    /// An unresolvable provider OMITS the field entirely — never `null`, the
+    /// same absent-not-false contract as `sessionCorrupted`.
+    #[test]
+    fn omits_provider_id_when_unresolved() {
+        let mut data = json!({ "agentId": "a1", "error": "boom" });
+        stamp_quota_failure(&mut data, None);
+        assert_eq!(
+            data,
+            json!({ "agentId": "a1", "error": "boom", "errorCode": "quota-exceeded" })
+        );
+        assert!(data.get("providerId").is_none());
+    }
+
+    /// The flattened wrapper the terminal-failure publisher actually sees —
+    /// `session/prompt failed: {AcpError}` with the 429 nested in the
+    /// JSON-RPC `data` — still classifies, so both publishers stamp the same
+    /// turn identically.
+    #[test]
+    fn flattened_prompt_wrapper_classifies_as_quota() {
+        let acp = intent_acp::AcpError::Rpc(intent_acp::JsonRpcError {
+            code: -32603,
+            message: "Internal error".to_string(),
+            data: Some(json!("{\"type\":\"rate_limit_error\"}")),
+        });
+        assert!(intent_acp::is_quota_exceeded(&acp));
+        let flattened = format!("{PROMPT_FAILED_PREFIX} {acp}");
+        assert!(intent_acp::message_is_quota_exceeded(&flattened));
+        // An ordinary terminal failure is untouched by the classifier, so it
+        // emits exactly what it emitted before.
+        assert!(!intent_acp::message_is_quota_exceeded(
+            "failed to persist user message to transcript; turn not started"
+        ));
+    }
+}
+
+/// Where a quota-classified terminal failure takes its `providerId` from —
+/// the provider whose allowance actually ran out depends on WHICH step failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailedProviderSource {
+    /// A turn that RAN failed (prompt rejected): the identity the failing
+    /// turn committed (`last_turn_provider`, session row as fallback — see
+    /// [`crate::agent_session::session_provider_id`]).
+    CommittedTurn,
+    /// The spawn / ACP session setup itself failed: the provider
+    /// [`AgentManager::ensure_started`] resolved for the attempt
+    /// (`spawn_attempt_provider`). Never `last_turn_provider`, which during a
+    /// failed startup still names the PREVIOUS identity after a switch.
+    SpawnAttempt,
+}
+
 /// Publish the terminal `agent:failed` + `agent:stream:end` event pair for a
 /// failure the streaming path did NOT already surface. The error message
 /// deliberately excludes recent stderr to avoid leaking secrets (API keys,
@@ -11237,6 +11566,7 @@ async fn publish_terminal_failure_events(
     workspace_id: &WorkspaceId,
     error_msg: &str,
     turn_id: Option<&str>,
+    provider_source: FailedProviderSource,
 ) {
     use intent_core::events::{AGENT_FAILED, AGENT_STREAM_END};
 
@@ -11253,6 +11583,34 @@ async fn publish_terminal_failure_events(
     if let Some(tid) = turn_id {
         failed_data["turnId"] = json!(tid);
         end_data["turnId"] = json!(tid);
+    }
+    // Same additive quota signal the streaming path stamps, so the two
+    // `agent:failed` publishers agree on the wire shape. Classified from the
+    // flattened text rather than an `AcpError`: by the time a failure reaches
+    // this publisher it has been through the `session/prompt failed: …` wrap
+    // boundary (or was never an ACP error at all — a spawn or a pre-turn
+    // persist failure), and the message-level classifier is the only surface
+    // left. The committed-turn store read is deliberately inside the branch: a
+    // terminal failure that is not a quota rejection costs exactly what it did
+    // before. A spawn-attempt record is consumed on EVERY failed spawn, quota
+    // or not: the terminal publisher runs once per failed attempt, and a
+    // record that outlived its attempt must not linger for an agent that is
+    // never retried nor be able to label an unrelated later failure.
+    let spawn_attempt = match provider_source {
+        FailedProviderSource::SpawnAttempt => {
+            mgr.spawn_attempt_provider.lock().unwrap().remove(agent_id)
+        }
+        FailedProviderSource::CommittedTurn => None,
+    };
+    if intent_acp::message_is_quota_exceeded(error_msg) {
+        let provider_id = match provider_source {
+            FailedProviderSource::CommittedTurn => {
+                crate::agent_session::session_provider_id(&mgr.services, workspace_id, agent_id)
+                    .await
+            }
+            FailedProviderSource::SpawnAttempt => spawn_attempt,
+        };
+        stamp_quota_failure(&mut failed_data, provider_id.as_deref());
     }
     crate::agent_session::trace_stream_lifecycle(
         turn_id,
@@ -11476,36 +11834,107 @@ async fn publish_error_status_and_requeue(
     // `id` but keeps the failed turn's ORIGINAL `turn_id` (monorepo#1022) so
     // the retry correlates with the turn it redrives; a missing option (bare
     // test wiring — spawn_worker always mints one) falls back to the new id.
-    let id = new_message_id();
-    let queued = crate::agent_ops::QueuedMessage {
-        turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
-        id,
-        content: content.to_string(),
-        image_blocks: options.image_blocks.clone(),
-        file_blocks: options.file_blocks.clone(),
-        queued_at: options.queued_at.clone().unwrap_or_else(now_iso),
-        editing: false,
-        persisted,
-        requeued_after_failure: true,
-        message_metadata: options.message_metadata.clone(),
-        prepend_content: options.prepend_content.clone(),
-        prepend_image_blocks: options.prepend_image_blocks.clone(),
-        prepend_file_blocks: options.prepend_file_blocks.clone(),
-        interrupt_priority: options.interrupt_priority,
-        user_origin: options.origin.is_user(),
-        hold_kind: None,
-        hold_until: None,
-        child_agent_id: None,
-    };
-    mgr.services.requeue_front(agent_id, queued);
+    //
+    // Context-size failure on an oversized entry (intent-hq/intent#4703): a
+    // 413 against a payload above `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`
+    // means the MESSAGE itself cannot fit, so re-queueing it verbatim would
+    // re-fail every retry and wedge the queue (hook payloads have no sender
+    // who could remove the entry). The content is replaced with a short
+    // recovery marker naming the dropped size, and `persisted` is forced to
+    // `false` so the retry drain appends the MARKER as the turn's user row
+    // and sends it to the provider — with `true` the drain would skip the
+    // append and the transcript would show the original text for a turn the
+    // provider never saw. The original row (when it was persisted) stays in
+    // the transcript untouched. A small entry that hits a 413 is the
+    // accumulated context's problem, not the message's: it re-queues
+    // unchanged and the identical-failure streak escalates as today.
+    // `content` and `prepend_content` are measured SEPARATELY: the prepend
+    // is prompt-only (its row is already persisted), so an oversized prepend
+    // is swapped for the marker without touching `persisted`.
+    //
+    // A combined flush turn (`options.flushed_entries`, `prepare_flush_turn`)
+    // delivered N entries as ONE prompt. On a context-size failure the
+    // entries are restored INDIVIDUALLY at the queue front in original
+    // order, each keeping its own id / `turn_id` / `queued_at` / metadata /
+    // `persisted` state, and only the entries above the threshold are
+    // replaced with the marker — so one oversized hook payload never takes
+    // its small siblings down with it, and a batch of small entries whose
+    // SUM exceeded the limit keeps every payload verbatim (the next flush
+    // still combines them; the per-entry drain never lost them). A stop
+    // redelivery consumed by the flush turn (`spawn_worker`) rides the LAST
+    // entry's `prepend_*`, so it is measured and restored with that entry
+    // — keeping the aggregate prepend order on the retry — rather than
+    // lost with the aggregate options. Any other failure on a
+    // flush turn requeues the combined prompt as ONE entry, exactly as
+    // before.
+    let context_size_failure = crate::is_context_size_error(error_text);
+    if let Some(entries) = options
+        .flushed_entries
+        .as_ref()
+        .filter(|entries| context_size_failure && !entries.is_empty())
+    {
+        let restored: Vec<crate::agent_ops::QueuedMessage> = entries
+            .iter()
+            .map(|entry| {
+                let (content, persisted, prepend_content) = requeue_payload_after_context_failure(
+                    agent_id,
+                    &entry.content,
+                    entry.persisted,
+                    entry.prepend_content.as_deref(),
+                );
+                crate::agent_ops::QueuedMessage {
+                    content,
+                    persisted,
+                    prepend_content,
+                    requeued_after_failure: true,
+                    editing: false,
+                    ..entry.clone()
+                }
+            })
+            .collect();
+        mgr.services.requeue_front_batch(agent_id, restored);
+    } else {
+        let (content, persisted, prepend_content) = if context_size_failure {
+            requeue_payload_after_context_failure(
+                agent_id,
+                content,
+                persisted,
+                options.prepend_content.as_deref(),
+            )
+        } else {
+            (
+                content.to_string(),
+                persisted,
+                options.prepend_content.clone(),
+            )
+        };
+        let id = new_message_id();
+        let queued = crate::agent_ops::QueuedMessage {
+            turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
+            id,
+            content,
+            image_blocks: options.image_blocks.clone(),
+            file_blocks: options.file_blocks.clone(),
+            queued_at: options.queued_at.clone().unwrap_or_else(now_iso),
+            editing: false,
+            persisted,
+            requeued_after_failure: true,
+            message_metadata: options.message_metadata.clone(),
+            prepend_content,
+            prepend_image_blocks: options.prepend_image_blocks.clone(),
+            prepend_file_blocks: options.prepend_file_blocks.clone(),
+            interrupt_priority: options.interrupt_priority,
+            user_origin: options.origin.is_user(),
+            hold_kind: None,
+            hold_until: None,
+            child_agent_id: None,
+        };
+        mgr.services.requeue_front(agent_id, queued);
+    }
 
     // Publish queue updated so FE reflects the requeued message
     mgr.services
-        .publish_queue_updated_for(
-            agent_id,
-            workspace_id,
-            mgr.services.queue_snapshot(agent_id),
-        )
+        .publish_queue_updated_for(agent_id, workspace_id)
         .await;
 
     // A top-level agent parked in Error drives the `failed` displayStatus
@@ -11669,6 +12098,7 @@ async fn handle_terminal_spawn_failure(
         workspace_id,
         &error_text,
         options.turn_id.as_deref(),
+        FailedProviderSource::SpawnAttempt,
     )
     .await;
     publish_error_status_and_requeue(
@@ -11714,6 +12144,7 @@ async fn handle_drain_persist_failure(
         workspace_id,
         &error_text,
         options.turn_id.as_deref(),
+        FailedProviderSource::CommittedTurn,
     )
     .await;
     publish_error_status_and_requeue(
@@ -12063,6 +12494,7 @@ async fn handle_terminal_turn_failure(
             workspace_id,
             &error_text,
             options.turn_id.as_deref(),
+            FailedProviderSource::CommittedTurn,
         )
         .await;
     }
@@ -12137,6 +12569,7 @@ mod role_reminder_tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -13022,8 +13455,16 @@ mod role_reminder_tests {
 
     /// Make the agent's snapshot non-trivial (one pending queued message).
     fn make_snapshot_nontrivial(mgr: &AgentManager, agent_id: &AgentId) {
-        mgr.services
-            .enqueue_message(agent_id, "pending".into(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            agent_id,
+            "pending".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
     }
 
     /// A trivial snapshot (all counts zero, no attention) never injects:
@@ -13817,10 +14258,20 @@ mod dead_child_respawn_tests {
     async fn agent_root_pids_maps_child_pids_and_skips_pidless_handles() {
         let (mgr, _seeded, _db) = manager_with(None, None).await;
 
-        // A live child whose pid is known: it must appear in the map.
+        // A live child whose pid is known: it must appear in the map. Spawn
+        // it the way production does (`process_group(0)` + `kill_on_drop`):
+        // `mgr.stop` tears down by `killpg` on the child's own group, so a
+        // child left in the test's group survives the kill and outlives the
+        // test holding the harness stdio pipes (nextest LEAK, intent#4221).
+        // Null stdio so nothing can hold those pipes even if teardown fails.
         let with_pid = AgentId::from("agent-root-pid");
         let child = tokio::process::Command::new("sleep")
             .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
             .spawn()
             .expect("spawn sleeping child");
         let pid = child.id().expect("live child has a pid");
@@ -13874,7 +14325,7 @@ mod dead_child_respawn_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod legacy_feature_freeze_tests {
     //! Lazy legacy feature freeze (intent-hq/monorepo#2459, H2 scope
     //! addition): a pre-0096 session whose `harness_features` is NULL gets
@@ -14227,8 +14678,16 @@ mod v1_turn_envelope_goldens {
         // and make the snapshot non-trivial (one queued message).
         let mock = intent_providers::find_provider("mock").unwrap();
         mgr.arm_first_turn_prepend(&agent_id, mock);
-        mgr.services
-            .enqueue_message(&agent_id, "pending".into(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &agent_id,
+            "pending".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
         let options = TurnOptions {
             stdin_context: Some("repo: demo".to_string()),
             ..Default::default()
@@ -14379,6 +14838,7 @@ mod uniform_isolation_tests {
     ) -> Workspace {
         let ts = now_iso();
         Workspace {
+            browser_client_id: None,
             pending_delete_at: None,
             context_links: None,
             waiting: false,
@@ -14716,7 +15176,7 @@ mod uniform_isolation_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod thought_level_tests {
     //! Generic reasoning-effort application (PROTOCOL §5.5): the session's
     //! `reasoningEffort` reaches the provider through whatever
@@ -15080,7 +15540,7 @@ mod rebuild_spawn_opts_tests {
 }
 
 #[cfg(all(test, unix))]
-#[allow(clippy::used_underscore_binding)] // tests read the RAII `_extension` field; underscore documents production intent
+#[expect(clippy::used_underscore_binding)] // tests read the RAII `_extension` field; underscore documents production intent
 mod pi_extension_delivery_tests {
     //! Unit tests for the pi-extension MCP delivery spawn assembly: the two
     //! per-agent temp files (bundled extension + 0755 wrapper), the two spawn
@@ -15913,6 +16373,7 @@ mod agent_retry_tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -16035,6 +16496,7 @@ mod agent_retry_tests {
             None,
             None,
             false,
+            intent_core::MessageOrigin::Automatic,
         );
 
         let result = mgr
@@ -16079,6 +16541,7 @@ mod agent_retry_tests {
                     None,
                     None,
                     false,
+                    intent_core::MessageOrigin::Automatic,
                 );
                 mgr.clone()
                     .try_drain_queue(agent_id.clone(), ws.clone())

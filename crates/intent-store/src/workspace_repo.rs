@@ -1,9 +1,9 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    now_iso, CheckoutMode, ContextLink, Error, PullRequestInfo, Result, SandboxType, SetupScript,
-    TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    CHIEF_WORKSPACE_ID,
+    now_iso, CheckoutMode, ClientId, ContextLink, Error, PullRequestInfo, Result, SandboxType,
+    SetupScript, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -18,7 +18,7 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
-    execution_environment";
+    browser_client_id, execution_environment";
 
 /// SQL behind [`Store::clear_workspace_unread_if_all_seen`], extracted so the
 /// monorepo#4190 plan-shape guard runs `EXPLAIN` on the exact production
@@ -62,7 +62,7 @@ impl Store {
     ) -> Result<()> {
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -98,6 +98,7 @@ impl Store {
             .bind(token_usage_to_db(ws)?)
             .bind(setup_script_to_db(ws)?)
             .bind(checkout_mode_to_db(ws)?)
+            .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
             .bind(execution_environment_to_db(ws)?)
             .bind(auto_commit.map(i64::from))
             .execute(self.write_pool())
@@ -525,6 +526,9 @@ impl Store {
     /// `recentlyDeletedWorkspaces` parity, persisted across restarts).
     /// Also removes the workspace's `draft` rows explicitly — `draft` has no
     /// workspace FK (opaque keys, PROTOCOL §5.16), so no cascade applies.
+    /// The `browser_tab` rows cascade, and their process-local `displayed`
+    /// overlay entries are evicted once the cascade has committed (see
+    /// `browser_tab_repo`).
     ///
     /// Uses whole-transaction retry to eliminate `SQLITE_BUSY` (code 5) failures
     /// during lock upgrade under concurrent load (STAB-7).
@@ -536,11 +540,12 @@ impl Store {
         let pool = self.write_pool();
         let id = id.clone();
 
-        crate::with_write_txn_retry(|| async {
+        let tab_ids = crate::with_write_txn_retry(|| async {
             let mut tx = pool
                 .begin()
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace tx failed: {e}")))?;
+            let tab_ids = crate::browser_tab_repo::workspace_tab_ids(&mut tx, &id).await?;
             // Child-table cleanup first (defensive ordering); on the NotFound
             // early-return below the rollback undoes it.
             sqlx::query("DELETE FROM draft WHERE workspace_id = ?")
@@ -567,9 +572,12 @@ impl Store {
             tx.commit()
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace commit failed: {e}")))?;
-            Ok(())
+            Ok(tab_ids)
         })
-        .await
+        .await?;
+        self.browser_tab_displayed
+            .forget_all(tab_ids.iter().map(String::as_str));
+        Ok(())
     }
 
     /// Whether a workspace id was ever used — a live row exists **or** a
@@ -673,6 +681,50 @@ impl Store {
             .map_err(|e| Error::Internal(format!("get auto_commit_enabled failed: {e}")))?;
         match row {
             Some(r) => Ok(col::<Option<i64>>(&r, "auto_commit_enabled")?.map(|v| v != 0)),
+            None => Err(Error::NotFound(format!("workspace {id}"))),
+        }
+    }
+
+    /// Scoped write of the per-workspace browser-client pin (REV-2,
+    /// `workspace.setBrowserClient`): `None` clears it. This setter is the
+    /// only writer of the column after insert — `update_workspace` never
+    /// touches it (like `auto_commit_enabled`), so a stale `Workspace`
+    /// snapshot passed to a general update cannot revert a concurrent pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_browser_client(
+        &self,
+        id: &WorkspaceId,
+        client_id: Option<&ClientId>,
+    ) -> Result<()> {
+        let res = sqlx::query("UPDATE workspace SET browser_client_id = ? WHERE id = ?")
+            .bind(client_id.map(|c| c.0.as_str()))
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set browser_client_id failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
+    /// The persisted per-workspace browser-client pin; `Ok(None)` when
+    /// unpinned. `NotFound` when the workspace does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn workspace_browser_client(&self, id: &WorkspaceId) -> Result<Option<ClientId>> {
+        let row = sqlx::query("SELECT browser_client_id FROM workspace WHERE id = ?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("get browser_client_id failed: {e}")))?;
+        match row {
+            Some(r) => Ok(col::<Option<String>>(&r, "browser_client_id")?.map(ClientId)),
             None => Err(Error::NotFound(format!("workspace {id}"))),
         }
     }
@@ -890,6 +942,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         // cow_supported is computed on the emit path (intent-services), never persisted.
         cow_supported: None,
         checkout_mode,
+        browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
         execution_environment,
         // disk_usage is computed on the emit path (intent-services), never persisted.
         disk_usage: None,

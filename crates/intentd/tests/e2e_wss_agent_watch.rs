@@ -40,7 +40,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,7 +56,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
@@ -64,7 +63,7 @@ type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
@@ -72,19 +71,15 @@ impl Drop for Daemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
         if std::thread::panicking() {
-            if let Ok(log) = std::fs::read_to_string(self.data_dir.join("daemon.log")) {
+            if let Ok(log) = std::fs::read_to_string(self.data_dir.path().join("daemon.log")) {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
             }
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-watch-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-watch-")
 }
 
 fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
@@ -354,6 +349,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -381,7 +377,8 @@ async fn boot_daemon(
     sub_event_types: Value,
     budget: Budget,
 ) -> Setup {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let ws_id = seed_workspace_only(&data_dir).await;
     let env: [(&str, &str); 4] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
@@ -392,7 +389,7 @@ async fn boot_daemon(
     let child = spawn_serve(&data_dir, &env);
     let daemon = Daemon {
         child,
-        data_dir: data_dir.clone(),
+        data_dir: data_dir_guard,
     };
     let socket = data_dir.join("intentd.sock");
     // Startup is clamped to the same whole-test budget: the shared
@@ -1913,9 +1910,20 @@ async fn report_progress_keeps_original_watch_for_terminal_completion_over_wss()
     )
     .await;
     let wakes = wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, "completed.").await;
+    req_id += 1;
     assert_eq!(wakes, 1, "exactly one terminal completion wake");
-    let n = watch_count_on_target(&mut setup.rpc, req_id + 1, &ws_id, &parent, &child).await;
-    assert_eq!(n, 0, "terminal completion retires the original watch");
+    // The wake row is visible before the retire write commits (monorepo#4380):
+    // poll for retirement instead of a one-shot read.
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        &child,
+        0,
+        budget.step(60),
+    )
+    .await;
 }
 
 /// The child reports during a silent in-turn tail. The report wake is visible
@@ -2048,8 +2056,17 @@ async fn in_turn_progress_is_followed_by_terminal_wake_over_wss() {
         wake_row_count(&mut setup.rpc, req_id, &ws_id, &parent, "reported. Report:").await;
     req_id += 1;
     assert_eq!(reports, 1, "exactly one report wake in the cycle");
-    let n = watch_count_on_target(&mut setup.rpc, req_id, &ws_id, &parent, &child).await;
-    assert_eq!(n, 0, "terminal completion retires the original watch");
+    // Same retire-after-wake window as monorepo#4380: poll for retirement.
+    await_watch_count(
+        &mut setup.rpc,
+        &mut req_id,
+        &ws_id,
+        &parent,
+        &child,
+        0,
+        budget.step(60),
+    )
+    .await;
 }
 
 /// monorepo#2532 Gap B: arming a watch on a child that REPORTED and idled
@@ -2339,7 +2356,7 @@ async fn wake_rows_serialized(
         .collect()
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#2528: the immediate `agent.reportToParent` wake over the real
 /// transport says "reported" (a report is not necessarily a completion) and
 /// keeps the parent's ungrouped completion watch armed across progress:
@@ -2610,7 +2627,6 @@ async fn report_wake_disclosure_tracks_progress_and_terminal_watch_over_wss() {
     );
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Monitoring-idle advisory persistence (intent-hq/intent#4254): a child
 /// that goes idle while only externally monitoring (an active background
 /// hook here — the cheapest external wait to arrange hermetically; PR

@@ -23,7 +23,7 @@ use crate::protocol::PROTOCOL_VERSION;
 /// is not stored here; it is applied when the snapshot is rendered to JSON.
 // The bools (`uds`, `tcp`, `has_display`, `update_supported`) are independent
 // wire-facing status flags, not an encoded state machine.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct SystemStatus {
     /// Derived listen mode: `both` while the TCP listener (secure WSS, or
@@ -140,6 +140,14 @@ pub struct SystemStatus {
     /// down), so the whole `fileWatch` object is presence-detected on the
     /// wire — absent when `None`, never null.
     pub file_watch: Option<FileWatchStatus>,
+    /// Open file descriptors held by the daemon process, from the background
+    /// own-process sampler (intent-hq/intent#4390). `None` until the first
+    /// sample lands or where the count is unavailable (non-Linux/macOS).
+    /// Presence-detected on the wire — omitted when `None`, never null.
+    pub fd_count: Option<u64>,
+    /// Soft `RLIMIT_NOFILE` in effect after the startup raise. `None` where
+    /// the limit could not be read (non-Unix). Presence-detected on the wire.
+    pub fd_limit: Option<u64>,
     /// Whether `system.requestUpdate` can currently succeed
     /// (intent-hq/intent#3875): true exactly when the daemon is
     /// sitter-supervised, per the same pidfile + parent/name verification
@@ -372,6 +380,12 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
                 "failedRoots": fw.failed_roots,
             }),
         );
+    }
+    if let Some(count) = status.fd_count {
+        obj.insert("fdCount".into(), count.into());
+    }
+    if let Some(limit) = status.fd_limit {
+        obj.insert("fdLimit".into(), limit.into());
     }
     v
 }

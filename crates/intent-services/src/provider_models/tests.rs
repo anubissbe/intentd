@@ -11,7 +11,9 @@ use super::parse::{
 use super::parse::{
     is_auth_required_error, parse_acp_models, parse_codex_acp_models, parse_opencode_models,
 };
-use super::probe::{exit_attribution, ProbeError};
+#[cfg(unix)]
+use super::probe::exit_attribution;
+use super::probe::ProbeError;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -601,6 +603,7 @@ async fn antigravity_auth_accepts_valid_empty_catalog_and_detects_browser_guard(
 /// timeout); under full-suite parallel load an unserialized child can be
 /// starved past its budget, flaking the probe. `unwrap_or_else(into_inner)`
 /// recovers from a poisoned lock so one panicking test does not cascade.
+#[cfg(unix)]
 static CHILD_SPAWN_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Recorded (trimmed) response from
@@ -1287,6 +1290,56 @@ fn parse_codex_models_collapse_live_bracket_effort_ids() {
 }
 
 #[test]
+fn parse_codex_models_collapse_live_1_9_0_new_model_catalog() {
+    // Canned from a live codex-acp@1.9.0 session/new result (2026-09-04).
+    let payload = json!({
+        "models": { "availableModels": [
+            { "modelId": "vega-alpha[low]", "name": "vega-alpha (low)",
+              "description": "Latest frontier agentic coding model. Fast responses with lighter reasoning" },
+            { "modelId": "vega-alpha[medium]", "name": "vega-alpha (medium)",
+              "description": "Latest frontier agentic coding model. Balances speed and reasoning depth for everyday tasks" },
+            { "modelId": "vega-alpha[high]", "name": "vega-alpha (high)",
+              "description": "Latest frontier agentic coding model. Greater reasoning depth for complex problems" },
+            { "modelId": "vega-alpha[xhigh]", "name": "vega-alpha (xhigh)",
+              "description": "Latest frontier agentic coding model. Extra high reasoning depth for complex problems" },
+            { "modelId": "vega-alpha[max]", "name": "vega-alpha (max)",
+              "description": "Latest frontier agentic coding model. Maximum reasoning depth for the hardest problems" },
+            { "modelId": "vega-alpha[ultra]", "name": "vega-alpha (ultra)",
+              "description": "Latest frontier agentic coding model. Maximum reasoning with automatic task delegation" },
+            { "modelId": "gpt-6-astra[low]", "name": "GPT-6-Astra (low)",
+              "description": "Our most capable model for complex, demanding work. Fast responses with lighter reasoning" },
+            { "modelId": "gpt-6-astra[medium]", "name": "GPT-6-Astra (medium)",
+              "description": "Our most capable model for complex, demanding work. Balances speed and reasoning depth for everyday tasks" },
+            { "modelId": "gpt-6-astra[high]", "name": "GPT-6-Astra (high)",
+              "description": "Our most capable model for complex, demanding work. Greater reasoning depth for complex problems" },
+            { "modelId": "gpt-6-astra[xhigh]", "name": "GPT-6-Astra (xhigh)",
+              "description": "Our most capable model for complex, demanding work. Extra high reasoning depth for complex problems" },
+            { "modelId": "gpt-6-astra[max]", "name": "GPT-6-Astra (max)",
+              "description": "Our most capable model for complex, demanding work. Maximum reasoning depth for the hardest problems" },
+            { "modelId": "gpt-6-astra[ultra]", "name": "GPT-6-Astra (ultra)",
+              "description": "Our most capable model for complex, demanding work. Maximum reasoning with automatic task delegation" }
+        ] },
+        "configOptions": [
+            { "id": "model", "options": [
+                { "value": "vega-alpha", "name": "vega-alpha",
+                  "description": "Latest frontier agentic coding model." },
+                { "value": "gpt-6-astra", "name": "GPT-6-Astra",
+                  "description": "Our most capable model for complex, demanding work." }
+            ] }
+        ]
+    });
+    let rows = parse_codex_acp_models(&payload);
+    let ids: Vec<&str> = rows.iter().map(|row| row["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["vega-alpha", "gpt-6-astra"]);
+    for row in rows {
+        assert_eq!(
+            row["effortLevels"],
+            json!(["low", "medium", "high", "xhigh", "max", "ultra"])
+        );
+    }
+}
+
+#[test]
 fn parse_codex_models_none_only_variant_has_no_effort_evidence() {
     let payload = json!({
         "models": { "availableModels": [
@@ -1571,7 +1624,7 @@ fn grok_outcome_rows_win_over_failed_exit() {
 // Holds CHILD_SPAWN_SERIAL across the spawn/await on purpose: the guard must
 // cover the whole child-spawning body so these fake-CLI execs never run
 // concurrently and starve one another.
-#[allow(clippy::await_holding_lock)]
+#[expect(clippy::await_holding_lock)]
 async fn opencode_models_cli_child_path_includes_binary_dir() {
     use std::os::unix::fs::PermissionsExt;
     // A fake opencode whose success is gated on its own parent dir being on
@@ -1603,7 +1656,7 @@ async fn opencode_models_cli_child_path_includes_binary_dir() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn grok_models_cli_child_path_includes_binary_dir() {
     use std::os::unix::fs::PermissionsExt;
     // Same enhanced-path contract as the opencode CLI spawn: the fake grok
@@ -1629,7 +1682,7 @@ async fn grok_models_cli_child_path_includes_binary_dir() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn grok_cli_timeout_flows_into_attributed_warning() {
     use std::os::unix::fs::PermissionsExt;
     // A wedged `grok models` must be cut short and the timeout reason must
@@ -2026,7 +2079,7 @@ async fn probe_rpc_error_survives_dead_child() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
     use std::os::unix::fs::PermissionsExt;
     // A wedged `opencode models` must be reaped when the timeout elapses and
@@ -2079,7 +2132,7 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
+#[expect(clippy::await_holding_lock)] // deliberate: serialize the whole child spawn (see above)
 async fn opencode_timeout_flows_into_attributed_warning() {
     use std::os::unix::fs::PermissionsExt;
     // The timeout reason must surface through the fetch result attribution
@@ -2141,7 +2194,7 @@ fn parse_param_count_billions_handles_dense_and_moe_names() {
 
 #[test]
 // Small test constants: float→int casts are exact and saturating.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn fits_within_ram_applies_the_seventy_percent_threshold() {
     // A 20B dense model: ~20e9 * 0.6 + 1GiB headroom ≈ 12.99 GB. Comfortably
     // under 70% of 32 GiB (~22.4 GB).
@@ -2157,7 +2210,7 @@ fn fits_within_ram_applies_the_seventy_percent_threshold() {
 
 #[test]
 // Small test constants: float↔int casts are exact and saturating.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss

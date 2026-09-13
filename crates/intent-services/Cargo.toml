@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.9.19"
+version = "0.9.54"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,19 +8,19 @@ license.workspace = true
 description = "Shared business-logic surface invoked by every transport and the agent MCP server"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.9.19" }
-intent-store = { path = "../intent-store", version = "0.9.19" }
-intent-git = { path = "../intent-git", version = "0.9.19" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.19" }
-intent-linear = { path = "../intent-linear", version = "0.9.19" }
-intent-sentry = { path = "../intent-sentry", version = "0.9.19" }
+intent-core = { path = "../intent-core", version = "0.9.54" }
+intent-store = { path = "../intent-store", version = "0.9.54" }
+intent-git = { path = "../intent-git", version = "0.9.54" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.9.54" }
+intent-linear = { path = "../intent-linear", version = "0.9.54" }
+intent-sentry = { path = "../intent-sentry", version = "0.9.54" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.9.19" }
-intent-js = { path = "../intent-js", version = "0.9.19" }
-intent-context = { path = "../intent-context", version = "0.9.19" }
-intent-providers = { path = "../intent-providers", version = "0.9.19" }
-intent-pty = { path = "../intent-pty", version = "0.9.19" }
-intent-search = { path = "../intent-search", version = "0.9.19" }
+intent-acp = { path = "../intent-acp", version = "0.9.54" }
+intent-js = { path = "../intent-js", version = "0.9.54" }
+intent-context = { path = "../intent-context", version = "0.9.54" }
+intent-providers = { path = "../intent-providers", version = "0.9.54" }
+intent-pty = { path = "../intent-pty", version = "0.9.54" }
+intent-search = { path = "../intent-search", version = "0.9.54" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }
@@ -32,7 +32,6 @@ tracing = { workspace = true }
 serde = { workspace = true }
 time = { workspace = true, features = ["formatting", "local-offset"] }
 similar = { version = "3.1.1", default-features = false }
-yrs = "0.27.2"
 serde_yaml = "0.9"
 async-recursion = "1.1"
 toml_edit = "0.25.5"
@@ -57,7 +56,7 @@ image = { version = "0.25.6", default-features = false, features = ["png", "jpeg
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process"] }
 pprof = "0.15"
-libc = "0.2"
+libc = { workspace = true }
 
 [lints]
 workspace = true

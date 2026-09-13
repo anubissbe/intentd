@@ -75,6 +75,80 @@ fn connect_mock(
     (conn, responder, stderr_w)
 }
 
+/// Records the rendered fields of every WARN the reader task emits. The reader
+/// runs as a task on the test's current-thread runtime, so a thread-local
+/// subscriber observes it.
+#[derive(Clone, Default)]
+struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl WarnCapture {
+    fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Install `self` as the thread-local default, pinning callsite interest
+    /// at `sometimes` first via a process-global anchor so a rebuild on a
+    /// subscriber-less thread cannot cache the callsite as `never`
+    /// (monorepo#3580).
+    fn set_as_default(&self) -> tracing::subscriber::DefaultGuard {
+        static ANCHOR: std::sync::Once = std::sync::Once::new();
+        ANCHOR.call_once(|| {
+            tracing::subscriber::set_global_default(InterestAnchor)
+                .expect("intent-acp tests own this process's global tracing default");
+        });
+        tracing::subscriber::set_default(self.clone())
+    }
+}
+
+impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Visitor(String);
+        impl tracing::field::Visit for Visitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+        let mut visitor = Visitor(String::new());
+        event.record(&mut visitor);
+        self.0.lock().unwrap().push(visitor.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Consumes nothing itself (`enabled` is always false) — it exists only so
+/// every callsite resolves to `sometimes` instead of a cached `never`.
+struct InterestAnchor;
+
+impl tracing::Subscriber for InterestAnchor {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 #[tokio::test]
 async fn handshake_completes() {
     let provider = intent_providers::find_provider("auggie").unwrap();
@@ -127,6 +201,54 @@ async fn antigravity_auth_marker_fails_pending_and_future_requests_without_url()
     assert_eq!(conn.pending_len(), 0);
 }
 
+/// An unparseable stdout line is attributed to its agent and measured, never
+/// echoed: the WARN carries the agent id and the line length only.
+#[tokio::test]
+async fn unparseable_stdout_line_warns_with_agent_and_length_only() {
+    let capture = WarnCapture::default();
+    let _guard = capture.set_as_default();
+    let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
+    let (mut a2c_agent, a2c_client) = tokio::io::duplex(4096);
+    let _conn = Connection::new(
+        c2a_client,
+        a2c_client,
+        None,
+        ConnectionHooks {
+            agent_id: Some("agent-7".to_string()),
+            ..ConnectionHooks::default()
+        },
+    );
+
+    let line = "this is not json: sensitive transcript text";
+    a2c_agent
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .unwrap();
+    a2c_agent.flush().await.unwrap();
+    for _ in 0..200 {
+        if !capture.lines().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let lines = capture.lines();
+    assert_eq!(lines.len(), 1, "exactly one parse WARN: {lines:?}");
+    let rendered = &lines[0];
+    assert!(
+        rendered.contains("agent=\"agent-7\""),
+        "the WARN names the owning agent: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("line_len={}", line.len())),
+        "the WARN carries the line length: {rendered}"
+    );
+    assert!(
+        !rendered.contains("sensitive transcript text"),
+        "the line content never enters the log: {rendered}"
+    );
+}
+
 #[tokio::test]
 async fn concurrent_writes_do_not_interleave() {
     let (conn, responder, _stderr) = connect_mock(ConnectionHooks::default());
@@ -164,6 +286,7 @@ async fn routes_requests_and_notifications() {
         auth_error_patterns: Vec::new(),
         stderr_log_dir: None,
         auth_required_stdout_marker: None,
+        agent_id: None,
     };
 
     let (c2a_client, _c2a_agent) = tokio::io::duplex(4096);
@@ -1182,6 +1305,91 @@ mod session_tests {
     }
 
     #[test]
+    fn derive_tool_name_recognizes_workspace_api_input_shape() {
+        // intent-hq/intent#4491: auggie titles a `workspace_api` call with the
+        // model-authored `summary` (prose, no `name`, `kind: other`), so only
+        // the `{ code, summary }` input identifies the tool.
+        let input = json!({
+            "code": "return await ws.workspace.proposeSibling({ title: 't', initialPrompt: 'p' })",
+            "summary": "Propose the follow-up settings change",
+        });
+        assert_eq!(
+            session::derive_tool_name("Propose the follow-up settings change", Some(&input)),
+            "workspace_api"
+        );
+        // A prose summary that happens to look like `<name>: <description>`
+        // must not be split into a bogus tool name.
+        assert_eq!(
+            session::derive_tool_name("Note: append the plan to the spec", Some(&input)),
+            "workspace_api"
+        );
+        // Providers that do title the call with the tool name agree.
+        for title in [
+            "workspace_api",
+            "workspace_api_workspace-mcp",
+            "workspace-mcp_workspace_api",
+            "mcp.workspace-mcp.workspace_api",
+            "mcp__workspace-mcp__workspace_api",
+        ] {
+            assert_eq!(
+                session::derive_tool_name(title, Some(&input)),
+                "workspace_api",
+                "title={title}"
+            );
+        }
+        // A daemon-stamped `_acpTitle` echo on the input is tolerated.
+        assert_eq!(
+            session::derive_tool_name(
+                "Propose",
+                Some(&json!({ "code": "return 1", "summary": "Propose", "_acpTitle": "Propose" }))
+            ),
+            "workspace_api"
+        );
+        // Explicitly namespaced foreign MCP titles are authoritative: a
+        // foreign tool whose arguments happen to be `{ code, summary }` keeps
+        // its own name and must never be mistaken for the daemon's tool.
+        for (title, name) in [
+            ("mcp.python.execute", "python_execute"),
+            ("mcp__python__execute", "python_execute"),
+        ] {
+            assert_eq!(
+                session::derive_tool_name(title, Some(&input)),
+                name,
+                "title={title}"
+            );
+        }
+        // Extra keys mean another tool's arguments, not the workspace_api
+        // schema.
+        assert_eq!(
+            session::derive_tool_name(
+                "Run Python",
+                Some(&json!({ "code": "print(1)", "summary": "Run Python", "language": "python" }))
+            ),
+            "Run Python"
+        );
+        // Both keys are required, as strings; `code` must be non-empty.
+        assert_eq!(
+            session::derive_tool_name("Run some code", Some(&json!({ "code": "return 1" }))),
+            "Run some code"
+        );
+        assert_eq!(
+            session::derive_tool_name("Summarize", Some(&json!({ "summary": "x" }))),
+            "Summarize"
+        );
+        assert_eq!(
+            session::derive_tool_name("Run", Some(&json!({ "code": "", "summary": "empty code" }))),
+            "Run"
+        );
+        assert_eq!(
+            session::derive_tool_name(
+                "Run",
+                Some(&json!({ "code": ["not", "a", "string"], "summary": "x" }))
+            ),
+            "Run"
+        );
+    }
+
+    #[test]
     fn derive_tool_name_strips_opencode_mcp_prefix() {
         // Opencode names MCP tools `<server>_<tool>` (leading prefix), the
         // mirror image of auggie's trailing suffix. Captured from opencode
@@ -1665,6 +1873,123 @@ mod session_tests {
     }
 
     #[test]
+    fn foreign_mcp_tool_with_code_summary_arguments_never_claims_pending_attachments() {
+        // intent-hq/intent#4491 negative control across the mapper and the
+        // §7.1 registry: a non-workspace_api tool completing while a batch is
+        // pending must not claim it, even when its arguments are shaped
+        // `{ code, summary }`. Codex `server`/`tool` metadata and namespaced
+        // titles are authoritative over the input-shape rule — in the mapper
+        // AND at the registry's input-shape claim gate, which the transcript
+        // writer feeds only for calls the mapper did NOT identify
+        // authoritatively (`name_authoritative`). The titles here equal the
+        // model-authored `summary` on purpose: nothing constrains a summary
+        // from matching the title, and the codex unwrap strips `server`/`tool`
+        // from the recorded input, so the input alone cannot tell these
+        // frames from auggie's.
+        use intent_core::turn_attachments::{
+            AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry,
+        };
+        use intent_core::AgentId;
+
+        // What the transcript writer hands the claim gate.
+        let gate_input = |tc: &session::MappedToolCall| {
+            (!tc.name_authoritative).then(|| {
+                let mut input = tc.input.clone();
+                input["_acpTitle"] = json!(tc.title);
+                input
+            })
+        };
+        let reg = TurnAttachmentRegistry::new();
+        let agent = AgentId::from_string("agent-4491");
+        let pending = || TurnAttachment {
+            id: "tar-4491".to_string(),
+            policy: AttachmentPolicy::AtToolResult,
+            mime_type: "application/vnd.intent.proposal+json".to_string(),
+            uri: "intent-proposal://workspace-create/x".to_string(),
+            name: "Create workspace".to_string(),
+            text: "{}".to_string(),
+        };
+        let args = |summary: &str| json!({ "code": "print(1)", "summary": summary });
+        let garbled = json!({ "output": "ok" });
+
+        let codex = ToolCall::new("t1", "Run Python")
+            .kind(ToolKind::Execute)
+            .raw_input(json!({
+                "arguments": args("Run Python"),
+                "server": "python",
+                "tool": "execute",
+            }));
+        let claude = ToolCall::new("t2", "mcp__python__execute")
+            .kind(ToolKind::Execute)
+            .raw_input(args("mcp__python__execute"));
+        let codex_title = ToolCall::new("t3", "mcp.python.execute")
+            .kind(ToolKind::Execute)
+            .raw_input(args("mcp.python.execute"));
+        for call in [codex, claude, codex_title] {
+            let title = call.title.clone();
+            let MappedUpdate::ToolCall(tc) =
+                session::map_session_update(&SessionUpdate::ToolCall(call)).unwrap()
+            else {
+                panic!("expected tool call");
+            };
+            assert_eq!(tc.tool_name, "python_execute", "title={title}");
+            assert!(tc.name_authoritative, "title={title}");
+            assert!(
+                intent_core::is_workspace_api_input(&tc.input),
+                "the unwrapped input is indistinguishable from auggie's: title={title}"
+            );
+            let input = gate_input(&tc);
+            assert!(input.is_none(), "title={title}");
+            reg.register(&agent, pending());
+            assert!(
+                reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name, input.as_ref())
+                    .is_empty(),
+                "foreign tool {title} must not claim the pending batch"
+            );
+            // The batch is still there for the daemon's own tool.
+            assert_eq!(
+                reg.claim_at_tool_result(&agent, Some(&garbled), "workspace_api", None)
+                    .len(),
+                1,
+                "title={title}"
+            );
+        }
+
+        // Positive control on the same registry: the auggie-shaped frame
+        // (prose title, `{ code, summary }` input) resolves to workspace_api
+        // and does claim.
+        let auggie = ToolCall::new("t4", "Propose the follow-up")
+            .kind(ToolKind::Other)
+            .raw_input(json!({
+                "code": "return { ok: true }",
+                "summary": "Propose the follow-up",
+            }));
+        let MappedUpdate::ToolCall(tc) =
+            session::map_session_update(&SessionUpdate::ToolCall(auggie)).unwrap()
+        else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tc.tool_name, "workspace_api");
+        assert!(!tc.name_authoritative);
+        let input = gate_input(&tc);
+        assert!(input.is_some());
+        reg.register(&agent, pending());
+        assert_eq!(
+            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.tool_name, input.as_ref())
+                .len(),
+            1
+        );
+        // Second line of defense: were the name ever recorded as the prose
+        // title again, the same identifier-less input still opens the gate.
+        reg.register(&agent, pending());
+        assert_eq!(
+            reg.claim_at_tool_result(&agent, Some(&garbled), &tc.title, input.as_ref())
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn non_codex_shapes_pass_through_verbatim() {
         // `arguments` not an object → no unwrap.
         let array_args = json!({
@@ -1954,7 +2279,6 @@ mod mcp_tests {
             Box::pin(async { Ok(Vec::new()) })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn git_agent_commit(
             &self,
             _workspace_id: WorkspaceId,
@@ -2008,7 +2332,6 @@ mod mcp_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn agent_create(
             &self,
             _workspace_id: WorkspaceId,
@@ -2033,7 +2356,6 @@ mod mcp_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn agent_send_message(
             &self,
             _workspace_id: WorkspaceId,
@@ -5825,6 +6147,7 @@ mod workspace_api_tool_tests {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                browser_client_id: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
@@ -6800,7 +7123,7 @@ mod wsapi3_bindings_tests {
     /// test can inspect the peel result; unknown noteIds surface `NotFound`
     /// so the error-path tests can prove JS-visible failures.
     #[derive(Default)]
-    #[allow(clippy::struct_field_names)] // fields mirror the recorded method names
+    #[expect(clippy::struct_field_names)] // fields mirror the recorded method names
     struct FakeApi {
         get_note_calls: Mutex<Vec<String>>,
         create_note_calls: Mutex<Vec<CreateNoteCall>>,
@@ -7060,6 +7383,7 @@ mod wsapi3_bindings_tests {
                     created_task_note_ids: Vec::new(),
                     created_tasks: Vec::new(),
                     warnings: Vec::new(),
+                    rev: 1,
                 })
             })
         }
@@ -7250,7 +7574,6 @@ mod wsapi3_bindings_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn task_update(
             &self,
             _ws: WorkspaceId,
@@ -7403,7 +7726,6 @@ mod wsapi3_bindings_tests {
         }
 
         // ---- comment.* ----
-        #[allow(clippy::too_many_arguments)]
         fn comment_add(
             &self,
             _ws: WorkspaceId,
@@ -7503,7 +7825,6 @@ mod wsapi3_bindings_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn comment_respond(
             &self,
             _ws: WorkspaceId,
@@ -8859,6 +9180,78 @@ mod wsapi6_bindings_tests {
         assert!(api.browser_exec_calls.lock().unwrap().is_empty());
     }
 
+    // `ws.browser.listTabs(scope?)` (REV-2 Model 5): a one-action `listTabs`
+    // batch through the seam, with the caller attributed and the envelope
+    // unwrapped to the bare tab array.
+    #[tokio::test]
+    async fn browser_list_tabs_unwraps_the_registry_envelope() {
+        let (srv, api) = server_with_caller("agent-77");
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": true,
+            "results": [{
+                "action": "listTabs",
+                "success": true,
+                "result": [
+                    { "tabId": "t-1", "ownerAgentId": null, "hostClientId": "desktop-a", "hostConnected": true },
+                    { "tabId": "t-2", "ownerAgentId": "agent-77", "hostClientId": "desktop-b", "hostConnected": false }
+                ]
+            }]
+        }));
+        let resp = call(&srv, "return await ws.browser.listTabs('mine');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        let tabs = v.as_array().expect("bare tab array");
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[1]["tabId"], json!("t-2"));
+        assert_eq!(tabs[1]["hostClientId"], json!("desktop-b"));
+
+        let calls = api.browser_exec_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (actions, tab_id, agent_id) = &calls[0];
+        assert_eq!(
+            actions,
+            &vec![json!({ "action": "listTabs", "scope": "mine" })]
+        );
+        assert_eq!(tab_id.as_deref(), None);
+        assert_eq!(agent_id.as_deref(), Some("agent-77"));
+    }
+
+    #[tokio::test]
+    async fn browser_list_tabs_omits_scope_when_not_given() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.browser.listTabs();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let calls = api.browser_exec_calls.lock().unwrap();
+        assert_eq!(calls[0].0, vec![json!({ "action": "listTabs" })]);
+        assert_eq!(calls[0].2, None);
+    }
+
+    #[tokio::test]
+    async fn browser_list_tabs_rejects_non_string_scope_without_calling_trait() {
+        let (srv, api) = server();
+        let resp = call(&srv, "return await ws.browser.listTabs(42);").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("scope must be"));
+        assert!(api.browser_exec_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_list_tabs_surfaces_the_action_error_as_a_throw() {
+        let (srv, api) = server();
+        *api.browser_exec_fe_envelope.lock().unwrap() = Some(json!({
+            "success": false,
+            "error": "listTabs scope \"mine\" requires an agent caller",
+            "results": [{
+                "action": "listTabs",
+                "success": false,
+                "error": "listTabs scope \"mine\" requires an agent caller"
+            }]
+        }));
+        let resp = call(&srv, "return await ws.browser.listTabs('mine');").await;
+        assert_eq!(resp["result"]["isError"], json!(true));
+        assert!(text(&resp).contains("requires an agent caller"));
+    }
+
     #[tokio::test]
     async fn browser_docs_returns_topic_text_verbatim() {
         let (srv, _api) = server();
@@ -9202,7 +9595,6 @@ mod wsapi4_bindings_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn agent_send_message(
             &self,
             _ws: WorkspaceId,
@@ -9287,7 +9679,6 @@ mod wsapi4_bindings_tests {
             })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn agent_create(
             &self,
             _ws: WorkspaceId,
@@ -11364,6 +11755,7 @@ mod workspace_api_output_limit_tests {
                     diff_summary: None,
                     token_usage: None,
                     cow_supported: None,
+                    browser_client_id: None,
                     display_status: None,
                     waiting: false,
                     checkout_mode: None,

@@ -62,6 +62,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -97,7 +98,8 @@ fn gate() -> Option<String> {
 async fn event_bindings_query_and_subscribe() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-event-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-event-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -196,9 +198,6 @@ async fn event_bindings_query_and_subscribe() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 //
@@ -209,11 +208,12 @@ async fn event_bindings_query_and_subscribe() {
 async fn file_bindings_read_write_list() {
     let Some(script) = gate() else { return };
 
-    let ws_root = std::env::temp_dir().join(format!("itd-e2e-file-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("itd-e2e-file-");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(&ws_root).expect("mkdir ws_root");
     std::fs::write(ws_root.join("existing.txt"), "existing content").expect("write existing");
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-file-{}.db", uuid::Uuid::new_v4()));
+    let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
@@ -363,10 +363,6 @@ async fn file_bindings_read_write_list() {
     }
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 //
@@ -377,7 +373,8 @@ async fn file_bindings_read_write_list() {
 async fn agent_bindings_list_and_status() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-agent-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-agent-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -483,9 +480,6 @@ async fn agent_bindings_list_and_status() {
     assert_eq!(session.id, agent_id);
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// `ws.agent.listSpecialists` over the real MCP loop: the project tier
@@ -497,7 +491,8 @@ async fn agent_bindings_list_and_status() {
 async fn agent_bindings_list_specialists() {
     let Some(script) = gate() else { return };
 
-    let ws_root = std::env::temp_dir().join(format!("itd-e2e-spec-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("itd-e2e-spec-");
+    let ws_root = tmp.path().join("ws");
     std::fs::create_dir_all(ws_root.join(".intent/specialists")).expect("mkdir specialists");
     std::fs::write(
         ws_root.join(".intent/specialists/e2e-pinned.md"),
@@ -505,7 +500,7 @@ async fn agent_bindings_list_specialists() {
     )
     .expect("write project specialist");
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-spec-{}.db", uuid::Uuid::new_v4()));
+    let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
@@ -644,10 +639,6 @@ async fn agent_bindings_list_specialists() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&ws_root);
 }
 
 /// `ws.agent.getQueue` + `ws.agent.removeQueuedMessage` + the queue merged
@@ -660,7 +651,8 @@ async fn agent_bindings_list_specialists() {
 async fn agent_bindings_get_queue_and_remove_queued_message() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-queue-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-queue-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -948,9 +940,6 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
     assert_eq!(remaining_ids, ["qmsg-foreign", "qmsg-interrupt"]);
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 /// Single-pending-message guard on `ws.agent.send` / `ws.agent.sendToTask`:
@@ -964,7 +953,8 @@ async fn agent_bindings_get_queue_and_remove_queued_message() {
 async fn agent_bindings_send_single_pending_message_guard() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-sguard-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-sguard-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -1351,9 +1341,6 @@ async fn agent_bindings_send_single_pending_message_guard() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 //
@@ -1375,7 +1362,8 @@ async fn git_bindings_commit() {
     }
 
     // Create a temp git repo
-    let repo_dir = std::env::temp_dir().join(format!("itd-e2e-git-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("itd-e2e-git-");
+    let repo_dir = tmp.path().join("repo");
 
     // Helper to run git commands and assert success
     let run_git = |args: &[&str]| {
@@ -1405,7 +1393,7 @@ async fn git_bindings_commit() {
     // Create new file for git operations
     std::fs::write(repo_dir.join("test.txt"), "test content").expect("write test");
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-git-{}.db", uuid::Uuid::new_v4()));
+    let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
@@ -1503,10 +1491,6 @@ async fn git_bindings_commit() {
     // Note: The git operations may not persist due to how Services resolves the workspace path
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&repo_dir);
 }
 
 /// Attribution-filtered `ws.git.commit` fallback (monorepo#939): an
@@ -1528,7 +1512,8 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
         return;
     }
 
-    let repo_dir = std::env::temp_dir().join(format!("itd-e2e-gitattr-{}", uuid::Uuid::new_v4()));
+    let tmp = common::test_tempdir("itd-e2e-gitattr-");
+    let repo_dir = tmp.path().join("repo");
     let run_git = |args: &[&str]| {
         let out = std::process::Command::new("git")
             .args(args)
@@ -1555,7 +1540,7 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
     // Unattributed dirty file: written outside any agent context.
     std::fs::write(repo_dir.join("unattributed.txt"), "someone else\n").expect("write dirty");
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-gitattr-{}.db", uuid::Uuid::new_v4()));
+    let db = tmp.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let services = Services::new(store.clone())
@@ -1691,10 +1676,6 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
-    let _ = std::fs::remove_dir_all(&repo_dir);
 }
 
 //
@@ -1705,7 +1686,8 @@ async fn git_bindings_agent_commit_filters_to_attributed_paths() {
 async fn note_bindings_edit_and_edit_lines() {
     let Some(script) = gate() else { return };
 
-    let db = std::env::temp_dir().join(format!("intentd-e2e-note-{}.db", uuid::Uuid::new_v4()));
+    let db_dir = common::test_tempdir("intentd-e2e-note-");
+    let db = db_dir.path().join("intentd.db");
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
     let ws_root = common::hermetic_workspaces_root();
@@ -1838,7 +1820,4 @@ async fn note_bindings_edit_and_edit_lines() {
     );
 
     manager.shutdown().await;
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }

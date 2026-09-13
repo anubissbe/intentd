@@ -18,6 +18,7 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 use crate::browser;
 use crate::client;
@@ -28,8 +29,10 @@ use crate::events::{self, FastPath};
 use crate::forward::{self, ForwardRegistry};
 use crate::host;
 use crate::panic_guard;
-use crate::reverse::ReverseChannel;
-use crate::router::{check_envelope, handle_message, EnvelopeCheck};
+use crate::reverse::{PrimaryReverseGuard, ReverseChannel};
+use crate::router::{
+    check_envelope, handle_message, EnvelopeCheck, RPC_DISPATCH_SPAN_NAME, RPC_DISPATCH_SPAN_TARGET,
+};
 use crate::rpc_limit::{Overloaded, RpcLimiter, OVERLOAD_ERROR_CODE, OVERLOAD_ERROR_MESSAGE};
 use crate::subscriptions::{self, Channel, SubFastPath};
 
@@ -186,16 +189,29 @@ pub(crate) fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
     )
 }
 
+/// Content-free identity of a chat subscription, kept on its registry entry so
+/// the lifecycle teardown record survives every removal path (unsubscribe,
+/// `replaceGroup` replacement, connection close) — all of which abort the
+/// forwarder before it can log its own exit.
+struct ChatLifecycle {
+    scope: String,
+    subscription_id: String,
+}
+
 /// Per-connection record for one active subscription: the forwarder task (its
-/// `Drop` aborts delivery and releases the bus subscription) and the optional
-/// `replaceGroup` it belongs to.
+/// `Drop` aborts delivery and releases the bus subscription), the optional
+/// `replaceGroup` it belongs to, and (chat only) its lifecycle identity.
 struct ConnSub {
     handle: JoinHandle<()>,
     replace_group: Option<String>,
+    lifecycle: Option<ChatLifecycle>,
 }
 
 impl Drop for ConnSub {
     fn drop(&mut self) {
+        if let Some(lifecycle) = &self.lifecycle {
+            subscriptions::trace_chat_teardown(&lifecycle.scope, &lifecycle.subscription_id);
+        }
         self.handle.abort();
     }
 }
@@ -205,15 +221,23 @@ impl Drop for ConnSub {
 #[derive(Default)]
 pub(crate) struct ConnSubs {
     subs: HashMap<String, ConnSub>,
+    setup: crate::provider_setup::Connection,
 }
 
 impl ConnSubs {
-    fn insert(&mut self, id: String, handle: JoinHandle<()>, replace_group: Option<String>) {
+    fn insert(
+        &mut self,
+        id: String,
+        handle: JoinHandle<()>,
+        replace_group: Option<String>,
+        lifecycle: Option<ChatLifecycle>,
+    ) {
         self.subs.insert(
             id,
             ConnSub {
                 handle,
                 replace_group,
+                lifecycle,
             },
         );
     }
@@ -254,7 +278,10 @@ impl ConnSubs {
 ///
 /// The fast-paths that mutate per-connection state (`reverse.route_response`,
 /// `system.*`, `forward.*`, `client.hello`, `drafts.*`, `events.`/subscription
-/// fast-paths) run inline on the read loop and stay serialized. The two
+/// fast-paths) run inline on the read loop and stay serialized. A successful
+/// `client.hello` also binds the connection's logical identity onto its
+/// `reverse_guard` registry entry (REV-2 target selection) and publishes the
+/// global `client:connected` event when the logical client came online. The two
 /// stateless slow paths — `host::handle` and the [`handle_message`] JSON-RPC
 /// dispatcher — are spawned onto detached tokio tasks that write their response
 /// frame through a cloned outbound sender, so a long-running request (e.g.
@@ -277,7 +304,7 @@ impl ConnSubs {
 /// Frames that fail parse/envelope validation are exempt: they are answered
 /// inline with the router's `-32700`/`-32600`, so the error matrix does not
 /// change under load.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn process_frame(
     raw: &str,
     api: &Arc<dyn WorkspaceApi>,
@@ -286,6 +313,7 @@ pub(crate) async fn process_frame(
     subs: &mut ConnSubs,
     forwards: &mut ForwardRegistry,
     reverse: &ReverseChannel,
+    reverse_guard: &PrimaryReverseGuard,
     control: Option<&Arc<dyn SystemControl>>,
     server_pairing_info: Option<&Arc<dyn crate::server::ServerPairingInfo>>,
     client_id: &mut Option<ClientId>,
@@ -370,6 +398,18 @@ pub(crate) async fn process_frame(
                 };
             }
         }
+        if let Some(req) = crate::provider_setup::classify(value) {
+            let frame = panic_guard::guard_frame(
+                &method,
+                rpc_id.clone(),
+                subs.setup.handle(req, api.as_ref(), reverse),
+            )
+            .await;
+            return match frame {
+                Some(frame) => out_tx.send_priority(frame).await.is_ok(),
+                None => true,
+            };
+        }
         if let Some(req) = host::classify(value) {
             let host_environment = control
                 .map(|control| control.host_environment())
@@ -424,7 +464,14 @@ pub(crate) async fn process_frame(
             // Slow path: `browser.exec` awaits an FE-served reverse RPC on this
             // same connection (§12.4), so run it off the read loop for the same
             // reason as `host::classify` — inline would block frame reads until
-            // the reverse timeout.
+            // the reverse timeout. The registry methods share the path (they
+            // hit SQLite) and take the connection's hello'd identity as the
+            // reporting host plus the reverse registry for presence. The host
+            // is the identity `client.hello` bound onto the registry entry —
+            // not the `client_id` slot, which `drafts.*` mints lazily without
+            // a handshake and must not qualify a connection to host tabs. Only
+            // the host reports resolve it (an O(1) index lookup); `listTabs` /
+            // `exec` do not use it and skip the lock entirely.
             let Ok(slot) = out_tx.reserve_priority().await else {
                 return false;
             };
@@ -436,13 +483,29 @@ pub(crate) async fn process_frame(
                 }
             };
             let reverse = reverse.clone();
+            let api = Arc::clone(api);
+            let host_client_id = req
+                .method
+                .reports_as_host()
+                .then(|| reverse_guard.bound_client_id())
+                .flatten();
+            let registry = reverse_guard.registry();
             let is_tcp = crate::context::is_tcp_connection();
             let (rpc_id, method) = (rpc_id.clone(), method.clone());
             tokio::spawn(async move {
                 crate::context::with_connection_context(is_tcp, async {
+                    let tabs = browser::TabContext {
+                        api: api.as_ref(),
+                        client_id: host_client_id.as_ref(),
+                        registry: registry.as_ref(),
+                    };
                     finish_slow_path_rpc(
                         permit,
-                        panic_guard::guard_frame(&method, rpc_id, browser::handle(req, &reverse)),
+                        panic_guard::guard_frame(
+                            &method,
+                            rpc_id,
+                            browser::handle(req, &reverse, tabs),
+                        ),
                         slot,
                     )
                     .await;
@@ -464,12 +527,33 @@ pub(crate) async fn process_frame(
             };
         }
         if let Some(req) = client::classify(value) {
-            let frame = panic_guard::guard_frame(
-                &method,
-                rpc_id.clone(),
-                client::handle(req, api.as_ref(), client_id, is_local),
-            )
+            let setup_requested = req.id_present
+                && req
+                    .capabilities
+                    .as_ref()
+                    .and_then(|v| v.get("antigravitySetup"))
+                    .and_then(Value::as_u64)
+                    == Some(1);
+            // A new hello revokes the previous connection-local operation.
+            subs.setup = crate::provider_setup::Connection::default();
+            let mut bound = None;
+            let frame = panic_guard::guard_frame(&method, rpc_id.clone(), async {
+                let outcome = client::handle(req, api.as_ref(), client_id, is_local).await;
+                bound = outcome.bound;
+                outcome.frame
+            })
             .await;
+            // REV-2: bind the hello'd identity onto the registry entry; the
+            // registry queues and publishes any `client:*` transition.
+            if let Some(identity) = bound {
+                reverse_guard.bind(identity);
+            }
+            subs.setup.authorized = setup_requested
+                && !crate::context::is_tcp_connection()
+                && frame
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .is_some_and(|v| v.get("result").is_some());
             return match frame {
                 Some(frame) => out_tx.send_priority(frame).await.is_ok(),
                 None => true,
@@ -702,7 +786,7 @@ async fn handle_fast_path(
                     subscription_id.clone(),
                     out_tx.clone(),
                 ));
-                subs.insert(subscription_id, handle, replace_group);
+                subs.insert(subscription_id, handle, replace_group, None);
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -819,8 +903,9 @@ async fn forward_subscription(
 /// Subscribe wires the bus subscription FIRST (so concurrent mutations are
 /// captured), enqueues the `{ subscriptionId }` response, then spawns the
 /// forwarder that emits the snapshot (seq 0) and tails deltas. Returns `false`
-/// when the outbound channel is closed.
-async fn handle_sub_fast_path(
+/// when the outbound channel is closed. `pub(crate)` for the conn-level chat
+/// lifecycle test in `subscriptions::tests`.
+pub(crate) async fn handle_sub_fast_path(
     sub: SubFastPath,
     api: &Arc<dyn WorkspaceApi>,
     bus: &EventBus,
@@ -884,7 +969,7 @@ async fn handle_sub_fast_path(
                     out_tx.clone(),
                     timer,
                 ));
-                subs.insert(subscription_id, handle, replace_group);
+                subs.insert(subscription_id, handle, replace_group, None);
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -926,15 +1011,30 @@ async fn handle_sub_fast_path(
                     ..Default::default()
                 });
                 let subscription_id = events::next_subscription_id();
+                // Logged before the response enqueue so a client that vanishes
+                // mid-reply still leaves the subscribe record behind. The
+                // failure arm below closes it with a teardown record: no
+                // forwarder or registry entry exists yet, so nothing else
+                // could ever emit the terminal record for this id.
+                subscriptions::trace_chat_subscribe(
+                    &agent_id,
+                    &subscription_id,
+                    since_message_id.is_some(),
+                );
                 if id.present {
                     let frame = events::success_frame(
                         &id.echo,
                         &json!({ "subscriptionId": subscription_id }),
                     );
                     if out_tx.send_priority(frame).await.is_err() {
+                        subscriptions::trace_chat_teardown(&agent_id, &subscription_id);
                         return false;
                     }
                 }
+                let lifecycle = ChatLifecycle {
+                    scope: agent_id.clone(),
+                    subscription_id: subscription_id.clone(),
+                };
                 let handle = tokio::spawn(forward_chat_subscription(
                     api.clone(),
                     AgentId::from(agent_id),
@@ -946,7 +1046,7 @@ async fn handle_sub_fast_path(
                     out_tx.clone(),
                     timer,
                 ));
-                subs.insert(subscription_id, handle, replace_group);
+                subs.insert(subscription_id, handle, replace_group, Some(lifecycle));
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -1008,7 +1108,7 @@ async fn handle_sub_fast_path(
                         out_tx.clone(),
                         timer,
                     ));
-                    subs.insert(subscription_id, handle, replace_group);
+                    subs.insert(subscription_id, handle, replace_group, None);
                     true
                 }
                 Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -1128,8 +1228,39 @@ async fn forward_note_subscription(
 /// (the eventual snapshot supersedes them) and the read is re-attempted on
 /// the next delivery or after [`CHAT_RECOVERY_RETRY`], whichever comes first,
 /// so the client keeps its rendered transcript until a good page converges it.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn forward_chat_subscription(
+    api: Arc<dyn WorkspaceApi>,
+    agent_id: AgentId,
+    since_message_id: Option<String>,
+    delta_encoding: subscriptions::DeltaEncoding,
+    projection: Option<intent_core::ConversationProjection>,
+    subscription: Subscription,
+    subscription_id: String,
+    out_tx: OutboundSender,
+    timer: subscriptions::SnapshotTimer,
+) {
+    let scope = agent_id.as_str().to_string();
+    let reason = chat_subscription_loop(
+        api,
+        agent_id,
+        since_message_id,
+        delta_encoding,
+        projection,
+        subscription,
+        subscription_id.clone(),
+        out_tx,
+        timer,
+    )
+    .await;
+    subscriptions::trace_chat_forwarder_exit(&scope, &subscription_id, reason);
+}
+
+/// The snapshot-then-tail loop behind [`forward_chat_subscription`], returning
+/// the fixed-vocabulary reason it exited for the lifecycle record:
+/// `client_closed` (the outbound lane is gone) or `bus_closed`.
+#[expect(clippy::too_many_arguments)]
+async fn chat_subscription_loop(
     api: Arc<dyn WorkspaceApi>,
     agent_id: AgentId,
     since_message_id: Option<String>,
@@ -1139,7 +1270,7 @@ async fn forward_chat_subscription(
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
-) {
+) -> &'static str {
     // Everything this forwarder emits travels on the bulk lane; conflation
     // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
     let out_tx = out_tx.bulk_sender();
@@ -1153,8 +1284,12 @@ async fn forward_chat_subscription(
     subscriptions::stamp_delta_encoding(&mut snapshot, delta_encoding);
     let frame = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
     if out_tx.send(frame).await.is_err() {
-        return;
+        return "client_closed";
     }
+    // Logged only after the frame is queued, so a full/closed lane never
+    // leaves a snapshot record overstating progress (the `client_closed`
+    // exit above is that path's terminal record).
+    subscriptions::trace_chat_snapshot(agent_id.as_str(), &subscription_id, &snapshot);
     timer.snapshot_emitted();
     let mut state = subscriptions::ChatDeltaState::new(&agent_id, delta_encoding, projection);
     // Mid-turn resume (CS-0 D5): if the snapshot carried an in-flight message,
@@ -1188,7 +1323,7 @@ async fn forward_chat_subscription(
                         seq += 1;
                     }
                 }
-                Err(_) => return,
+                Err(_) => return "client_closed",
             },
             // A pending recovery with a quiet bus: retry on a timer so the
             // client is not left stale until the next event happens to arrive.
@@ -1197,7 +1332,7 @@ async fn forward_chat_subscription(
                     api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
                     &mut seq, &out_tx, &mut state, &mut pending_recovery,
                 ).await {
-                    return;
+                    return "client_closed";
                 }
             }
             maybe = subscription.recv_delivery() => {
@@ -1209,7 +1344,7 @@ async fn forward_chat_subscription(
                             frame
                         })
                         .await;
-                    return;
+                    return "bus_closed";
                 };
                 let batch = match delivery {
                     // While a recovery is owed, batches are discarded — the
@@ -1220,7 +1355,7 @@ async fn forward_chat_subscription(
                             api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
                             &mut seq, &out_tx, &mut state, &mut pending_recovery,
                         ).await {
-                            return;
+                            return "client_closed";
                         }
                         continue;
                     }
@@ -1256,7 +1391,7 @@ async fn forward_chat_subscription(
                             api.as_ref(), &agent_id, &subscription_id, delta_encoding, projection,
                             &mut seq, &out_tx, &mut state, &mut pending_recovery,
                         ).await {
-                            return;
+                            return "client_closed";
                         }
                         continue;
                     }
@@ -1279,7 +1414,7 @@ async fn forward_chat_subscription(
                                 *s += 1;
                                 frame
                             }) {
-                                Enqueue::Closed => return,
+                                Enqueue::Closed => return "client_closed",
                                 Enqueue::Sent | Enqueue::Buffered => continue,
                                 // Buffer at capacity: fall back to the
                                 // original blocking backpressure — flush,
@@ -1293,12 +1428,12 @@ async fn forward_chat_subscription(
                                         })
                                         .await;
                                     if !drained {
-                                        return;
+                                        return "client_closed";
                                     }
                                     let frame = item.into_frame(&subscription_id, seq);
                                     seq += 1;
                                     if out_tx.send(frame).await.is_err() {
-                                        return;
+                                        return "client_closed";
                                     }
                                     continue;
                                 }
@@ -1314,12 +1449,12 @@ async fn forward_chat_subscription(
                         })
                         .await;
                     if !drained {
-                        return;
+                        return "client_closed";
                     }
                     let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                     seq += 1;
                     if out_tx.send(frame).await.is_err() {
-                        return;
+                        return "client_closed";
                     }
                 }
             }
@@ -1338,7 +1473,7 @@ const CHAT_RECOVERY_RETRY: std::time::Duration = std::time::Duration::from_secs(
 /// emit it at the next `seq`, reseed the mapper, and clear the pending flag.
 /// On a failed read the recovery stays pending for the caller to re-attempt.
 /// Returns `false` only when the outbound lane is closed (caller returns).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn attempt_chat_recovery(
     api: &dyn WorkspaceApi,
     agent_id: &AgentId,
@@ -1422,7 +1557,7 @@ fn parse_channel_params(
 /// [`subscriptions::task_delta`] pair so spec-body edits refresh flipped
 /// `specLinked` flags (monorepo#2407). Owns `seq` for strict monotonicity;
 /// aborted by [`ConnSub`] on unsubscribe / disconnect.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn forward_channel_subscription(
     api: Arc<dyn WorkspaceApi>,
     channel: Channel,
@@ -1442,6 +1577,24 @@ async fn forward_channel_subscription(
         let (snapshot, links) = subscriptions::task_snapshot(api.as_ref(), &workspace_id).await;
         spec_links = links;
         snapshot
+    } else if channel == Channel::Workspace {
+        // The workspace subscribe fast-path bypasses router::dispatch, but its
+        // seq-0 aggregate read has the same bounded-statement contract as
+        // workspace.list. Give that read the canonical profiling span so the
+        // runtime guardrail and real-daemon integration tests can attribute
+        // sqlx statements to `workspace.subscribe`.
+        let span = tracing::info_span!(
+            target: RPC_DISPATCH_SPAN_TARGET,
+            RPC_DISPATCH_SPAN_NAME,
+            method = "workspace.subscribe",
+            response_bytes = tracing::field::Empty,
+            encode_elapsed_ms = tracing::field::Empty,
+            oversized_replacement = tracing::field::Empty,
+            encode_failed = tracing::field::Empty,
+        );
+        subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
+            .instrument(span)
+            .await
     } else {
         subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
             .await

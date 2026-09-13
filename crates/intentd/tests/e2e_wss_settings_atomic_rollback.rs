@@ -10,7 +10,11 @@
 //!   provider (cached catalog default, else cleared);
 //! - `tokenImpact` annotations: every `agentFeatures.*` definition in
 //!   `settings.list` carries its approximate token-impact string, and
-//!   unannotated definitions omit the optional key.
+//!   unannotated definitions omit the optional key;
+//! - redaction placeholder on sensitive paths (intent#4383): echoing the
+//!   `settings.list` placeholder back through `settings.update` keeps the
+//!   stored secret, and the placeholder without a stored secret rejects the
+//!   whole batch with `-32602`.
 
 #![cfg(unix)]
 
@@ -33,7 +37,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
@@ -50,15 +53,11 @@ impl Drop for Daemon {
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
         }
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-atomic-rb-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-atomic-rb-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -226,7 +225,8 @@ where
 /// and returns the failing key in the error response (per AGENTS.md testing gate).
 #[tokio::test]
 async fn mixed_batch_rollback_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     // Start daemon with both UDS and TCP (server.wsApi.enabled=true in config.toml)
     let child = spawn_serve(&data_dir, "both", &env);
@@ -341,7 +341,8 @@ async fn mixed_batch_rollback_over_wss() {
 /// as unknown — same wire contract as UDS (`legacy_workspace_overrides_discards_and_strips_on_boot`).
 #[tokio::test]
 async fn retired_workspace_overrides_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -431,7 +432,8 @@ async fn retired_workspace_overrides_over_wss() {
 /// unannotated definitions omit the key entirely.
 #[tokio::test]
 async fn agent_features_token_impact_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -554,7 +556,8 @@ fn model_default_values(changes: &Value) -> Vec<Value> {
 /// `model.default` in the batch is never overridden.
 #[tokio::test]
 async fn provider_switch_reresolves_default_model_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     // Warm the grok catalog cache pre-boot (grok's catalog version key is
     // constant/empty, so the seeded entry is current on any host).
     std::fs::write(
@@ -711,7 +714,8 @@ async fn provider_switch_reresolves_default_model_over_wss() {
 /// and out-of-range values reject with `-32602`.
 #[tokio::test]
 async fn workspace_api_settings_round_trip_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -876,7 +880,8 @@ async fn workspace_api_settings_round_trip_over_wss() {
 /// documented `result` / `error` shape).
 #[tokio::test]
 async fn model_default_reasoning_effort_round_trips_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -979,7 +984,8 @@ async fn model_default_reasoning_effort_round_trips_over_wss() {
 /// `-32602` (PROTOCOL §9).
 #[tokio::test]
 async fn agents_resume_interrupted_on_start_round_trips_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -1070,7 +1076,7 @@ fn assert_success_envelope(resp: &Value, id: i64) {
     assert!(resp["result"].is_object(), "{resp}");
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// The `agents` memory knobs as clients actually receive them (monorepo#2109):
 /// `agents.memoryBudgetMb` advertises a machine-derived `max`, and
 /// `agents.idleReapMinutes` advertises the shipped 10-minute default.
@@ -1085,12 +1091,13 @@ fn assert_success_envelope(resp: &Value, id: i64) {
 /// i.e. the catalog advertising a value the write path refuses.
 #[tokio::test]
 // The advertised max is a small whole-valued float: casts are exact.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 async fn agent_memory_knobs_over_wss() {
     // The static bound `SettingsFile` enforces when parsing config.toml. The
     // catalog bound may sit below it (this machine's RAM) but never above.
     const PARSE_BOUND_MB: f64 = 1_024_000.0;
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
@@ -1220,6 +1227,256 @@ async fn agent_memory_knobs_over_wss() {
     assert_success_envelope(&resp, 10);
     assert_eq!(resp["result"]["value"], Value::Null, "{resp}");
     assert_eq!(resp["result"]["origin"], json!("default"), "{resp}");
+}
+
+/// Read one account straight from the daemon's secrets file, bypassing the
+/// (redacting) wire — the only way to prove the stored secret is intact.
+fn stored_secret(secrets_file: &Path, account: &str) -> Option<String> {
+    let bytes = std::fs::read(secrets_file).ok()?;
+    let map: serde_json::Map<String, Value> = serde_json::from_slice(&bytes).ok()?;
+    map.get(account)?.as_str().map(str::to_string)
+}
+
+/// Redaction placeholder round trip over WSS (intent#4383): store a secret,
+/// read it back redacted via `settings.list`, echo that redacted value into
+/// `settings.update` (what a client submitting the whole form does), and the
+/// stored secret is still the original — the response and the
+/// `settings:changed` notification carry the placeholder, never the secret.
+#[tokio::test]
+async fn redaction_placeholder_round_trip_keeps_secret_over_wss() {
+    const PLACEHOLDER: &str = "********";
+    const SECRET: &str = "lin_api_original_0123456789";
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let secrets_file = data_dir.join("secrets.json");
+    let secrets_file_str = secrets_file.to_string_lossy().into_owned();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SECRETS_FILE", &secrets_file_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg.clone()).await;
+    let mut sub = connect_ws(port, cfg).await;
+    let resp = wss_rpc(
+        &mut sub,
+        100,
+        "events.subscribe",
+        json!({ "eventTypes": ["settings:changed"] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 100);
+
+    // Store the secret; the wire only ever shows the placeholder.
+    let resp = wss_rpc(
+        &mut ws,
+        1,
+        "settings.update",
+        json!({ "changes": [{ "path": "linear.token", "value": SECRET }] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 1);
+    assert_eq!(resp["result"]["applied"][0]["value"], json!(PLACEHOLDER));
+    let _ = next_settings_changed(&mut sub).await;
+    assert_eq!(
+        stored_secret(&secrets_file, "linear.token").as_deref(),
+        Some(SECRET)
+    );
+
+    // settings.list → redacted.
+    let list = wss_rpc(&mut ws, 2, "settings.list", json!({})).await;
+    assert_success_envelope(&list, 2);
+    let listed = list["result"]["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .find(|e| e["path"] == json!("linear.token"))
+        .expect("linear.token in settings.list")
+        .clone();
+    assert_eq!(listed["sensitive"], json!(true));
+    assert_eq!(listed["value"], json!(PLACEHOLDER));
+
+    // Echo the redacted value back (plus a real sibling change): the secret
+    // must survive, the response/notification echo the placeholder.
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "linear.token", "value": listed["value"] },
+            { "path": "git.autoCommit", "value": false }
+        ] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 3);
+    let applied = resp["result"]["applied"].as_array().expect("applied array");
+    let echoed = applied
+        .iter()
+        .find(|e| e["path"] == json!("linear.token"))
+        .expect("linear.token echoed in applied");
+    assert_eq!(echoed["value"], json!(PLACEHOLDER), "{resp}");
+    assert!(
+        applied
+            .iter()
+            .any(|e| e["path"] == json!("git.autoCommit") && e["value"] == json!(false)),
+        "{resp}"
+    );
+    let changes = next_settings_changed(&mut sub).await;
+    assert!(
+        !changes.to_string().contains(SECRET),
+        "secret leaked in settings:changed: {changes}"
+    );
+    let notified: Vec<&Value> = changes
+        .as_array()
+        .expect("data.changes array")
+        .iter()
+        .filter(|e| e["path"] == json!("linear.token"))
+        .collect();
+    assert_eq!(
+        notified.len(),
+        1,
+        "linear.token must ride settings:changed exactly once: {changes}"
+    );
+    assert_eq!(
+        notified[0]["value"],
+        json!(PLACEHOLDER),
+        "settings:changed must echo the placeholder for the untouched secret: {changes}"
+    );
+    assert!(
+        changes
+            .as_array()
+            .expect("data.changes array")
+            .iter()
+            .any(|e| e["path"] == json!("git.autoCommit") && e["value"] == json!(false)),
+        "sibling change must ride settings:changed: {changes}"
+    );
+    assert_eq!(
+        stored_secret(&secrets_file, "linear.token").as_deref(),
+        Some(SECRET),
+        "echoing the placeholder must not clobber the stored secret"
+    );
+
+    // A literal value still replaces.
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "settings.update",
+        json!({ "changes": [{ "path": "linear.token", "value": "lin_api_rotated" }] }),
+    )
+    .await;
+    assert_success_envelope(&resp, 4);
+    assert_eq!(
+        stored_secret(&secrets_file, "linear.token").as_deref(),
+        Some("lin_api_rotated")
+    );
+}
+
+/// Redaction placeholder without a stored secret over WSS (intent#4383):
+/// `-32602`, and the batch is atomic — the sibling non-sensitive change is
+/// not applied and no secret is written.
+#[tokio::test]
+async fn redaction_placeholder_without_secret_rejects_batch_over_wss() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let secrets_file = data_dir.join("secrets.json");
+    let secrets_file_str = secrets_file.to_string_lossy().into_owned();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("INTENTD_SECRETS_FILE", &secrets_file_str),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon {
+        child,
+        data_dir: data_dir.clone(),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+
+    let status = common::await_wss_status(&socket).await;
+    let port = u16::try_from(
+        status["result"]["port"]
+            .as_u64()
+            .expect("port should be set at boot"),
+    )
+    .expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint should be set")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+    let mut ws = connect_ws(port, cfg).await;
+
+    let resp = wss_rpc(
+        &mut ws,
+        1,
+        "settings.get",
+        json!({ "path": "linear.token" }),
+    )
+    .await;
+    assert_success_envelope(&resp, 1);
+    assert_eq!(resp["result"]["value"], Value::Null, "no secret stored yet");
+
+    let resp = wss_rpc(
+        &mut ws,
+        2,
+        "settings.update",
+        json!({ "changes": [
+            { "path": "git.autoCommit", "value": false },
+            { "path": "linear.token", "value": "********" }
+        ] }),
+    )
+    .await;
+    assert_error_envelope(&resp, 2, -32602);
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("linear.token")),
+        "error must name the offending path: {resp}"
+    );
+
+    assert_eq!(stored_secret(&secrets_file, "linear.token"), None);
+    let resp = wss_rpc(
+        &mut ws,
+        3,
+        "settings.get",
+        json!({ "path": "linear.token" }),
+    )
+    .await;
+    assert_success_envelope(&resp, 3);
+    assert_eq!(resp["result"]["value"], Value::Null);
+    let resp = wss_rpc(
+        &mut ws,
+        4,
+        "settings.get",
+        json!({ "path": "git.autoCommit" }),
+    )
+    .await;
+    assert_success_envelope(&resp, 4);
+    assert_eq!(
+        resp["result"]["value"],
+        json!(true),
+        "sibling change must not apply when the batch is rejected: {resp}"
+    );
 }
 
 /// Assert the JSON-RPC 2.0 error envelope (PROTOCOL §1/§9): `jsonrpc: "2.0"`,

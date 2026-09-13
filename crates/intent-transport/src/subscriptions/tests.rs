@@ -328,6 +328,269 @@ fn slow_snapshot_warn_logs_fractional_millis_for_marginal_breach() {
 }
 
 #[test]
+fn chat_lifecycle_records_carry_the_triage_fields() {
+    let snapshot = json!({
+        "agentId": "agent-1",
+        "messages": [{ "id": "msg-1" }, { "id": "msg-2" }],
+        "resumed": true,
+    });
+    let lines = crate::protocol::test_capture::capture_events(|| {
+        trace_chat_subscribe("agent-1", "ws-sub-7", true);
+        trace_chat_snapshot("agent-1", "ws-sub-7", &snapshot);
+        trace_chat_forwarder_exit("agent-1", "ws-sub-7", "client_closed");
+        trace_chat_teardown("agent-1", "ws-sub-7");
+    });
+    assert_eq!(lines.len(), 4, "one record per stage: {lines:?}");
+    for (level, rendered) in &lines {
+        assert_eq!(*level, tracing::Level::INFO);
+        assert!(
+            rendered.contains("channel=\"chat\"")
+                && rendered.contains("scope=\"agent-1\"")
+                && rendered.contains("subscription_id=\"ws-sub-7\""),
+            "every stage carries channel/scope/subscription id: {rendered}"
+        );
+    }
+    assert!(lines[0].1.contains("stage=\"subscribe\"") && lines[0].1.contains("since=true"));
+    assert!(
+        lines[1].1.contains("stage=\"snapshot\"")
+            && lines[1].1.contains("resumed=true")
+            && lines[1].1.contains("page_size=2"),
+        "the snapshot record carries the resume result and page size: {}",
+        lines[1].1
+    );
+    assert!(
+        lines[2].1.contains("stage=\"forwarder_exit\"")
+            && lines[2].1.contains("reason=\"client_closed\""),
+        "the exit record names why the forwarder stopped: {}",
+        lines[2].1
+    );
+    assert!(lines[3].1.contains("stage=\"teardown\""));
+}
+
+#[test]
+fn chat_snapshot_record_keeps_resumed_tri_state() {
+    // `resumed` mirrors the snapshot key verbatim: a snapshot without it (no
+    // resume requested, or a page degraded by a read failure) omits the field
+    // so it stays distinguishable from a FAILED resume, which logs an
+    // explicit `false`. `page_size` still defaults to 0 rather than vanishing.
+    let lines = crate::protocol::test_capture::capture_events(|| {
+        trace_chat_snapshot("agent-1", "ws-sub-8", &json!({}));
+        trace_chat_snapshot(
+            "agent-1",
+            "ws-sub-9",
+            &json!({ "resumed": false, "messages": [] }),
+        );
+    });
+    assert_eq!(lines.len(), 2, "exactly two INFO events: {lines:?}");
+    let no_resume = &lines[0].1;
+    assert!(
+        !no_resume.contains("resumed=") && no_resume.contains("page_size=0"),
+        "an absent resume key omits the field, page_size still defaults: {no_resume}"
+    );
+    let failed_resume = &lines[1].1;
+    assert!(
+        failed_resume.contains("resumed=false") && failed_resume.contains("page_size=0"),
+        "a declined resume logs an explicit false: {failed_resume}"
+    );
+}
+
+/// Conn-level lifecycle wiring: a REAL `chat.subscribe` through
+/// [`crate::conn::handle_sub_fast_path`] under a capturing subscriber must
+/// emit `subscribe` + `snapshot` records whose `resumed`/`page_size` stay in
+/// sync with the emitted seq-0 frame (built by [`chat_snapshot`]),
+/// `chat.unsubscribe` and connection close (registry drop) must each close a
+/// chat entry with exactly one `teardown`, and a non-chat subscription must
+/// contribute NO lifecycle records — so a refactor that drops a call site or
+/// renames a snapshot key fails here, not in production triage.
+mod conn_lifecycle {
+    use std::sync::Arc;
+
+    use intent_core::{AgentId, BoxFuture, Result, WorkspaceApi, WorkspaceId};
+    use intent_services::EventBus;
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use crate::conn::{
+        handle_sub_fast_path, outbound_channel, ConnSubs, OutboundReceiver, OutboundSender,
+    };
+    use crate::subscriptions::classify;
+
+    /// Two persisted messages, no live turn: the seq-0 page is deterministic.
+    struct TwoMessageApi;
+
+    impl WorkspaceApi for TwoMessageApi {
+        fn agent_get_conversation(
+            &self,
+            agent_id: AgentId,
+            _limit: Option<i64>,
+            _workspace_id: Option<WorkspaceId>,
+            _page_token: Option<String>,
+            _around_message_id: Option<String>,
+            _around_index: Option<i64>,
+            _projection: Option<intent_core::ConversationProjection>,
+            _include_in_progress: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [
+                        { "id": "m-1", "role": "user", "seq": 0 },
+                        { "id": "m-2", "role": "assistant", "seq": 1 },
+                    ],
+                    "truncated": false,
+                    "totalMessages": 2,
+                    "nextToken": Value::Null,
+                }))
+            })
+        }
+    }
+
+    /// Drive one classified subscribe frame through the real fast-path and
+    /// return the priority-lane reply plus the seq-0 `subscription.push`.
+    async fn subscribe(
+        raw: &Value,
+        api: &Arc<dyn WorkspaceApi>,
+        bus: &EventBus,
+        out_tx: &OutboundSender,
+        rx: &mut OutboundReceiver,
+        subs: &mut ConnSubs,
+    ) -> (Value, Value) {
+        let sub = classify(raw).expect("frame classifies as a fast-path subscribe");
+        assert!(handle_sub_fast_path(sub, api, bus, out_tx, subs).await);
+        let reply: Value = serde_json::from_str(&rx.priority.recv().await.unwrap()).unwrap();
+        let push: Value = serde_json::from_str(&rx.bulk.recv().await.unwrap()).unwrap();
+        (reply, push)
+    }
+
+    #[test]
+    fn real_chat_subscribe_emits_in_sync_lifecycle_records() {
+        // Current-thread runtime: every spawned task (bus delivery, chat
+        // forwarder) runs on THIS thread while `block_on` polls, so the
+        // thread-default capturing subscriber sees their records too.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut plain_snapshot = Value::Null;
+        let mut resume_snapshot = Value::Null;
+        let lines = crate::protocol::test_capture::capture_events(|| {
+            rt.block_on(async {
+                let dir = tempfile::Builder::new()
+                    .prefix("intent-transport-conn-lifecycle-")
+                    .tempdir()
+                    .unwrap();
+                let store = Store::open(&dir.path().join("bus.db")).await.unwrap();
+                let bus = EventBus::new(store);
+                let api: Arc<dyn WorkspaceApi> = Arc::new(TwoMessageApi);
+                let (out_tx, mut rx) = outbound_channel();
+                let mut subs = ConnSubs::default();
+
+                // 1. A plain chat.subscribe: no resume requested.
+                let (reply, push) = subscribe(
+                    &json!({"jsonrpc":"2.0","id":1,"method":"chat.subscribe",
+                            "params":{"agentId":"agent-1"}}),
+                    &api,
+                    &bus,
+                    &out_tx,
+                    &mut rx,
+                    &mut subs,
+                )
+                .await;
+                let chat_sub_id = reply["result"]["subscriptionId"]
+                    .as_str()
+                    .expect("reply carries the subscription id")
+                    .to_string();
+                plain_snapshot = push["params"]["snapshot"].clone();
+
+                // 2. A resume that misses the page: `resumed: false` on the wire.
+                let (_, push) = subscribe(
+                    &json!({"jsonrpc":"2.0","id":2,"method":"chat.subscribe",
+                            "params":{"agentId":"agent-1","sinceMessageId":"m-unknown"}}),
+                    &api,
+                    &bus,
+                    &out_tx,
+                    &mut rx,
+                    &mut subs,
+                )
+                .await;
+                resume_snapshot = push["params"]["snapshot"].clone();
+
+                // 3. A non-chat subscription: no lifecycle records of its own.
+                let sub = classify(&json!({"jsonrpc":"2.0","id":3,"method":"note.subscribe",
+                                           "params":{"workspaceId":"ws-1"}}))
+                .unwrap();
+                assert!(handle_sub_fast_path(sub, &api, &bus, &out_tx, &mut subs).await);
+                let _ = rx.priority.recv().await.unwrap();
+                let _ = rx.bulk.recv().await.unwrap();
+
+                // 4. A real chat.unsubscribe tears down the first subscription…
+                let sub = classify(&json!({"jsonrpc":"2.0","id":4,"method":"chat.unsubscribe",
+                                           "params":{"subscriptionId": chat_sub_id}}))
+                .unwrap();
+                assert!(handle_sub_fast_path(sub, &api, &bus, &out_tx, &mut subs).await);
+                let _ = rx.priority.recv().await.unwrap();
+
+                // 5. …and connection close (registry drop) tears down the rest:
+                // one record for the remaining chat entry, none for note.
+                drop(subs);
+            });
+        });
+
+        let records: Vec<&str> = lines
+            .iter()
+            .map(|(_, rendered)| rendered.as_str())
+            .filter(|rendered| rendered.contains("chat subscription lifecycle"))
+            .collect();
+        assert_eq!(
+            records.len(),
+            6,
+            "2 subscribes + 2 snapshots + 2 teardowns, chat only: {records:#?}"
+        );
+        assert!(
+            records[0].contains("stage=\"subscribe\"") && records[0].contains("since=false"),
+            "plain subscribe record: {}",
+            records[0]
+        );
+        // Snapshot record ↔ frame key sync: `page_size` counts the emitted
+        // `messages` array, and `resumed` mirrors the frame's key — omitted
+        // when the snapshot carries none, explicit `false` on a declined
+        // resume. A renamed key in `chat_snapshot` breaks this pairing.
+        assert_eq!(plain_snapshot["messages"].as_array().unwrap().len(), 2);
+        assert!(plain_snapshot.get("resumed").is_none());
+        assert!(
+            records[1].contains("stage=\"snapshot\"")
+                && records[1].contains("page_size=2")
+                && !records[1].contains("resumed="),
+            "no-resume snapshot record stays in sync with the frame: {}",
+            records[1]
+        );
+        assert!(
+            records[2].contains("stage=\"subscribe\"") && records[2].contains("since=true"),
+            "resume subscribe record: {}",
+            records[2]
+        );
+        assert_eq!(resume_snapshot["resumed"], json!(false));
+        assert!(
+            records[3].contains("stage=\"snapshot\"")
+                && records[3].contains("resumed=false")
+                && records[3].contains("page_size=2"),
+            "declined-resume snapshot record stays in sync with the frame: {}",
+            records[3]
+        );
+        assert!(
+            records[4].contains("stage=\"teardown\""),
+            "chat.unsubscribe closes the record: {}",
+            records[4]
+        );
+        assert!(
+            records[5].contains("stage=\"teardown\""),
+            "registry drop closes the record: {}",
+            records[5]
+        );
+    }
+}
+
+#[test]
 fn snapshot_warn_threshold_parses_override_and_falls_back() {
     assert_eq!(
         snapshot_warn_threshold_from(Some("50".to_string())),
@@ -3733,6 +3996,136 @@ mod chat_terminal_reconcile_failure {
                 "exactly one bounded page read on the happy path"
             );
             assert_eq!(snapshot["messages"][0]["id"], "msg-1");
+        }
+    }
+
+    /// intent#4409 — the terminal reconcile lifts the persisted assistant
+    /// row's `metadata` onto every entity it emits (mirroring the
+    /// `agent:message` re-read), so a chat.subscribe-only client renders
+    /// interrupted / finish-reason state identically to
+    /// `agent.getConversation`. Rows without metadata keep the lean shape,
+    /// and the best-effort fallback frame — built with no persisted row —
+    /// carries none.
+    mod chat_terminal_metadata {
+        use super::*;
+
+        fn serving(conversation: Value) -> FailingConvApi {
+            FailingConvApi {
+                calls: AtomicUsize::new(0),
+                fail_first: 0,
+                conversation,
+            }
+        }
+
+        fn conversation_with_metadata(metadata: Value) -> Value {
+            let mut conv = conversation();
+            conv["messages"][0]["metadata"] = metadata;
+            conv["messages"][0]["contentBlocks"] = json!([
+                { "type": "text", "id": "msg-1:0", "text": "Hello, world" },
+                { "type": "text", "id": "msg-1:1", "text": "Interrupted" }
+            ]);
+            conv
+        }
+
+        #[tokio::test]
+        async fn terminal_entities_carry_the_persisted_row_metadata() {
+            // An interrupted turn persists the assistant row with
+            // `metadata.interrupted/stopReason/interruptReason`. Both the block
+            // the client already saw live (`updated`) and the one it never saw
+            // (`added`) must carry that metadata verbatim.
+            let metadata = json!({
+                "interrupted": true,
+                "stopReason": "interrupted",
+                "interruptReason": "user_stop",
+            });
+            let api = serving(conversation_with_metadata(metadata.clone()));
+            let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+            s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
+                .expect("first chunk");
+            let d = s
+                .delta(&api, &end_event("msg-1"))
+                .await
+                .expect("terminal reconcile");
+            let updated = d["updated"].as_array().unwrap();
+            let added = d["added"].as_array().unwrap();
+            assert_eq!(updated.len(), 1, "the live block returns as an update: {d}");
+            assert_eq!(added.len(), 1, "msg-1:1 is new: {d}");
+            for e in updated.iter().chain(added.iter()) {
+                assert_eq!(
+                    e["metadata"], metadata,
+                    "every terminal entity carries the persisted row metadata: {d}"
+                );
+                assert_eq!(e["messageSeq"], 8);
+                assert_eq!(e["streamingComplete"], true);
+            }
+            assert_eq!(d["removedIds"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn a_fallback_id_reconcile_carries_the_persisted_row_metadata() {
+            // monorepo#2105 path: nothing was learned live, the id comes from
+            // the terminal event — the recovered entities still carry metadata.
+            let metadata = json!({ "interrupted": true, "interruptReason": "user_stop" });
+            let api = serving(conversation_with_metadata(metadata.clone()));
+            let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+            let d = s
+                .delta(&api, &end_event("msg-1"))
+                .await
+                .expect("terminal reconcile");
+            let added = d["added"].as_array().unwrap();
+            assert_eq!(added.len(), 2, "every persisted block is delivered: {d}");
+            for e in added {
+                assert_eq!(e["metadata"], metadata, "{d}");
+            }
+        }
+
+        #[tokio::test]
+        async fn rows_without_metadata_keep_the_lean_entity_shape() {
+            for conv in [conversation(), conversation_with_metadata(Value::Null)] {
+                let api = serving(conv);
+                let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+                s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
+                    .expect("first chunk");
+                let d = s
+                    .delta(&api, &end_event("msg-1"))
+                    .await
+                    .expect("terminal reconcile");
+                let entities = d["updated"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .chain(d["added"].as_array().unwrap());
+                let mut count = 0;
+                for e in entities {
+                    count += 1;
+                    assert!(
+                        e.get("metadata").is_none(),
+                        "absent/null row metadata keeps the lean entity shape: {e}"
+                    );
+                }
+                assert!(count > 0, "the frame carries entities: {d}");
+            }
+        }
+
+        #[tokio::test]
+        async fn the_best_effort_frame_carries_no_metadata() {
+            // The degraded frame is built from accumulated live state with no
+            // persisted row to read metadata from, so it stays metadata-less.
+            let api = FailingConvApi::new();
+            let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
+            s.chunk_delta(&chunk_event("msg-1", "msg-1:0", "text", &json!("Hello")))
+                .expect("first chunk");
+            let d = s
+                .delta(&api, &end_event("msg-1"))
+                .await
+                .expect("best-effort terminal frame");
+            let updated = d["updated"].as_array().unwrap();
+            assert_eq!(updated.len(), 1, "{d}");
+            assert!(
+                updated[0].get("metadata").is_none(),
+                "no persisted row → no metadata on the fallback frame: {d}"
+            );
+            assert_eq!(updated[0]["streamingComplete"], true);
         }
     }
 }

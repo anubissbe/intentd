@@ -131,6 +131,20 @@ impl Registration {
         self.state.load(Ordering::Acquire) == REG_FAILED
     }
 
+    #[cfg(test)]
+    fn live(&self) -> bool {
+        self.state.load(Ordering::Acquire) == REG_LIVE
+    }
+
+    #[cfg(test)]
+    fn describe(&self) -> &'static str {
+        match self.state.load(Ordering::Acquire) {
+            REG_LIVE => "live",
+            REG_FAILED => "failed",
+            _ => "pending",
+        }
+    }
+
     fn settle(&self, live: bool) {
         self.state
             .store(if live { REG_LIVE } else { REG_FAILED }, Ordering::Release);
@@ -277,6 +291,83 @@ impl SubHandle {
     #[cfg(test)]
     pub(super) async fn wait_established(&self, timeout: std::time::Duration) {
         wait_settled(&self.registration, timeout).await;
+    }
+
+    /// Detach a [`RegistrationProbe`] for this subscription, so a test can
+    /// await the watch going live without holding whatever lock guards the
+    /// handle itself.
+    #[cfg(test)]
+    pub(super) fn probe(&self) -> RegistrationProbe {
+        let watcher_live = {
+            let state = match self.hub.state.lock() {
+                Ok(state) => state,
+                Err(e) => e.into_inner(),
+            };
+            state
+                .groups
+                .get(&self.group)
+                .map(|group| Arc::clone(&group.watcher_live))
+                .unwrap_or_default()
+        };
+        RegistrationProbe {
+            root: self.root.clone(),
+            registration: Arc::clone(&self.registration),
+            watcher_live,
+        }
+    }
+}
+
+/// Test-only view of one subscription's registration, detached from its
+/// [`SubHandle`] / [`TierWatch`].
+///
+/// [`SubHandle::wait_established`] returns as soon as the registration
+/// *settles*, failure included — the right contract for the creation-retry
+/// tests, but the wrong sync point for a test about to mutate the tree: a
+/// registration settled as failed while the group's watcher creation is being
+/// retried (inotify instance exhaustion under full-suite parallelism,
+/// intent-hq/intent#4845 / #4852) returns immediately, the test writes, and
+/// the write lands before the retry re-registers the root — so the awaited
+/// event never arrives and the test hangs into nextest's kill.
+/// [`Self::wait_live`] waits for the watch to actually be live instead.
+#[cfg(test)]
+pub(super) struct RegistrationProbe {
+    root: PathBuf,
+    registration: Arc<Registration>,
+    watcher_live: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl RegistrationProbe {
+    /// Await the watch being live, riding out a creation-retry: a
+    /// registration the registrar settled as failed while it had no watcher
+    /// is re-registered once creation succeeds, so keep waiting through that
+    /// state. Panics — naming the root, the registration state and the OS
+    /// watch limits — when the group's watcher is live yet the root's own
+    /// `watch()` failed (nothing will retry that), or when `timeout` elapses,
+    /// so a dead watch is diagnosed here rather than as a downstream
+    /// "no event" hang.
+    pub(super) async fn wait_live(&self, timeout: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.registration.live() {
+                return;
+            }
+            let watcher_live = self.watcher_live.load(Ordering::Acquire);
+            assert!(
+                !(watcher_live && self.registration.failed()),
+                "shared watch registration failed for {} with the group's watcher live; {}",
+                self.root.display(),
+                os_watch_limits()
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "shared watch on {} not live within {timeout:?} (registration {}, group watcher live: {watcher_live}); {}",
+                self.root.display(),
+                self.registration.describe(),
+                os_watch_limits()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -529,6 +620,22 @@ impl SharedWatchHub {
             .map(|r| r.registration.settled())
     }
 
+    /// Human-readable registration state of one root for test diagnostics:
+    /// `pending` / `live` / `failed`, or `unwatched` when nothing watches it.
+    #[cfg(test)]
+    pub(super) fn root_registration_state(&self, root: &Path) -> &'static str {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(e) => e.into_inner(),
+        };
+        state
+            .groups
+            .values()
+            .find_map(|g| g.roots.get(&root))
+            .map_or("unwatched", |r| r.registration.describe())
+    }
+
     /// Await every currently-requested root being registered with the OS.
     /// Registration is deferred off the caller's thread (monorepo#1572), so
     /// tests that drive the hub indirectly (through the registry) need this
@@ -567,11 +674,13 @@ impl SharedWatchHub {
 }
 
 /// First delay before retrying a failed watcher creation; doubles per failure.
-const CREATE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Shared with [`super::root_watch`]'s registration retry so both watch
+/// families recover from the same transient failure on the same schedule.
+pub(super) const CREATE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Ceiling for the creation-retry backoff, so a persistent failure (fd
 /// exhaustion, intent-hq/intent#3708) keeps probing about once a minute.
-const CREATE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+pub(super) const CREATE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Start a group's registrar: a DETACHED OS thread that builds the shared
 /// watcher and then serves `watch`/`unwatch` commands. Detached rather than
@@ -847,6 +956,17 @@ impl Drop for TierWatch {
     }
 }
 
+impl TierWatch {
+    /// Detach a [`RegistrationProbe`] for the shared watch this tier rides.
+    /// Tier watches are held behind a `std::sync::Mutex` by their owners, so
+    /// the probe is what a test awaits, not the watch itself.
+    #[cfg(test)]
+    #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
+    pub(super) fn probe(&self) -> RegistrationProbe {
+        self._sub.probe()
+    }
+}
+
 /// Watch the tier directories `subpaths` (relative to `workspace_root`) via the
 /// shared stream on the workspace root, invoking `on_change` for matching
 /// events.
@@ -946,7 +1066,7 @@ mod tests {
     /// a SINGLE stream, and the demux still keeps them isolated — each sink
     /// sees only the events under its own root.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn sibling_roots_share_one_stream_and_stay_isolated() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1025,7 +1145,6 @@ mod tests {
     /// Dropping the last subscription for a group retires the stream, so an
     /// archived/closed workspace stops consuming fseventsd capacity.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn dropping_the_last_subscription_retires_the_stream() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1093,7 +1212,7 @@ mod tests {
     /// so on Linux (one global group) the co-tenant nested root would go
     /// silently dead without the re-registration in `SubHandle::drop`.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn dropping_an_outer_root_keeps_a_nested_root_covered() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1213,6 +1332,7 @@ mod tests {
     /// The resolution fallback is per path, not per event: one path of a
     /// multi-path event matching raw must not suppress resolution for a sibling
     /// path that only reaches its sink after canonicalization.
+    #[cfg(unix)]
     #[test]
     fn a_raw_match_does_not_suppress_resolution_for_sibling_paths() {
         use notify::event::{EventKind, ModifyKind, RenameMode};
@@ -1317,7 +1437,7 @@ mod tests {
     /// command channel and retries creation with backoff, and once the factory
     /// recovers the failed roots are re-registered and deliver events.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn watcher_creation_failure_settles_registrations_and_recovers() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1376,12 +1496,65 @@ mod tests {
         panic!("recovered watch never delivered events");
     }
 
+    /// Regression for intent-hq/intent#4845 / #4852: the sync point a test
+    /// uses before mutating a watched tree must wait for the watch to be
+    /// LIVE, not merely settled. A registration settled as failed during a
+    /// creation retry must keep the waiter parked (a) and release it once the
+    /// retry re-registers the root (b) — otherwise the test writes before the
+    /// OS watch exists and its event wait hangs into nextest's kill.
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn probe_wait_live_rides_out_creation_retry() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parent = TempDir::new("probe-live");
+        let root = parent.path.join("ws");
+        std::fs::create_dir_all(&root).expect("mk ws");
+
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail_in_factory = Arc::clone(&fail);
+        let hub = SharedWatchHub::with_factory(Arc::new(move |callback: EventCallback| {
+            if fail_in_factory.load(Ordering::SeqCst) {
+                Err(notify::Error::generic("injected creation failure"))
+            } else {
+                notify::recommended_watcher(callback)
+                    .map(|w| Box::new(w) as Box<dyn Watcher + Send>)
+            }
+        }));
+
+        let (sub, _rx, _canonical) = hub.subscribe(&root);
+        sub.wait_established(LIVENESS).await;
+        assert!(
+            sub.registration.failed(),
+            "precondition: creation failure settles the registration as failed"
+        );
+
+        // (a) Settled-as-failed is not live: the probe keeps waiting.
+        let probe = sub.probe();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), probe.wait_live(LIVENESS))
+                .await
+                .is_err(),
+            "wait_live must not return on a registration failed during a creation retry"
+        );
+
+        // (b) Once the factory recovers the retry re-registers the root and
+        // the probe releases with the registration live.
+        fail.store(false, Ordering::SeqCst);
+        probe.wait_live(LIVENESS).await;
+        assert!(
+            sub.registration.live(),
+            "wait_live must return only once live"
+        );
+    }
+
     /// The health handle tracks the hub through its lifecycle: `None` before
     /// attachment, healthy counts while watches are live, failed-root counts
     /// when a registration settles as failed, and `None` again once the hub
     /// is dropped (the `Weak` must not extend the hub's lifetime).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn watch_health_snapshot_tracks_roots_failures_and_hub_lifetime() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
@@ -1436,7 +1609,7 @@ mod tests {
     /// registrar settles incoming registrations as failed while no watcher
     /// exists), and recovery drains the count back to zero.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
+    #[expect(clippy::await_holding_lock)]
     async fn watch_health_reflects_creation_failure_and_recovery() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()

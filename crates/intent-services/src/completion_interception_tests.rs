@@ -25,23 +25,18 @@ mod tests {
     use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
     use crate::Services;
 
+    /// `SQLite` db inside an RAII temp dir; the dir sweep on drop also covers
+    /// the `-wal`/`-shm` sidecars.
     struct TempDb {
         path: PathBuf,
+        _dir: tempfile::TempDir,
     }
 
     impl TempDb {
         fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("completion-test-{}.db", uuid::Uuid::new_v4()));
-            Self { path }
-        }
-    }
-
-    impl Drop for TempDb {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let _ = fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-            }
+            let dir = crate::test_support::test_tempdir("completion-test-");
+            let path = dir.path().join("completion.db");
+            Self { path, _dir: dir }
         }
     }
 
@@ -120,6 +115,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -1256,7 +1252,6 @@ mod tests {
     /// Provision a sandbox with one clean commit and strand it `merge_pending`,
     /// returning `(test_root, repo_path, sandbox_path, ws, services, bus)`.
     /// Returns `None` when `CoW` is unsupported (test should skip).
-    #[allow(clippy::type_complexity)]
     async fn setup_merge_pending_sandbox(
         store: &Store,
         name: &str,
@@ -1803,7 +1798,6 @@ mod tests {
     /// turn-end merges (`mergeOnTurnEnd: false` — the delegate/create path
     /// stamps this), with one clean commit in the sandbox. Returns `None`
     /// when `CoW` is unsupported (test should skip).
-    #[allow(clippy::type_complexity)]
     async fn setup_no_merge_sandbox(
         store: &Store,
         name: &str,

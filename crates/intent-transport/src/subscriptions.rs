@@ -9,6 +9,12 @@
 //! deltas (seq 1, 2, …). TB-4 wires the `note` channel end-to-end; other
 //! channels (TB-5) reuse this machinery. The legacy `events.subscribe` firehose
 //! (`events.event`) is left intact and coexists (Risk R1).
+//!
+//! For "the client says chat is stuck" triage, grep the daemon log for the
+//! `intent_transport::subscription_lifecycle` INFO records ([`trace_chat_subscribe`],
+//! [`trace_chat_snapshot`], [`trace_chat_forwarder_exit`], [`trace_chat_teardown`]):
+//! per subscription id they show whether the subscribe arrived, whether a seq-0
+//! snapshot went out, and how the forwarder ended.
 
 use intent_core::events::{
     AGENT_COMPLETED, AGENT_CREATED, AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_MESSAGE,
@@ -241,7 +247,7 @@ pub(crate) fn parse_note_subscribe_params(
 
 /// Validate `workspace.subscribe` params. The channel is global, so only the
 /// optional `replaceGroup` is read (§6.2).
-#[allow(clippy::unnecessary_wraps)] // params parser; keeps the uniform Result shape of its siblings
+#[expect(clippy::unnecessary_wraps)] // params parser; keeps the uniform Result shape of its siblings
 pub(crate) fn parse_workspace_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<WorkspaceSubscribeParams, String> {
@@ -553,6 +559,82 @@ impl Drop for SnapshotTimer {
             SNAPSHOT_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Target the chat subscription lifecycle INFO records are emitted under.
+/// Content-free like the [`SNAPSHOT_WARN_TARGET`] records — channel, scope,
+/// subscription id, flags, and counts only, never message content.
+const LIFECYCLE_TARGET: &str = "intent_transport::subscription_lifecycle";
+
+/// Record an accepted `chat.subscribe`: the bus subscription is wired, but the
+/// forwarder is only spawned after the reply enqueue succeeds — a failed
+/// enqueue closes this record with an immediate teardown record instead.
+/// `since` is whether the client asked to resume (§7.1), not the id itself.
+pub(crate) fn trace_chat_subscribe(scope: &str, subscription_id: &str, since: bool) {
+    tracing::info!(
+        target: LIFECYCLE_TARGET,
+        channel = channel_name(Channel::Chat),
+        scope,
+        subscription_id,
+        stage = "subscribe",
+        since,
+        "chat subscription lifecycle"
+    );
+}
+
+/// Record the seq-0 snapshot a chat forwarder queued (logged after the frame
+/// lands on the outbound lane, so the record never overstates progress).
+/// `resumed` mirrors the snapshot's §7.1 resume-outcome key verbatim: omitted
+/// when the snapshot carries no `resumed` key (no resume requested), else
+/// `true`/`false` for an honored/declined resume — so the record alone
+/// distinguishes "no resume attempted" from "resume failed". `page_size` is
+/// the number of messages the emitted page carries.
+pub(crate) fn trace_chat_snapshot(scope: &str, subscription_id: &str, snapshot: &Value) {
+    let resumed = snapshot.get("resumed").and_then(serde_json::Value::as_bool);
+    let page_size = snapshot
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    tracing::info!(
+        target: LIFECYCLE_TARGET,
+        channel = channel_name(Channel::Chat),
+        scope,
+        subscription_id,
+        stage = "snapshot",
+        resumed,
+        page_size,
+        "chat subscription lifecycle"
+    );
+}
+
+/// Record a chat forwarder loop exiting. `reason` is a fixed vocabulary:
+/// `client_closed` (the outbound lane is gone) or `bus_closed`.
+pub(crate) fn trace_chat_forwarder_exit(scope: &str, subscription_id: &str, reason: &'static str) {
+    tracing::info!(
+        target: LIFECYCLE_TARGET,
+        channel = channel_name(Channel::Chat),
+        scope,
+        subscription_id,
+        stage = "forwarder_exit",
+        reason,
+        "chat subscription lifecycle"
+    );
+}
+
+/// Record a chat subscription leaving the connection's registry —
+/// `chat.unsubscribe`, a `replaceGroup` replacement, or connection close (all
+/// three abort the forwarder, so this is the only teardown signal those paths
+/// produce) — or, before any registry entry exists, a subscribe whose reply
+/// enqueue failed, so every subscribe record is closed by a terminal record.
+pub(crate) fn trace_chat_teardown(scope: &str, subscription_id: &str) {
+    tracing::info!(
+        target: LIFECYCLE_TARGET,
+        channel = channel_name(Channel::Chat),
+        scope,
+        subscription_id,
+        stage = "teardown",
+        "chat subscription lifecycle"
+    );
 }
 
 /// The bus event types a channel tails for deltas (TB-0 §3). The `agent:stream:*`
@@ -1435,7 +1517,12 @@ impl ChatDeltaState {
     /// persisted block as `updated` (or `added` if never emitted live) carrying
     /// the authoritative `messageSeq`/`timestamp` and `streamingComplete:true`,
     /// plus `removedIds` for any block emitted live that the persisted message
-    /// does not contain (e.g. a mispredicted `tool_result` index).
+    /// does not contain (e.g. a mispredicted `tool_result` index). Each entity
+    /// also carries the persisted row's `metadata` verbatim when present
+    /// (intent#4409 — mirrors the `agent:message` re-read lift), so a
+    /// subscribe-only client renders interrupted / finish-reason state exactly
+    /// as `agent.getConversation` does; rows without metadata keep the lean
+    /// entity shape.
     ///
     /// The re-read is retried once, and a persistent failure still emits a
     /// terminal frame — the best-effort one built from the accumulated live
@@ -1503,6 +1590,7 @@ impl ChatDeltaState {
         {
             let seq = msg.get("seq").and_then(Value::as_u64);
             let ts = msg.get("timestamp").and_then(Value::as_str);
+            let metadata = msg.get("metadata").filter(|m| !m.is_null());
             if let Some(blocks) = msg.get("contentBlocks").and_then(Value::as_array) {
                 for block in blocks {
                     let Some(bid) = block.get("id").and_then(Value::as_str) else {
@@ -1510,7 +1598,10 @@ impl ChatDeltaState {
                     };
                     persisted_ids.insert(bid.to_string());
                     let is_added = !self.seen_ids.contains(bid);
-                    let entity = self.entity(&message_id, block.clone(), seq, ts, true);
+                    let mut entity = self.entity(&message_id, block.clone(), seq, ts, true);
+                    if let (Some(obj), Some(md)) = (entity.as_object_mut(), metadata) {
+                        obj.insert("metadata".to_string(), md.clone());
+                    }
                     push_entity(&mut added, &mut updated, is_added, entity);
                 }
             }
@@ -1530,8 +1621,9 @@ impl ChatDeltaState {
     /// delivered live or seeded from the seq-0 snapshot) stamped
     /// `streamingComplete: true`, so the client still flips out of the
     /// streaming state on the content it has. No authoritative
-    /// `messageSeq`/`timestamp` (the store read failed) and no `removedIds`
-    /// (without the persisted message no orphan is provable). Text/thinking
+    /// `messageSeq`/`timestamp` (the store read failed), no `removedIds`
+    /// (without the persisted message no orphan is provable), and no
+    /// `metadata` (there is no persisted row to lift it from). Text/thinking
     /// entries are markers — their FULL text is rebuilt from
     /// [`Self::text_acc`] here, the one place the degraded frame needs it.
     ///

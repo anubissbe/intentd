@@ -8,11 +8,13 @@
 
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate, NoteEditInput,
-    NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode, TaskAgentLink,
-    WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
+    ClientId, ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate,
+    NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode,
+    TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
 };
+use serde::Serialize;
 use serde_json::{json, Map, Value};
+use std::time::Instant;
 use tracing::Instrument;
 
 /// Target of the per-dispatch profiling span wrapped around [`dispatch`] in
@@ -324,33 +326,100 @@ pub async fn handle_message(api: &dyn WorkspaceApi, message: &str) -> Option<Str
         }
     };
 
-    // Per-dispatch profiling span: carries the method name so the composition
-    // root's profiling layer can count `sqlx::query` statement events scoped
-    // to this dispatch and time the handler (see RPC_DISPATCH_SPAN_TARGET).
-    let span =
-        tracing::info_span!(target: RPC_DISPATCH_SPAN_TARGET, RPC_DISPATCH_SPAN_NAME, method);
-    let result = dispatch(api, method, &params).instrument(span).await;
-
-    // Notifications never get a response, even on error / unknown method (§3.4).
-    if is_notification {
-        return None;
+    // Keep one span alive through dispatch AND response encoding. The writer
+    // queue consumes the returned frame later, so queue latency is deliberately
+    // excluded from `encode_elapsed_ms`.
+    let span = tracing::info_span!(
+        target: RPC_DISPATCH_SPAN_TARGET,
+        RPC_DISPATCH_SPAN_NAME,
+        method,
+        response_bytes = tracing::field::Empty,
+        encode_elapsed_ms = tracing::field::Empty,
+        oversized_replacement = tracing::field::Empty,
+        encode_failed = tracing::field::Empty,
+    );
+    let profile_span = span.clone();
+    async move {
+        let result = dispatch(api, method, &params).await;
+        let encode_started = Instant::now();
+        let encoded = encode_dispatch_result(
+            &echo_id,
+            method,
+            is_notification,
+            result,
+            crate::MAX_OUTBOUND_MESSAGE_BYTES,
+        );
+        let encode_elapsed_ms = if is_notification {
+            0
+        } else {
+            millis_u64(encode_started.elapsed().as_millis())
+        };
+        profile_span.record(
+            "response_bytes",
+            u64::try_from(encoded.response_bytes).unwrap_or(u64::MAX),
+        );
+        profile_span.record("encode_elapsed_ms", encode_elapsed_ms);
+        profile_span.record("oversized_replacement", encoded.oversized_replacement);
+        profile_span.record("encode_failed", encoded.encode_failed);
+        encoded.frame
     }
-    // The log-only large-frame warning for outbound responses lives in
-    // `panic_guard::guard_frame` (the chokepoint covering fast-path responses
-    // that bypass this dispatcher, e.g. `host.exec`). The `-32010`
-    // replacement below hands a small error frame to that check, so an
-    // oversized response is never double-warned on top of its `error!`.
-    Some(match result {
-        Ok(v) => {
-            let frame = success_string(&echo_id.clone(), &v);
-            if frame.len() > crate::MAX_OUTBOUND_MESSAGE_BYTES {
-                oversized_response_string(&echo_id, method, frame.len())
-            } else {
-                frame
-            }
+    .instrument(span)
+    .await
+}
+
+fn millis_u64(millis: u128) -> u64 {
+    u64::try_from(millis.min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
+}
+
+struct ResponseEncoding {
+    frame: Option<String>,
+    /// Serialized size of the intended envelope. For a hard-cap replacement,
+    /// this remains the rejected envelope's size rather than the small error
+    /// frame's size so profiling retains the payload-cost signal.
+    response_bytes: usize,
+    oversized_replacement: bool,
+    encode_failed: bool,
+}
+
+/// Encode a dispatched result and apply the hard response cap. Notifications
+/// have no envelope, therefore all response-encoding metrics are zero/false.
+fn encode_dispatch_result(
+    id: &Value,
+    method: &str,
+    is_notification: bool,
+    result: Result<Value, RpcErr>,
+    max_response_bytes: usize,
+) -> ResponseEncoding {
+    if is_notification {
+        return ResponseEncoding {
+            frame: None,
+            response_bytes: 0,
+            oversized_replacement: false,
+            encode_failed: false,
+        };
+    }
+
+    let encoded = match result {
+        Ok(value) => success_frame(id, &value),
+        Err(err) => error_frame(id, err.code, &err.message, err.data),
+    };
+    let response_bytes = encoded.frame.len();
+    if response_bytes > max_response_bytes {
+        let replacement = oversized_response_frame(id, method, response_bytes, max_response_bytes);
+        ResponseEncoding {
+            frame: Some(replacement.frame),
+            response_bytes,
+            oversized_replacement: true,
+            encode_failed: encoded.encode_failed || replacement.encode_failed,
         }
-        Err(e) => error_string(&echo_id, e.code, &e.message, e.data),
-    })
+    } else {
+        ResponseEncoding {
+            frame: Some(encoded.frame),
+            response_bytes,
+            oversized_replacement: false,
+            encode_failed: encoded.encode_failed,
+        }
+    }
 }
 
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
@@ -576,6 +645,42 @@ async fn dispatch(
                 .await
                 .map_err(workspace_err)?;
             Ok(json!({ "autoCommit": auto_commit }))
+        }
+        "client.list" => {
+            let clients = api.client_list().await.map_err(workspace_err)?;
+            Ok(json!({ "clients": clients }))
+        }
+        "workspace.getBrowserClient" => {
+            let id = require_workspace_id(params)?;
+            let browser_client = api
+                .get_workspace_browser_client(id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "browserClient": browser_client }))
+        }
+        "workspace.setBrowserClient" => {
+            let id = require_workspace_id(params)?;
+            let client_id = match params.get("clientId") {
+                Some(Value::String(s)) if !s.trim().is_empty() => {
+                    Some(ClientId::from_string(s.clone()))
+                }
+                Some(Value::Null) => None,
+                Some(_) => {
+                    return Err(invalid_params(
+                        "Invalid parameter: clientId must be a non-empty string or null",
+                    ))
+                }
+                None => {
+                    return Err(invalid_params(
+                        "Missing required parameter: clientId (string | null)",
+                    ))
+                }
+            };
+            let browser_client = api
+                .set_workspace_browser_client(id, client_id)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "browserClient": browser_client }))
         }
         "workspace.getSetupScript" => {
             let id = require_workspace_id(params)?;
@@ -1658,8 +1763,26 @@ async fn dispatch(
             let content = require_str_param(params, "content")?;
             let image_blocks = opt_value(params, "imageBlocks");
             let file_blocks = opt_value(params, "fileBlocks");
+            // Opaque per-message payload (PROTOCOL §5.5), captured on the
+            // queued entry so the drain-time persist writes the same row
+            // metadata a direct `agent.sendMessage` would (a queued
+            // `question_answers` answer resolves the pending question set).
+            // Same user-origin front door as `agent.sendMessage`: the
+            // reserved attribution fields are stripped; a non-object value
+            // is rejected.
+            let message_metadata = match opt_value(params, "messageMetadata") {
+                None => None,
+                Some(Value::Object(obj)) => strip_sender_attribution(Some(Value::Object(obj))),
+                Some(_) => return Err(invalid_params("messageMetadata must be an object")),
+            };
             let result = api
-                .agent_queue_message(agent_id, content, image_blocks, file_blocks)
+                .agent_queue_message(
+                    agent_id,
+                    content,
+                    image_blocks,
+                    file_blocks,
+                    message_metadata,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
@@ -3460,15 +3583,35 @@ async fn dispatch(
             let data = opt_str(params, "data");
             let source_path = opt_str(params, "sourcePath");
             let mime_type = opt_str(params, "mimeType");
-            api.file_place_attachment(ws, file_name, data, source_path, mime_type)
+            let idempotency_key = opt_str_strict(params, "idempotencyKey")?;
+            api.file_place_attachment(ws, file_name, data, source_path, mime_type, idempotency_key)
                 .await
                 .map_err(domain_to_rpc)
         }
         "file.getAttachmentInfo" => {
-            let attachment_id = require_str_param(params, "attachmentId")?;
-            api.file_get_attachment_info(attachment_id)
-                .await
-                .map_err(domain_to_rpc)
+            // Exactly one of `attachmentId` | (`workspaceId` + `idempotencyKey`)
+            // (intent-hq/intent#4691). Presence is decided on the raw params
+            // so a key arm never silently degrades to the id arm.
+            let has_id = params.get("attachmentId").is_some_and(|v| !v.is_null());
+            let has_key = params.get("idempotencyKey").is_some_and(|v| !v.is_null());
+            match (has_id, has_key) {
+                (true, false) => {
+                    let attachment_id = require_str_param(params, "attachmentId")?;
+                    api.file_get_attachment_info(attachment_id)
+                        .await
+                        .map_err(domain_to_rpc)
+                }
+                (false, true) => {
+                    let ws = require_ws_note(params)?;
+                    let idempotency_key = require_str_param(params, "idempotencyKey")?;
+                    api.file_get_attachment_info_by_key(ws, idempotency_key)
+                        .await
+                        .map_err(domain_to_rpc)
+                }
+                _ => Err(invalid_params(
+                    "exactly one of attachmentId or idempotencyKey (with workspaceId) is required",
+                )),
+            }
         }
         "file.attachmentUpload.begin" => {
             let ws = require_ws_note(params)?;
@@ -3476,9 +3619,17 @@ async fn dispatch(
             let size_bytes = require_u64(params, "sizeBytes")?;
             let sha256 = require_str_param(params, "sha256")?;
             let mime_type = opt_str(params, "mimeType");
-            api.file_attachment_upload_begin(ws, file_name, size_bytes, sha256, mime_type)
-                .await
-                .map_err(domain_to_rpc)
+            let idempotency_key = opt_str_strict(params, "idempotencyKey")?;
+            api.file_attachment_upload_begin(
+                ws,
+                file_name,
+                size_bytes,
+                sha256,
+                mime_type,
+                idempotency_key,
+            )
+            .await
+            .map_err(domain_to_rpc)
         }
         "file.attachmentUpload.chunk" => {
             let upload_id = require_str_param(params, "uploadId")?;
@@ -4220,6 +4371,18 @@ fn opt_bool_strict(params: &Map<String, Value>, name: &str) -> Result<Option<boo
     }
 }
 
+/// Like [`opt_str`] but strict: absent/null → `None`, a string →
+/// `Some(..)`, anything else → `-32602`. Used where silently dropping a
+/// non-string would change semantics (e.g. an attachment `idempotencyKey`,
+/// whose absence means "not idempotent").
+fn opt_str_strict(params: &Map<String, Value>, name: &str) -> Result<Option<String>, RpcErr> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(invalid_params(format!("{name} must be a string"))),
+    }
+}
+
 /// Optional string→string map param (absent/non-object → `None`); non-string
 /// values are skipped. Used for the `script.create` `env` overrides.
 fn opt_string_map(
@@ -4237,7 +4400,7 @@ fn opt_string_map(
 /// Used by the `event.*` `limit` / `minutesAgo` knobs, whose defaults are
 /// applied in the service layer (`value || default`).
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn opt_int(params: &Map<String, Value>, name: &str) -> Option<i64> {
     match params.get(name) {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -4324,7 +4487,7 @@ fn parse_confirm(params: &Map<String, Value>) -> bool {
 /// for parity with the other paginated reads we fall back to top-level `limit`
 /// and `nextToken` when no `page` object is present.
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn parse_page_params(params: &Map<String, Value>) -> (Option<i64>, Option<String>) {
     if let Some(Value::Object(page)) = params.get("page") {
         let limit = page
@@ -4369,7 +4532,7 @@ fn normalize_acceptance_criteria(params: &Map<String, Value>) -> Vec<String> {
 /// Loosely parse an integer from a JSON number or leading-int string
 /// (`parseInt`-like), returning `None` when no integer is present.
 // Whole-valued floats from JSON clients; float→int casts saturate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn parse_int_loose(value: Option<&Value>) -> Option<i64> {
     match value {
         Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
@@ -4420,13 +4583,13 @@ fn workspace_err(e: Error) -> RpcErr {
 }
 
 /// Serialize a success envelope. `result` is always a JSON object (§3.2).
-fn success_string(id: &Value, result: &Value) -> String {
+fn success_frame(id: &Value, result: &Value) -> EncodedEnvelope {
     let resp = json!({ "jsonrpc": "2.0", "result": result, "id": id });
-    serde_json::to_string(&resp).unwrap_or_else(|_| internal_fallback())
+    serialize_envelope(&resp)
 }
 
 /// Serialize an error envelope, optionally carrying `data`.
-fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> String {
+fn error_frame(id: &Value, code: i32, message: &str, data: Option<Value>) -> EncodedEnvelope {
     let mut err = Map::new();
     err.insert("code".to_string(), json!(code));
     err.insert("message".to_string(), json!(message));
@@ -4434,7 +4597,11 @@ fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> St
         err.insert("data".to_string(), d);
     }
     let resp = json!({ "jsonrpc": "2.0", "error": Value::Object(err), "id": id });
-    serde_json::to_string(&resp).unwrap_or_else(|_| internal_fallback())
+    serialize_envelope(&resp)
+}
+
+fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> String {
+    error_frame(id, code, message, data).frame
 }
 
 /// Replace a serialized response that exceeds
@@ -4442,32 +4609,135 @@ fn error_string(id: &Value, code: i32, message: &str, data: Option<Value>) -> St
 /// echoing the request id, so the client fails fast instead of hitting its
 /// RPC timeout on a silently dropped frame. The writer-task cap remains as a
 /// last-resort backstop for non-response frames (subscription pushes/events).
-fn oversized_response_string(id: &Value, method: &str, response_bytes: usize) -> String {
+fn oversized_response_frame(
+    id: &Value,
+    method: &str,
+    response_bytes: usize,
+    max_response_bytes: usize,
+) -> EncodedEnvelope {
     tracing::error!(
         method,
         response_bytes,
-        limit = crate::MAX_OUTBOUND_MESSAGE_BYTES,
+        limit = max_response_bytes,
         "oversized JSON-RPC response replaced with error"
     );
-    error_string(
+    error_frame(
         id,
         OVERSIZED_RESPONSE,
         &format!(
-            "response for {method} exceeds maximum outbound frame size: {response_bytes} bytes > {} bytes",
-            crate::MAX_OUTBOUND_MESSAGE_BYTES
+            "response for {method} exceeds maximum outbound frame size: {response_bytes} bytes > {max_response_bytes} bytes"
         ),
         Some(json!({
             "code": "oversized-response",
             "method": method,
             "responseBytes": response_bytes,
-            "limit": crate::MAX_OUTBOUND_MESSAGE_BYTES,
+            "limit": max_response_bytes,
         })),
     )
+}
+
+struct EncodedEnvelope {
+    frame: String,
+    encode_failed: bool,
+}
+
+fn serialize_envelope(value: &impl Serialize) -> EncodedEnvelope {
+    match serde_json::to_string(value) {
+        Ok(frame) => EncodedEnvelope {
+            frame,
+            encode_failed: false,
+        },
+        Err(_) => EncodedEnvelope {
+            frame: internal_fallback(),
+            encode_failed: true,
+        },
+    }
 }
 
 /// Last-resort response if serialization itself fails (should never happen).
 fn internal_fallback() -> String {
     r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":null}"#.to_string()
+}
+
+#[cfg(test)]
+mod response_profile_tests {
+    use super::*;
+    use serde::ser::Error as _;
+
+    struct FailingSerialize;
+
+    impl Serialize for FailingSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(S::Error::custom("intentional test failure"))
+        }
+    }
+
+    #[test]
+    fn serialization_failure_returns_profiled_fallback() {
+        let encoded = serialize_envelope(&FailingSerialize);
+        assert!(encoded.encode_failed);
+        assert_eq!(encoded.frame, internal_fallback());
+    }
+
+    #[test]
+    fn response_metrics_cover_success_error_replacement_and_notification() {
+        let success = encode_dispatch_result(
+            &json!(1),
+            "workspace.list",
+            false,
+            Ok(json!({ "workspaces": [] })),
+            usize::MAX,
+        );
+        assert_eq!(
+            success.response_bytes,
+            success.frame.as_ref().unwrap().len()
+        );
+        assert!(!success.oversized_replacement);
+        assert!(!success.encode_failed);
+
+        let error = encode_dispatch_result(
+            &json!(2),
+            "workspace.get",
+            false,
+            Err(invalid_params("bad params")),
+            usize::MAX,
+        );
+        assert_eq!(error.response_bytes, error.frame.as_ref().unwrap().len());
+        assert_eq!(
+            serde_json::from_str::<Value>(error.frame.as_ref().unwrap()).unwrap()["error"]["code"],
+            INVALID_PARAMS
+        );
+
+        let oversized = encode_dispatch_result(
+            &json!(3),
+            "note.list",
+            false,
+            Ok(json!({ "content": "x".repeat(256) })),
+            64,
+        );
+        assert!(oversized.response_bytes > 64);
+        assert!(oversized.oversized_replacement);
+        assert_eq!(
+            serde_json::from_str::<Value>(oversized.frame.as_ref().unwrap()).unwrap()["error"]
+                ["code"],
+            OVERSIZED_RESPONSE
+        );
+
+        let notification = encode_dispatch_result(
+            &Value::Null,
+            "workspace.list",
+            true,
+            Ok(json!({ "workspaces": [] })),
+            usize::MAX,
+        );
+        assert!(notification.frame.is_none());
+        assert_eq!(notification.response_bytes, 0);
+        assert!(!notification.oversized_replacement);
+        assert!(!notification.encode_failed);
+    }
 }
 
 #[cfg(test)]

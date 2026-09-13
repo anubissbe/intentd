@@ -17,6 +17,7 @@ mod agent_flipped_completion_repo;
 mod agent_queue_repo;
 mod agent_repo;
 mod attachment_repo;
+mod browser_tab_repo;
 mod client_repo;
 mod comment_repo;
 mod completion_wake_delivery_repo;
@@ -56,10 +57,10 @@ pub use agent_flipped_completion_repo::AGENT_FLIPPED_COMPLETIONS_CAP;
 pub use agent_queue_repo::AgentQueueRow;
 pub(crate) use agent_repo::AgentUsageRow;
 pub use agent_repo::{
-    ChildAgentCounts, MessageFtsMatch, ReplaceMessage, SessionMessageProjection,
-    UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
+    ChildAgentCounts, MessageFtsMatch, PrunedToolField, PrunedToolPayload, ReplaceMessage,
+    SessionMessageProjection, UserMessageIndexItem, PROJECTION_TEXT_BLOCK_CAP,
 };
-pub use attachment_repo::AttachmentRecord;
+pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;
 pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diffs_repo::NewDiff;
@@ -260,6 +261,9 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 pub struct Store {
     write_pool: SqlitePool,
     read_pool: SqlitePool,
+    /// Process-local `displayed` overlay of the browser tab registry; see
+    /// `browser_tab_repo::DisplayedOverlay`.
+    browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
 }
 
 impl Store {
@@ -303,6 +307,7 @@ impl Store {
         Ok(Self {
             write_pool,
             read_pool,
+            browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
         })
     }
 

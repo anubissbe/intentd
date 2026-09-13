@@ -373,20 +373,88 @@
 //! `git.status.files` entry set), and `error` only when the root could not
 //! be read (counts then 0). Unknown workspace → `-32602`. Method catalog
 //! grows by one router method — 300 router methods, 39 fast-path, 341
-//! total. Version 9.8 adds the execution-environment surface (additive;
+//! total.
+//!
+//! Version 9.8 adds guided Antigravity setup (§5.44). The four local-app
+//! methods are `providers.setup.status`, `providers.setup.start`,
+//! `providers.setup.login`, and `providers.setup.cancel`. The reverse request
+//! `providers.setup.openLogin` asks the owning app to open the sign-in URL
+//! after explicit user consent. The catalog contains 300 router methods,
+//! 43 fast-path methods, and two aliases: 345 client-callable names.
+//! The five reverse methods are counted separately.
+//!
+//! Version 9.9 adds the REV-2 per-workspace browser-client pin. `client.list`
+//! (global) reports live hello'd connections grouped by `clientId`, a client
+//! counting as `browserExec`-capable when ANY of its live connections
+//! advertises it; `workspace.getBrowserClient` / `workspace.setBrowserClient`
+//! read and persist the pin (`Workspace.browserClientId`, omitted when
+//! unset; `-32602` for Chief / unknown workspace / never-hello'd clientId;
+//! `workspace:updated { changes: { browserClientId } }`). Agent-initiated
+//! `browser.exec` dispatches to the pinned client when set — pinned but
+//! offline is `-32603`, never a silent fallback. The catalog grows by three
+//! router methods — 303 router methods, 43 fast-path, two aliases: 348
+//! client-callable names.
+//!
+//! Version 9.10 adds the daemon-owned browser tab registry (REV-2 Model 2 & 6).
+//! Four additive fast-path methods: `browser.listTabs` (any client; entries
+//! decorated with `hostName` / `hostConnected` from the live reverse
+//! registry) and the host-only reports `browser.upsertTab`,
+//! `browser.removeTab`, and `browser.syncTabs`, which are keyed by the
+//! connection's `client.hello` identity (never a wire parameter) and answer
+//! `-32602` on an un-hello'd connection or when a report would move a known
+//! `tabId` to another workspace. Three additive workspace events:
+//! `browser:tab-opened`, `browser:tab-updated`, `browser:tab-closed`. The
+//! catalog contains 303 router methods, 47 fast-path methods, and two
+//! aliases: 352 client-callable names. The five reverse methods are
+//! counted separately.
+//!
+//! Version 9.11 routes agent browser traffic through the registry (REV-2
+//! Model 3–6 & 10). Agent-initiated `browser.exec` dispatches to the
+//! workspace's **driving client** — the pin, else the host of the
+//! workspace's claimed tabs, else the first-connected eligible client — and
+//! answers `listTabs` itself from the registry (all hosts aggregated,
+//! `hostClientId` / `hostName` / `hostConnected` per entry); a `claimTab`
+//! executed on the driving client re-homes the tab's row there
+//! (`browser:tab-updated { changes: { hostClientId, ownerAgentId } }`), and
+//! `workspace.setBrowserClient` moves every claimed tab to the new pin. Two
+//! additive fast-path methods (any client): `browser.navigateTab { tabId,
+//! url }` routes a navigation to the tab's driving client / host and echoes
+//! the action envelope; `browser.closeTab { tabId, force? }` routes the
+//! close, or with `force` (or an offline target) tombstones the row
+//! daemon-side and publishes `browser:tab-closed`. Unknown `tabId` is
+//! `-32602`; an offline target is `-32603` ("browser client … for this
+//! workspace is not connected"). The catalog contains 303 router methods,
+//! 49 fast-path methods, and two aliases: 354 client-callable names. The
+//! five reverse methods are counted separately.
+//!
+//! Version 9.12 adds the `auth_required` external MCP-server lifecycle state
+//! (additive; §5.22): HTTP 401/403 from a remote probe or forwarded call tells
+//! clients to authenticate. No method-catalog change.
+//!
+//! Version 9.13 adds idempotent attachment placement (additive; §5.9,
+//! intent-hq/intent#4691): the optional `idempotencyKey` param on
+//! `file.placeAttachment` and `file.attachmentUpload.begin`, the presence-
+//! detected `replayed: true` result marker on a same-key replay, and the
+//! `{ workspaceId, idempotencyKey }` selector arm on `file.getAttachmentInfo`
+//! (exactly one of `attachmentId` | the key pair). Bindings are per
+//! workspace, retained 7 days. No method-catalog change.
+//!
+//! Version 9.14 adds the execution-environment surface (additive;
 //! §5.35, §5.1, §5.5b): the `sandbox.profiles.list` /
 //! `sandbox.profiles.update` / `sandbox.options` / `sandbox.image.check`
 //! router methods, the `system.capabilities.microvmSupported` field (§5.7),
 //! the `workspace.create` `executionEnvironment` param with the persisted
 //! `Workspace.executionEnvironment` field, and the structured
 //! `execution-environment-unavailable` / `execution-environment-not-implemented`
-//! error payloads (§9) — 304 router methods, 39 fast-path, 345 total.
+//! error payloads (§9). The catalog contains 307 router methods, 49
+//! fast-path methods, and two aliases: 358 client-callable names. The five
+//! reverse methods are counted separately.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "9.8";
+pub const PROTOCOL_VERSION: &str = "9.14";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

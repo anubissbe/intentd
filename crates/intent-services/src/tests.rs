@@ -6,14 +6,14 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Error, Note, NoteAddInput,
-    NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata, NoteUpdateInput,
-    NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, ContentType, Error, MessageOrigin,
+    Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata,
+    NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use intent_store::Store;
 
-use crate::Services;
+use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 /// Runs before `main()` — and therefore before any test threads exist, making
 /// `set_var` race-free. Node children spawned by lib tests (e.g. the real
@@ -68,41 +68,25 @@ impl Drop for DebounceEnvGuard {
     }
 }
 
-/// Create a temp dir with a recognizable `prefix` under the system temp root.
-/// The returned guard removes the dir on drop (including on panic); set
-/// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
-pub(crate) fn test_tempdir(prefix: &str) -> tempfile::TempDir {
-    let mut dir = tempfile::Builder::new()
-        .prefix(prefix)
-        .tempdir()
-        .expect("create test tempdir");
-    if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
-        dir.disable_cleanup(true);
-    }
-    dir
-}
+pub(crate) use crate::test_support::test_tempdir;
 
+/// `SQLite` db inside an RAII temp dir (see [`test_tempdir`]): the dir sweep on
+/// drop also covers the `-wal`/`-shm` sidecars and the `.config.toml` sibling.
 pub(crate) struct TempDb {
     pub(crate) path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     pub(crate) fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("intentd-svc-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
+        let dir = test_tempdir("intentd-svc-");
+        let path = dir.path().join("svc.db");
+        Self { path, _dir: dir }
     }
 }
 
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".config.toml"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
-    }
-}
-
-/// A settings registry (backed by a config file next to the temp db, removed
-/// by [`TempDb`]'s drop) seeding `model.defaultProvider = "auggie"`: since
+/// A settings registry (backed by a config file next to the temp db, swept
+/// with [`TempDb`]'s dir) seeding `model.defaultProvider = "auggie"`: since
 /// monorepo#3044 there is no positional provider fallback, so tests that
 /// create/delegate agents without an explicit provider or model need a
 /// configured default to resolve to. The `providers.paths` override points
@@ -134,23 +118,15 @@ pub(crate) fn test_registry_with_default_provider(
 /// test that constructs a `Services` reachable from workspace provisioning
 /// **must** attach one via `.with_workspaces_root(root.path().to_path_buf())`;
 /// otherwise the guard panics rather than writing under `~/intent/workspaces`.
-pub(crate) struct WorkspacesRoot(PathBuf);
+pub(crate) struct WorkspacesRoot(tempfile::TempDir);
 
 impl WorkspacesRoot {
     pub(crate) fn new() -> Self {
-        let p = std::env::temp_dir().join(format!("intentd-wss-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).expect("mkdir hermetic workspaces root");
-        Self(p)
+        Self(test_tempdir("intentd-wss-"))
     }
 
     pub(crate) fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for WorkspacesRoot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }
 
@@ -194,6 +170,7 @@ pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -389,10 +366,13 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         ))
         .await
         .unwrap();
-    // agent-2 is delegated by agent-1: `agentSummary` surfaces the session's
-    // delegation parent as `parentAgentId` (v2.9, additive).
+    // agent-2 is delegated by agent-1 and runs in the background:
+    // `agentSummary` surfaces the session's delegation parent as
+    // `parentAgentId` (v2.9, additive) and its persisted `is_background` flag
+    // as `isBackground` (monorepo#3789, additive).
     let mut delegated = mk_agent("agent-2", "Verifier", None, "2026-01-01T00:00:02Z");
     delegated.parent_agent_id = Some(AgentId::from("agent-1"));
+    delegated.is_background = true;
     store.insert_agent_session(&delegated).await.unwrap();
 
     // Hermetic root: the get/list enrichment probes the workspaces root for
@@ -412,10 +392,13 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         && a.specialist.as_deref() == Some("implementor")
         && !a.is_streaming
         && !a.is_responding
-        && a.parent_agent_id.is_none()));
-    // The delegated agent carries its parent's id (root agents omit it).
+        && a.parent_agent_id.is_none()
+        && !a.is_background));
+    // The delegated agent carries its parent's id (root agents omit it) and
+    // its background flag (foreground agents omit it).
     assert!(summary.agents.iter().any(|a| a.name == "Verifier"
-        && a.parent_agent_id.as_ref().map(AgentId::as_str) == Some("agent-1")));
+        && a.parent_agent_id.as_ref().map(AgentId::as_str) == Some("agent-1")
+        && a.is_background));
     // `agentIds` mirrors the agents used to build `agents` (forward-compat).
     let summary_ids: Vec<_> = summary.agent_ids.iter().map(|i| i.0.clone()).collect();
     let agent_ids: Vec<_> = summary.agents.iter().map(|a| a.id.0.clone()).collect();
@@ -437,6 +420,10 @@ async fn workspace_list_and_get_populate_card_aggregates() {
         .get("parentAgentId")
         .is_none());
     assert_eq!(v["agentSummary"]["agents"][1]["parentAgentId"], "agent-1");
+    // `isBackground` wire shape (monorepo#3789): omitted (not false) on
+    // foreground agents, camelCased `true` on background ones.
+    assert!(v["agentSummary"]["agents"][0].get("isBackground").is_none());
+    assert_eq!(v["agentSummary"]["agents"][1]["isBackground"], true);
     assert_eq!(v["agentSummary"]["agentIds"][0], "agent-1");
     assert_eq!(v["agentSummary"]["agentIds"].as_array().unwrap().len(), 2);
     assert!(v.get("diffSummary").is_none());
@@ -912,11 +899,20 @@ async fn cheap_task_stats_matches_enriched_compute_task_stats() {
         .await
         .unwrap();
 
+    let bulk = store
+        .count_task_stats_by_workspace(&[ws1.clone(), ws2.clone(), ws3.clone()])
+        .await
+        .expect("bulk task stats");
     for ws in [&ws1, &ws2, &ws3] {
         let notes = store.list_notes(ws).await.expect("list notes");
         let enriched = crate::compute_task_stats(&notes);
         let cheap = store.count_task_stats(ws).await.expect("cheap stats");
         assert_eq!(cheap, enriched, "parity failed for workspace {ws:?}");
+        assert_eq!(
+            bulk.get(ws),
+            Some(&cheap),
+            "bulk parity failed for workspace {ws:?}"
+        );
     }
 
     // Spot-check the expected counts and the services-side helper.
@@ -929,10 +925,176 @@ async fn cheap_task_stats_matches_enriched_compute_task_stats() {
     assert_eq!((s3.total, s3.completed, s3.in_progress), (0, 0, 0));
 }
 
+/// A malformed task/session projection in one workspace must not erase the
+/// healthy rows' aggregates when list-shaped reads fall back from the bulk
+/// query. The failed workspace alone retains the single-workspace omission
+/// behavior, for both `workspace.list` and the lite subscription snapshot.
+#[tokio::test]
+async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    let healthy = WorkspaceId::from("ws-healthy-projections");
+    let bad_task = WorkspaceId::from("ws-malformed-task-projection");
+    let bad_session = WorkspaceId::from("ws-malformed-session-projection");
+    for workspace_id in [&healthy, &bad_task, &bad_session] {
+        store
+            .insert_workspace(&workspace(workspace_id))
+            .await
+            .expect("workspace");
+        store
+            .insert_note(&note(workspace_id, "spec", "no task links"))
+            .await
+            .expect("spec");
+    }
+
+    let mut task = note(&healthy, "task-complete", "body");
+    task.parent_id = Some(NoteId::from("spec"));
+    task.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::Complete,
+        ..Default::default()
+    });
+    store.insert_note(&task).await.expect("healthy task");
+    let mut malformed_task = note(&bad_task, "task-malformed", "body");
+    malformed_task.parent_id = Some(NoteId::from("spec"));
+    malformed_task.metadata.task = Some(TaskMetadata::default());
+    store
+        .insert_note(&malformed_task)
+        .await
+        .expect("malformed task seed");
+
+    let session = |workspace_id: &WorkspaceId, id: &str| AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: AgentId::from(id),
+        workspace_id: workspace_id.clone(),
+        parent_agent_id: None,
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Agent".to_string(),
+        name_explicitly_set: true,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Idle,
+        is_active: false,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+        retired_at: None,
+    };
+    store
+        .insert_agent_session(&session(&healthy, "agent-healthy-projection"))
+        .await
+        .expect("healthy session");
+    let malformed_agent = "agent-malformed-projection";
+    store
+        .insert_agent_session(&session(&bad_session, malformed_agent))
+        .await
+        .expect("malformed session seed");
+
+    sqlx::query("UPDATE note SET task_json = ? WHERE workspace_id = ? AND id = 'task-malformed'")
+        .bind(vec![0xff_u8])
+        .bind(bad_task.as_str())
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt task projection");
+    sqlx::query("UPDATE agent_session SET harness_features = '{bad' WHERE id = ?")
+        .bind(malformed_agent)
+        .execute(store.write_pool())
+        .await
+        .expect("corrupt session projection");
+
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let mut gets = std::collections::HashMap::new();
+    for workspace_id in [healthy.clone(), bad_task.clone(), bad_session.clone()] {
+        let row = svc
+            .get_workspace(workspace_id.clone())
+            .await
+            .expect("workspace.get");
+        gets.insert(workspace_id, row);
+    }
+    let list = svc.list_workspaces(false).await.expect("workspace.list");
+    let lite = svc
+        .list_workspaces_lite(false)
+        .await
+        .expect("workspace.subscribe snapshot");
+
+    for workspace_id in [&healthy, &bad_task, &bad_session] {
+        let get = gets.get(workspace_id).expect("get row");
+        let listed = list.iter().find(|row| &row.id == workspace_id).unwrap();
+        let snapshot = lite.iter().find(|row| &row.id == workspace_id).unwrap();
+        assert_eq!(
+            listed.task_stats, get.task_stats,
+            "list taskStats: {workspace_id}"
+        );
+        assert_eq!(
+            listed.display_status, get.display_status,
+            "list displayStatus: {workspace_id}"
+        );
+        assert_eq!(
+            snapshot.task_stats, get.task_stats,
+            "lite taskStats: {workspace_id}"
+        );
+        assert_eq!(
+            snapshot.display_status, get.display_status,
+            "lite displayStatus: {workspace_id}"
+        );
+    }
+    assert_eq!(gets[&healthy].task_stats.as_ref().unwrap().completed, 1);
+    assert_eq!(
+        list.iter()
+            .find(|row| row.id == healthy)
+            .unwrap()
+            .agent_summary
+            .as_ref()
+            .unwrap()
+            .count,
+        1
+    );
+    assert!(gets[&bad_task].task_stats.is_none());
+    assert!(gets[&bad_session].agent_summary.is_none());
+    assert!(list
+        .iter()
+        .find(|row| row.id == bad_session)
+        .unwrap()
+        .agent_summary
+        .is_none());
+}
+
 /// The lite list path (workspace.subscribe seq-0 snapshot) is self-sufficient
 /// for client status rendering: rows carry `taskStats` (cheap counting query),
 /// `displayStatus` (same derivation as the enriched path — a subsequent
-/// enriched `workspace.get` must agree for the same data), and `cowSupported`,
+/// enriched `workspace.get` must agree for the same data), and a budgeted
+/// `cowSupported` probe result,
 /// while continuing to omit `agentSummary`/`diffSummary`. The lite read also
 /// seeds the `last_display_statuses` baseline (a seed never emits).
 #[tokio::test]
@@ -964,7 +1126,20 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
         store.insert_note(&tn).await.expect("task note");
     }
 
-    let list = svc.list_workspaces_lite(true).await.expect("lite list");
+    // A cold read awaits the single budgeted probe once for the whole snapshot,
+    // then fans the capability out to every row.
+    let list = svc
+        .list_workspaces_lite(true)
+        .await
+        .expect("cold lite list");
+    assert!(
+        list.iter()
+            .find(|row| row.id == ws)
+            .unwrap()
+            .cow_supported
+            .is_some(),
+        "cold snapshot carries cowSupported when the probe completes within budget"
+    );
     let row = list.iter().find(|w| w.id == ws).expect("row in lite list");
     let stats = row.task_stats.as_ref().expect("taskStats populated");
     assert_eq!((stats.total, stats.completed, stats.in_progress), (3, 1, 1));
@@ -990,6 +1165,51 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
     // The lite read seeded the displayStatus baseline map.
     let seeded = svc.last_display_statuses.contains(&ws);
     assert!(seeded, "lite list must seed the displayStatus baseline");
+}
+
+/// The bulk list projection is byte-for-byte identical to the former
+/// per-workspace enrichment path, including row order and omitted optionals.
+#[tokio::test]
+async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
+    let db = test_tempdir("intentd-bulk-list-shape-");
+    let store = Store::open(&db.path().join("shape.db")).await.unwrap();
+    let active_id = WorkspaceId::from("ws-shape-active");
+    let archived_id = WorkspaceId::from("ws-shape-archived");
+    let mut active = workspace(&active_id);
+    active.created_at = "2026-01-01T00:00:00Z".to_string();
+    active.updated_at = active.created_at.clone();
+    let mut archived = workspace(&archived_id);
+    archived.created_at = "2026-01-02T00:00:00Z".to_string();
+    archived.updated_at = archived.created_at.clone();
+    archived.archived = true;
+    archived.archived_at = Some("2026-01-03T00:00:00Z".to_string());
+    store.insert_workspace(&active).await.unwrap();
+    store.insert_workspace(&archived).await.unwrap();
+
+    let root = WorkspacesRoot::new();
+    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let unread = store
+        .workspaces_with_unread_top_level_sessions()
+        .await
+        .unwrap();
+    let mut expected = store.list_workspaces(true).await.unwrap();
+    for row in &mut expected {
+        row.activity = svc.workspace_activity(&row.id);
+        row.pending_delete_at = svc.pending_workspace_deletes.deadline(row.id.as_str());
+        svc.enrich_workspace_aggregates_with_unread(row, Some(unread.contains(row.id.as_str())))
+            .await;
+        row.token_usage = None;
+        if row.archived {
+            row.agent_summary = None;
+        }
+    }
+
+    let actual = svc.list_workspaces(true).await.unwrap();
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap(),
+        "bulk enrichment changed serialized workspace.list bytes"
+    );
 }
 
 /// Both list emit paths (`workspace.list` and the lite path behind
@@ -1587,8 +1807,9 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
     }
 }
 
-/// `crossWorkspace.listSiblings` returns only same-`repositoryPath` peers
-/// (self filtered out, other-repo filtered out) with the `PascalCase` status.
+/// `crossWorkspace.listSiblings` returns only same-repository peers — here
+/// matched by `repositoryPath` (self filtered out, other-repo filtered out)
+/// — with the `PascalCase` status.
 #[tokio::test]
 async fn cross_workspace_list_siblings_scopes_to_repository() {
     let tmp = TempDb::new();
@@ -1636,23 +1857,246 @@ async fn cross_workspace_list_siblings_scopes_to_repository() {
     assert!(arr[0]["createdAt"].is_string());
 }
 
-/// A caller with no `repositoryPath` cannot list siblings (mirrors the TS
-/// "not associated with a repository" error).
+/// Workspaces sharing a GitHub owner/name are siblings regardless of their
+/// local `repositoryPath` (self-contained checkouts and direct clones give
+/// each workspace a distinct source path). Owner/name match case-insensitively
+/// and tolerate a `.git` suffix on the name (in any case, so `INTENT.GIT`
+/// matches `intent`); a different GitHub repo at a different path is not a
+/// sibling.
+#[tokio::test]
+async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk = |id: &WorkspaceId, repo: Option<&str>, owner: Option<&str>, name: Option<&str>| {
+        let mut w = workspace(id);
+        w.title = id.to_string();
+        w.repository_path = repo.map(str::to_string);
+        w.repository_owner = owner.map(str::to_string);
+        w.repository_name = name.map(str::to_string);
+        w
+    };
+
+    let caller = WorkspaceId::from("ws-caller");
+    let other_path = WorkspaceId::from("ws-other-path");
+    let case_only = WorkspaceId::from("ws-case-only");
+    let git_suffix = WorkspaceId::from("ws-git-suffix");
+    let upper_git_suffix = WorkspaceId::from("ws-upper-git-suffix");
+    let other_repo = WorkspaceId::from("ws-other-repo");
+    let same_owner_other_name = WorkspaceId::from("ws-same-owner");
+    for w in [
+        mk(
+            &caller,
+            Some("/root/ws-caller/intent"),
+            Some("intent-hq"),
+            Some("intent"),
+        ),
+        mk(
+            &other_path,
+            Some("/root/ws-other-path/intent"),
+            Some("intent-hq"),
+            Some("intent"),
+        ),
+        mk(
+            &case_only,
+            Some("/clones/Intent"),
+            Some("Intent-HQ"),
+            Some("INTENT"),
+        ),
+        mk(
+            &git_suffix,
+            Some("/clones/intent.git"),
+            Some("intent-hq"),
+            Some("intent.git"),
+        ),
+        mk(
+            &upper_git_suffix,
+            Some("/clones/INTENT.GIT"),
+            Some("INTENT-HQ"),
+            Some("INTENT.GIT"),
+        ),
+        mk(
+            &other_repo,
+            Some("/root/ws-other-repo/intentd"),
+            Some("intent-hq"),
+            Some("intentd"),
+        ),
+        mk(
+            &same_owner_other_name,
+            Some("/root/ws-same-owner/other"),
+            Some("someone-else"),
+            Some("intent"),
+        ),
+    ] {
+        store.insert_workspace(&w).await.unwrap();
+    }
+
+    let svc = Services::new(store);
+    let v = svc
+        .cross_workspace_list_siblings(caller.clone())
+        .await
+        .expect("siblings");
+    let mut ids: Vec<String> = v
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "ws-case-only",
+            "ws-git-suffix",
+            "ws-other-path",
+            "ws-upper-git-suffix"
+        ]
+    );
+
+    // The access gate uses the same predicate as the listing.
+    svc.cross_workspace_list_notes(caller.clone(), other_path)
+        .await
+        .expect("same identity, different path is readable");
+    svc.cross_workspace_list_notes(caller.clone(), case_only)
+        .await
+        .expect("case-only difference is readable");
+    svc.cross_workspace_list_notes(caller.clone(), upper_git_suffix)
+        .await
+        .expect("upper-case .GIT suffix is stripped after lowercasing");
+    for denied in [other_repo, same_owner_other_name] {
+        let err = svc
+            .cross_workspace_list_notes(caller.clone(), denied)
+            .await
+            .expect_err("denied");
+        match err {
+            Error::Internal(m) => assert!(m.contains("Access denied"), "{m}"),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+}
+
+/// Rows without a GitHub identity (local-only repos, or rows the
+/// owner/name backfill has not reached yet) still resolve siblings by an
+/// identical `repositoryPath` — even when only one side carries owner/name.
+#[tokio::test]
+async fn cross_workspace_list_siblings_falls_back_to_repository_path() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+
+    let mk = |id: &WorkspaceId, repo: Option<&str>, owner: Option<&str>, name: Option<&str>| {
+        let mut w = workspace(id);
+        w.repository_path = repo.map(str::to_string);
+        w.repository_owner = owner.map(str::to_string);
+        w.repository_name = name.map(str::to_string);
+        w
+    };
+
+    // Caller has an identity; the sibling at the same path has none yet.
+    let caller = WorkspaceId::from("ws-caller");
+    let unbackfilled = WorkspaceId::from("ws-unbackfilled");
+    // Local-only pair: neither side has an identity, same path.
+    let local_a = WorkspaceId::from("ws-local-a");
+    let local_b = WorkspaceId::from("ws-local-b");
+    // Same path but only the owner (no name) — identity incomplete, path wins.
+    let partial = WorkspaceId::from("ws-partial");
+    // Different path, no identity: never a sibling of the caller.
+    let unrelated = WorkspaceId::from("ws-unrelated");
+    for w in [
+        mk(&caller, Some("/repo/a"), Some("intent-hq"), Some("intent")),
+        mk(&unbackfilled, Some("/repo/a"), None, None),
+        mk(&local_a, Some("/repo/local"), None, None),
+        mk(&local_b, Some("/repo/local"), None, None),
+        mk(&partial, Some("/repo/a"), Some("intent-hq"), None),
+        mk(&unrelated, Some("/repo/z"), None, None),
+    ] {
+        store.insert_workspace(&w).await.unwrap();
+    }
+
+    let svc = Services::new(store);
+
+    let list_ids = |v: serde_json::Value| {
+        let mut ids: Vec<String> = v
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    let v = svc
+        .cross_workspace_list_siblings(caller.clone())
+        .await
+        .expect("siblings");
+    assert_eq!(list_ids(v), vec!["ws-partial", "ws-unbackfilled"]);
+    svc.cross_workspace_list_notes(caller.clone(), unbackfilled.clone())
+        .await
+        .expect("path fallback grants access");
+
+    // The relation is symmetric: the un-backfilled row sees the caller too.
+    let v = svc
+        .cross_workspace_list_siblings(unbackfilled)
+        .await
+        .expect("siblings");
+    assert_eq!(list_ids(v), vec!["ws-caller", "ws-partial"]);
+
+    let v = svc
+        .cross_workspace_list_siblings(local_a.clone())
+        .await
+        .expect("siblings");
+    assert_eq!(list_ids(v), vec!["ws-local-b"]);
+    svc.cross_workspace_list_notes(local_a.clone(), local_b)
+        .await
+        .expect("local-only pair is readable");
+    let err = svc
+        .cross_workspace_list_notes(local_a, unrelated)
+        .await
+        .expect_err("denied");
+    match err {
+        Error::Internal(m) => assert!(m.contains("Access denied"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+}
+
+/// A caller with neither a GitHub identity nor a `repositoryPath` cannot list
+/// siblings or read notes (mirrors the TS "not associated with a repository"
+/// error). An identity alone (no path) is sufficient.
 #[tokio::test]
 async fn cross_workspace_list_siblings_requires_repository() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let caller = WorkspaceId::from("ws-norepo");
     store.insert_workspace(&workspace(&caller)).await.unwrap();
+    let identity_only = WorkspaceId::from("ws-identity-only");
+    let mut w = workspace(&identity_only);
+    w.repository_owner = Some("intent-hq".to_string());
+    w.repository_name = Some("intent".to_string());
+    store.insert_workspace(&w).await.unwrap();
     let svc = Services::new(store);
     let err = svc
-        .cross_workspace_list_siblings(caller)
+        .cross_workspace_list_siblings(caller.clone())
         .await
         .expect_err("should error");
     match err {
         Error::Internal(m) => assert!(m.contains("not associated with a repository"), "{m}"),
         other => panic!("expected Internal, got {other:?}"),
     }
+    // The access gate applies the same precondition before checking the target.
+    let err = svc
+        .cross_workspace_list_notes(caller, identity_only.clone())
+        .await
+        .expect_err("should error");
+    match err {
+        Error::Internal(m) => assert!(m.contains("not associated with a repository"), "{m}"),
+        other => panic!("expected Internal, got {other:?}"),
+    }
+    // A GitHub identity without a local path is enough to list.
+    let v = svc
+        .cross_workspace_list_siblings(identity_only)
+        .await
+        .expect("identity-only caller lists");
+    assert!(v.as_array().expect("array").is_empty());
 }
 
 /// Cross-repo `readNote`/`listNotes` are access-denied; a same-repo sibling
@@ -1804,70 +2248,1177 @@ async fn set_content_reduction_guard_requires_confirmation() {
     assert_eq!(ok.new_content, "x");
 }
 
-/// A5 (CRDT note-merge, PROTOCOL §5.2): two `note.setContent` calls whose new
-/// content each observes the other's write survive in the merged result. The
-/// second write's `oldContent` still points at the persisted state before it
-/// ran, but the CRDT diff against the yrs doc's *current* text preserves the
-/// first write's characters — the FE parity signal that the daemon no longer
-/// last-write-wins on concurrent full-content writes.
-#[tokio::test]
-async fn set_content_merges_concurrent_writes() {
-    let (_tmp, svc, ws, id) = setup("BODY").await;
-
-    // Author A appends a line at the end.
-    let a = svc
-        .set_note_content(
-            ws.clone(),
-            id.clone(),
-            "BODY\nA-line".into(),
-            true,
-            None,
-            None,
-        )
+/// [`setup`] plus a `note_version` snapshot at rev 0, so `expectedVersion: 0`
+/// resolves to a recoverable base for the three-way merge.
+async fn setup_versioned(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
+    let (tmp, svc, ws, id) = setup(content).await;
+    let note = svc.store.get_note(&ws, &id).await.expect("get note");
+    svc.store
+        .append_note_version(&note, &crate::system_version_author(), &note.updated_at, 0)
         .await
-        .expect("A write");
-    assert_eq!(a.new_content, "BODY\nA-line");
+        .expect("seed base snapshot");
+    (tmp, svc, ws, id)
+}
 
-    // Author B prepends a line, having read the post-A content as baseline —
-    // the yrs merge stitches both edits together.
+/// Stale `expectedVersion` (AC 1, 2): the writer's intent (`beta` → `beta-A`
+/// against base rev 0) is merged onto the current text (rev 1, which appended
+/// `delta`), the write succeeds, and `rev` bumps to `current + 1` both in the
+/// result and in the store.
+#[tokio::test]
+async fn set_content_stale_expected_version_merges_and_bumps_rev() {
+    let (_tmp, svc, ws, id) = setup_versioned("alpha\nbeta\ngamma").await;
+
     let b = svc
         .set_note_content(
             ws.clone(),
             id.clone(),
-            "B-line\nBODY\nA-line".into(),
-            true,
+            "alpha\nbeta\ngamma\ndelta".into(),
+            false,
             None,
             None,
         )
         .await
         .expect("B write");
-    assert_eq!(b.new_content, "B-line\nBODY\nA-line");
+    assert_eq!(b.rev, 1);
 
-    // A surgical mutation invalidates the CRDT session so the next
-    // `setContent` reseeds from the fresh persisted content.
-    svc.edit_note(
-        ws.clone(),
-        id.clone(),
-        NoteEditInput {
-            old: "A-line".into(),
-            new: "A-line (edited)".into(),
-        },
-        None,
-    )
-    .await
-    .expect("edit");
-    let c = svc
+    let a = svc
         .set_note_content(
-            ws,
-            id,
-            "B-line\nBODY\nA-line (edited)\nC-line".into(),
-            true,
-            None,
+            ws.clone(),
+            id.clone(),
+            "alpha\nbeta-A\ngamma".into(),
+            false,
+            Some(0),
             None,
         )
         .await
-        .expect("C write");
-    assert_eq!(c.new_content, "B-line\nBODY\nA-line (edited)\nC-line");
+        .expect("stale expectedVersion merges instead of conflicting");
+    assert_eq!(a.new_content, "alpha\nbeta-A\ngamma\ndelta");
+    assert_eq!(a.old_content.as_deref(), Some("alpha\nbeta\ngamma\ndelta"));
+    assert_eq!(a.rev, 2);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(stored.content, "alpha\nbeta-A\ngamma\ndelta");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.setContent merged").await;
+}
+
+/// Same-span conflict (AC 3): both writers replaced the same base word; the
+/// result keeps the current variant immediately followed by the incoming one
+/// (`WaWb`), dropping nothing.
+#[tokio::test]
+async fn set_content_same_word_conflict_keeps_both_variants() {
+    let (_tmp, svc, ws, id) = setup_versioned("one cat three").await;
+
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "one dog three".into(),
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("current write");
+
+    let merged = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "one fox three".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("conflicting spans merge, not -32005");
+    assert_eq!(merged.new_content, "one dogfox three");
+    assert_eq!(merged.rev, 2);
+}
+
+/// Reduction guard measured against the writer's base (AC 4): after a
+/// concurrent writer tripled the note, a 10 % removal relative to the base is
+/// tiny against base (accepted) even though it is ~70 % shorter than current;
+/// a 60 % removal relative to the base is still rejected with the existing
+/// message unless confirmed.
+#[tokio::test]
+async fn set_content_reduction_guard_measures_against_base() {
+    let lines: Vec<String> = (0..10).map(|i| format!("line-{i}-0123456789")).collect();
+    let base = lines.join("\n");
+    let (_tmp, svc, ws, id) = setup_versioned(&base).await;
+
+    let extra: Vec<String> = (10..30).map(|i| format!("line-{i}-0123456789")).collect();
+    let tripled = format!("{base}\n{}", extra.join("\n"));
+    svc.set_note_content(ws.clone(), id.clone(), tripled, false, None, None)
+        .await
+        .expect("tripling write");
+
+    let minus_ten_pct = lines[1..].join("\n");
+    let ok = svc
+        .set_note_content(ws.clone(), id.clone(), minus_ten_pct, false, Some(0), None)
+        .await
+        .expect("10% removal against base passes the guard");
+    assert!(!ok.new_content.contains("line-0-"), "removed line is gone");
+    assert!(
+        ok.new_content.contains("line-29-"),
+        "concurrent writer's tail survives the merge"
+    );
+    assert_eq!(ok.rev, 2);
+
+    let minus_sixty_pct = lines[6..].join("\n");
+    let denied = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            minus_sixty_pct,
+            false,
+            Some(0),
+            None,
+        )
+        .await;
+    match denied {
+        Err(Error::Internal(msg)) => assert!(
+            msg.starts_with("⚠️ CONTENT REDUCTION DETECTED"),
+            "existing guard message expected, got: {msg}"
+        ),
+        other => panic!("expected the reduction guard, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 2, "a rejected write persists nothing");
+}
+
+/// No recoverable base (AC 5): a note whose `expectedVersion` predates every
+/// retained snapshot degrades to honest last-writer-wins — the incoming text
+/// lands verbatim and `rev` still bumps by one.
+#[tokio::test]
+async fn set_content_stale_expected_version_without_base_is_lww() {
+    // `setup` inserts the row directly: no snapshot exists at rev 0.
+    let (_tmp, svc, ws, id) = setup("v0 body").await;
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "v1 body (other writer)".into(),
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("other writer");
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, 0)
+            .await
+            .expect("lookup"),
+        None,
+        "precondition: no snapshot at or below rev 0"
+    );
+
+    let r = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "v2 body (stale writer)".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("no base → LWW, not -32005");
+    assert_eq!(r.new_content, "v2 body (stale writer)");
+    assert_eq!(r.rev, 2);
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "v2 body (stale writer)");
+    assert_eq!(stored.rev, 2);
+}
+
+/// Only a rev the writer could have read merges: an `expectedVersion` ABOVE
+/// the stored rev was never served by this note, so it is the plain
+/// optimistic-concurrency mismatch (`Conflict`, `-32005` carrying the current
+/// row) — not a stale base that resolves to the newest snapshot and lets the
+/// incoming text land as an exact write.
+#[tokio::test]
+async fn set_content_future_expected_version_conflicts_without_writing() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
+        .await
+        .expect("bump to rev 1");
+
+    let r = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "impossible base".into(),
+            false,
+            Some(7),
+            None,
+        )
+        .await;
+    match r {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], serde_json::json!(1));
+            assert_eq!(current["content"], serde_json::json!("body v1"));
+        }
+        other => panic!("future expectedVersion must be Conflict, got {other:?}"),
+    }
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "body v1", "nothing persisted");
+    assert_eq!(stored.rev, 1, "rev unchanged");
+    assert_eq!(
+        svc.store
+            .list_note_versions(&ws, &id)
+            .await
+            .expect("versions")
+            .len(),
+        2,
+        "no extra snapshot appended"
+    );
+}
+
+/// The read-merge-persist loop is bounded: when every attempt's gated UPDATE
+/// misses (a `RAISE(IGNORE)` trigger makes the note row unconditionally
+/// unmatchable, counting each attempt), `note.setContent` stops after exactly
+/// [`crate::SET_CONTENT_MAX_ATTEMPTS`] misses and surfaces the last
+/// `Conflict` — same shape as the future-rev case — with no content write
+/// and no snapshot appended. Once the trigger is gone the same write lands,
+/// so exhaustion leaves the write pool usable.
+#[tokio::test]
+async fn set_content_retry_exhaustion_conflicts_without_writing() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    sqlx::raw_sql(
+        "CREATE TABLE cas_misses(n INTEGER);
+         INSERT INTO cas_misses VALUES (0);
+         CREATE TRIGGER force_cas_miss BEFORE UPDATE ON note BEGIN
+             UPDATE cas_misses SET n = n + 1;
+             SELECT RAISE(IGNORE);
+         END;",
+    )
+    .execute(svc.store.write_pool())
+    .await
+    .expect("arm trigger");
+
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        svc.set_note_content(
+            ws.clone(),
+            id.clone(),
+            "body attempted".into(),
+            false,
+            Some(0),
+            None,
+        ),
+    )
+    .await
+    .expect("bounded loop terminates");
+    match r {
+        Err(Error::Conflict { current }) => {
+            assert_eq!(current["rev"], serde_json::json!(0));
+            assert_eq!(current["content"], serde_json::json!("body"));
+        }
+        other => panic!("exhausted retries must be Conflict, got {other:?}"),
+    }
+    let misses: i64 = sqlx::query_scalar("SELECT n FROM cas_misses")
+        .fetch_one(svc.store.read_pool())
+        .await
+        .expect("count misses");
+    assert_eq!(
+        usize::try_from(misses).expect("non-negative miss count"),
+        crate::SET_CONTENT_MAX_ATTEMPTS,
+        "exactly one gated UPDATE per attempt"
+    );
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!((stored.content.as_str(), stored.rev), ("body", 0));
+    assert_eq!(
+        svc.store
+            .list_note_versions(&ws, &id)
+            .await
+            .expect("versions")
+            .len(),
+        1,
+        "no snapshot appended by a missed attempt"
+    );
+
+    sqlx::query("DROP TRIGGER force_cas_miss")
+        .execute(svc.store.write_pool())
+        .await
+        .expect("disarm trigger");
+    let ok = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "body accepted".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("pool usable after exhaustion");
+    assert_eq!((ok.new_content.as_str(), ok.rev), ("body accepted", 1));
+}
+
+/// Legacy history (snapshots from before migration 0121 carry `rev = NULL`)
+/// transitions to recoverable revisions on its own: while no snapshot for the
+/// writer's rev exists, a stale `expectedVersion` is the documented
+/// last-writer-wins replace, and each such write records a snapshot at its
+/// new rev — so the first rev a writer reads *after* the transition merges.
+#[tokio::test]
+async fn set_content_null_history_transitions_to_recoverable_revs() {
+    let (_tmp, svc, ws, id) = setup_versioned("legacy body").await;
+    sqlx::query("UPDATE note_version SET rev = NULL")
+        .execute(svc.store.write_pool())
+        .await
+        .expect("age the history");
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, 0)
+            .await
+            .expect("lookup"),
+        None,
+        "legacy snapshot is not a base"
+    );
+
+    let first = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "legacy body agent".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("lww write");
+    assert_eq!(first.rev, 1);
+    let second = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "legacy body user".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("second lww write");
+    assert_eq!(
+        (second.new_content.as_str(), second.rev),
+        ("legacy body user", 2),
+        "rev 0 still has no base: replace, not merge"
+    );
+
+    // Rev 1 was snapshotted by the first write, so a writer based on it merges.
+    let merged = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "legacy body agent again".into(),
+            false,
+            Some(1),
+            None,
+        )
+        .await
+        .expect("merge onto recoverable base");
+    assert_eq!(merged.rev, 3);
+    assert!(
+        merged.new_content.contains("user") && merged.new_content.contains("again"),
+        "both intents survive: {:?}",
+        merged.new_content
+    );
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "legacy transition").await;
+}
+
+/// Conflict stays where it belongs (AC 6): the non-merging conditional writes
+/// — `note.update` (metadata arm), `note.updateMetadata`, `note.delete` —
+/// still surface a stale `expectedVersion` as `Conflict` (`-32005`).
+#[tokio::test]
+async fn set_content_merge_leaves_other_conditional_writes_conflicting() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
+        .await
+        .expect("bump to rev 1");
+
+    let metadata_arm = svc
+        .update_note(
+            ws.clone(),
+            id.clone(),
+            NoteUpdateInput {
+                title: Some("stale title".into()),
+                expected_version: Some(0),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(metadata_arm, Err(Error::Conflict { .. })),
+        "note.update metadata arm: {metadata_arm:?}"
+    );
+
+    let update_metadata = svc
+        .update_note_metadata(
+            ws.clone(),
+            id.clone(),
+            Some("stale title".into()),
+            None,
+            Some(0),
+            None,
+        )
+        .await;
+    assert!(
+        matches!(update_metadata, Err(Error::Conflict { .. })),
+        "note.updateMetadata: {update_metadata:?}"
+    );
+
+    let delete = svc.delete_note(ws.clone(), id.clone(), Some(0)).await;
+    assert!(
+        matches!(delete, Err(Error::Conflict { .. })),
+        "note.delete: {delete:?}"
+    );
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("still present");
+    assert_eq!(stored.rev, 1);
+    assert_eq!(stored.title, "Title");
+}
+
+/// Drive `fut` one poll at a time until `stop` observes the condition it
+/// waits for or `max_polls` is exhausted; `fut` must still be pending at every
+/// step (the point is to inspect the store mid-flight). Returns whether `stop`
+/// fired.
+async fn poll_until<F, S, Fut>(
+    fut: &mut std::pin::Pin<Box<F>>,
+    max_polls: usize,
+    mut stop: S,
+) -> bool
+where
+    F: std::future::Future + ?Sized,
+    S: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    use std::future::poll_fn;
+    use std::task::Poll;
+    for _ in 0..max_polls {
+        let state = poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
+        assert!(state.is_pending(), "write finished before the pause point");
+        if stop().await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Regression (intentd#1817 review, finding 1): the content UPDATE and its
+/// `note_version` snapshot commit in ONE transaction, so the instant a reader
+/// observes the new rev on the note row, the base lookup by that rev already
+/// yields the new content. Before the fix the snapshot was appended in a
+/// second transaction: a writer that read rev 1 mid-gap recovered the rev-0
+/// text as its base and replayed the already-persisted insertion (observed
+/// `aXX!bcY`), and the delayed snapshot then landed with `rev = 1` after the
+/// rev-2/rev-3 rows, out of order.
+///
+/// The write is driven one poll at a time and the store (via a second
+/// connection) is sampled between polls; the invariant is asserted on every
+/// sample that shows rev 1 and once more after the write completes, so the
+/// test never depends on catching a particular window under load.
+#[tokio::test]
+async fn content_write_snapshot_is_visible_with_its_rev() {
+    let (tmp, svc, ws, id) = setup_versioned("abc").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let assert_rev1_has_snapshot = || async {
+        let current = other.get_note(&ws, &id).await.expect("get note");
+        if current.rev != 1 {
+            return false;
+        }
+        assert_eq!(current.content, "aXbc");
+        assert_eq!(
+            other
+                .get_note_version_content_by_rev(&ws, &id, 1)
+                .await
+                .expect("lookup"),
+            Some("aXbc".to_string()),
+            "rev 1 is visible, so its snapshot must be too"
+        );
+        true
+    };
+
+    let mut first =
+        Box::pin(svc.set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None));
+    let mut samples_at_rev1 = 0;
+    let first = loop {
+        use std::future::Future;
+        let state =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx))).await;
+        if let std::task::Poll::Ready(done) = state {
+            break done.expect("first write");
+        }
+        if assert_rev1_has_snapshot().await {
+            samples_at_rev1 += 1;
+            if samples_at_rev1 >= 50 {
+                break first.await.expect("first write");
+            }
+        }
+    };
+    assert_eq!(first.rev, 1);
+    assert!(assert_rev1_has_snapshot().await);
+
+    // A second writer that read rev 1 after the first write committed.
+    let next = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aXbcY".into(), false, Some(1), None)
+        .await
+        .expect("exact write at rev 1");
+    assert_eq!(next.rev, 2);
+    // A stale writer against rev 1: base is `aXbc`, so its `!` insertion
+    // lands once, on top of `Y`.
+    let merged = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aX!bc".into(), false, Some(1), None)
+        .await
+        .expect("stale write merges");
+    assert_eq!(merged.rev, 3);
+    assert_eq!(merged.new_content, "aX!bcY");
+
+    // History stays in rev order: the newest snapshot is the rev-3 write,
+    // not a late rev-1 row.
+    assert_eq!(newest_version_rev(&svc.store, &ws, &id).await, Some(3));
+    let stored = svc.store.get_note(&ws, &id).await.expect("get note");
+    assert_eq!((stored.rev, stored.content.as_str()), (3, "aX!bcY"));
+}
+
+/// Race a surgical write against a user `note.setContent` that completes
+/// while the surgical write is parked on the write pool: the surgical op
+/// reads rev 0, the user's save lands at rev 1 (via a second `Store` on the
+/// same file), then the surgical write proceeds. Returns the op's result and
+/// the final stored note (rev 2, snapshotted).
+async fn surgical_write_races_user_save<T>(
+    base: &str,
+    user: &str,
+    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, intent_core::Result<T>>,
+) -> (T, Note) {
+    let (tmp, svc, ws, id) = setup_versioned(base).await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    // The sole write-pool connection: the surgical write blocks on acquire.
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = op(&svc, ws.clone(), id.clone());
+    let parked = poll_until(&mut fut, 20, || async {
+        svc.store.get_note(&ws, &id).await.expect("get note");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let saved = other_svc
+        .set_note_content(ws.clone(), id.clone(), user.into(), false, Some(0), None)
+        .await
+        .expect("user save");
+    assert_eq!(saved.rev, 1);
+    drop(held);
+
+    let result = fut.await.expect("surgical write");
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(
+        stored.rev, 2,
+        "surgical write lands on top of the user save"
+    );
+    assert_eq!(
+        other
+            .get_note_version_content_by_rev(&ws, &id, 2)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone()),
+        "surgical write is snapshotted at its rev"
+    );
+    (result, stored)
+}
+
+/// Regression (intentd#1817 review, finding 2): `note.add` that read rev 0
+/// no longer overwrites a user `setContent` that landed at rev 1 — its write
+/// is gated on the rev it read, and the retry three-way-merges the appended
+/// chunk onto the user's text (`TYPED` survives, `AGENT` lands on top).
+#[tokio::test]
+async fn note_add_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.add_to_note(
+                ws,
+                id,
+                NoteAddInput {
+                    content: "AGENT".into(),
+                    heading: None,
+                    position: None,
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, "alpha TYPED\nbeta\ngamma\n\nAGENT");
+    assert_eq!(result.new_content, stored.content);
+    assert_eq!(result.old_content, "alpha TYPED\nbeta\ngamma");
+}
+
+/// Same race for `note.edit`: the replacement merges onto the user's save.
+#[tokio::test]
+async fn note_edit_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.edit_note(
+                ws,
+                id,
+                NoteEditInput {
+                    old: "gamma".into(),
+                    new: "gamma AGENT".into(),
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, "alpha TYPED\nbeta\ngamma AGENT");
+    assert_eq!(result.new_content, stored.content);
+}
+
+/// Same race for `note.editLines`: the line replacement merges onto the
+/// user's save.
+#[tokio::test]
+async fn note_edit_lines_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.edit_note_lines(
+                ws,
+                id,
+                NoteEditLinesInput {
+                    start: 3,
+                    end: 3,
+                    content: "gamma AGENT".into(),
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, "alpha TYPED\nbeta\ngamma AGENT");
+    assert_eq!(result.new_content, stored.content);
+    assert_eq!(result.total_lines_before, 3);
+    assert_eq!(result.total_lines_after, 3);
+}
+
+/// Regression (intentd#1817 re-verification, finding 1): `comment.add`'s
+/// anchor rewrite that read rev 0 no longer overwrites a user `setContent`
+/// that landed at rev 1 — the rewrite is gated on the rev it read, and the
+/// retry re-anchors on the user's text (`TYPED` survives, the markers wrap
+/// `gamma`, the comment row exists and `noteRev` is the rev that landed).
+#[tokio::test]
+async fn comment_add_reanchors_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| {
+            svc.comment_add(
+                ws,
+                id,
+                "gamma".into(),
+                "gamma".into(),
+                "Review".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        },
+    )
+    .await;
+    assert!(result.anchored);
+    assert_eq!(result.note_rev, 2);
+    let markers = format!(
+        "alpha TYPED\nbeta\n<!--anchor:{id}:start-->gamma<!--anchor:{id}:end-->",
+        id = result.comment_id
+    );
+    assert_eq!(stored.content, markers);
+}
+
+/// Same race for `primitive.addCli`: the appended block merges onto the
+/// user's save.
+#[tokio::test]
+async fn primitive_append_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "alpha\nbeta\ngamma",
+        "alpha TYPED\nbeta\ngamma",
+        |svc, ws, id| svc.primitive_add_cli(ws, id, "cargo test".into(), "run".into(), None),
+    )
+    .await;
+    assert!(stored.content.starts_with("alpha TYPED\nbeta\ngamma"));
+    assert!(stored.content.contains("ws-block:cli"));
+    assert!(stored.content.contains("cargo test"));
+    assert_eq!(result["content"], stored.content);
+}
+
+/// Same race for `task.updateStatus` on a plain (unlinked) checkbox line:
+/// the status flip merges onto the user's save.
+#[tokio::test]
+async fn task_update_status_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "- [ ] alpha\nbeta\ngamma",
+        "- [ ] alpha\nbeta TYPED\ngamma",
+        |svc, ws, id| svc.task_update_status(ws, id, "alpha".into(), "done".into(), None),
+    )
+    .await;
+    assert!(result.ok);
+    assert_eq!(stored.content, "- [x] alpha\nbeta TYPED\ngamma");
+}
+
+/// Same race for `task.update` on a plain checkbox line: the line edit
+/// merges onto the user's save.
+#[tokio::test]
+async fn task_update_merges_onto_completed_user_save() {
+    let (result, stored) = surgical_write_races_user_save(
+        "- [ ] alpha\nbeta\ngamma",
+        "- [ ] alpha\nbeta TYPED\ngamma",
+        |svc, ws, id| {
+            svc.task_update(
+                ws,
+                id,
+                1,
+                Some("alpha AGENT".into()),
+                Some("in-progress".into()),
+                None,
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(result.new_text, "alpha AGENT");
+    assert_eq!(stored.content, "- [/] alpha AGENT\nbeta TYPED\ngamma");
+}
+
+/// Same race for `task.convertBlocks` against a plain user edit: the op
+/// reads rev 0 and a store-level versioned save lands at rev 1 in between.
+/// The conversion re-derives from the fresh content (the fence is still
+/// there) and lands at rev 2 with `TYPED` intact and exactly one child.
+#[tokio::test]
+async fn convert_blocks_rederives_onto_completed_user_save() {
+    let base = "intro\n\n@@@task\n# Do it\nbody\n@@@\n";
+    let (tmp, svc, ws, id) = setup_versioned(base).await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = svc.convert_task_blocks(ws.clone(), id.clone(), None);
+    // Yield between polls so the op's reads complete and it parks on the
+    // held write connection, not on an in-flight read.
+    let parked = poll_until(&mut fut, 100, || async {
+        other.get_note(&ws, &id).await.expect("yield read");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let mut user = other.get_note(&ws, &id).await.expect("get note");
+    user.content = "intro TYPED\n\n@@@task\n# Do it\nbody\n@@@\n".into();
+    user.updated_at = now_iso();
+    let (rev, _) = other
+        .update_note_with_version(
+            &user,
+            Some(0),
+            &crate::user_version_author(),
+            &user.updated_at,
+        )
+        .await
+        .expect("user save");
+    assert_eq!(rev, 1);
+    drop(held);
+
+    let result = fut.await.expect("convert blocks");
+    assert_eq!(result.converted_count, 1);
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(stored.rev, 2);
+    assert_eq!(
+        stored.content,
+        format!(
+            "intro TYPED\n\n- [ ] [Do it](intent://local/task/{})\n",
+            result.created_note_ids[0]
+        )
+    );
+    assert_eq!(
+        other
+            .get_note_version_content_by_rev(&ws, &id, 2)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone())
+    );
+    let children: Vec<Note> = other
+        .list_notes(&ws)
+        .await
+        .expect("list notes")
+        .into_iter()
+        .filter(|n| n.parent_id.as_ref() == Some(&id))
+        .collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].id.0, result.created_note_ids[0]);
+}
+
+/// Regression (intentd#1817 re-verification, round 4): `task.convertBlocks`
+/// racing a real `note.setContent` that carries the same `@@@task` fence.
+/// The converter is parked after its rev-0 read; the user save lands
+/// (`TYPED`) and auto-converts the fence once (child #1, link at rev 2).
+/// Before the fix the parked converter then created a SECOND child and
+/// three-way-merged its own link onto the user's: two children, and the two
+/// generated UUIDs char-interleaved into one corrupt link. Now the
+/// converter's gated write misses, it re-derives from the fresh content —
+/// no fence remains, nothing to convert — and no child is ever persisted for
+/// the failed attempt: one child, the parent text clean, `TYPED` intact, and
+/// the newest snapshot matches the row.
+#[tokio::test]
+async fn convert_blocks_racing_real_user_save_converts_once() {
+    let base = "intro\n\n@@@task\n# Do it\nbody\n@@@\n";
+    let (tmp, svc, ws, id) = setup_versioned(base).await;
+    let other = Services::new(Store::open(&tmp.path).await.expect("open second store"));
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = svc.convert_task_blocks(ws.clone(), id.clone(), None);
+    let parked = poll_until(&mut fut, 100, || async {
+        other.store.get_note(&ws, &id).await.expect("yield read");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let user = other
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "intro TYPED\n\n@@@task\n# Do it\nbody\n@@@\n".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("user save");
+    assert_eq!(user.converted_count, 1);
+    drop(held);
+
+    let result = fut.await.expect("convert blocks");
+
+    let stored = other.store.get_note(&ws, &id).await.expect("final note");
+    let children: Vec<Note> = other
+        .store
+        .list_notes(&ws)
+        .await
+        .expect("list notes")
+        .into_iter()
+        .filter(|n| n.parent_id.as_ref() == Some(&id))
+        .collect();
+    assert_eq!(
+        children.len(),
+        1,
+        "one task block must not create duplicate tasks (parent: {:?})",
+        stored.content
+    );
+    assert_eq!(children[0].id.0, user.created_task_note_ids[0]);
+    assert_eq!(
+        stored.content,
+        format!(
+            "intro TYPED\n\n- [ ] [Do it](intent://local/task/{})\n",
+            children[0].id.0
+        )
+    );
+    assert_eq!(stored.rev, 2);
+    assert_eq!(result.converted_count, 0);
+    assert!(result.created_note_ids.is_empty());
+    assert_eq!(
+        other
+            .store
+            .get_note_version_content_by_rev(&ws, &id, stored.rev)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone())
+    );
+}
+
+/// Regression (intentd#1817 re-verification, finding 2): a note insert and
+/// its initial snapshot commit in ONE transaction, so the instant a fresh
+/// note is readable its rev 0 is a recoverable merge base. Before the fix
+/// the snapshot was appended in a second transaction: two `setContent(…,
+/// expectedVersion: 0)` writes issued against the note mid-gap found no base
+/// and degraded to last-writer-wins (`aXbc`@1, then `abcY`@2 dropped `X`),
+/// and the delayed rev-0 snapshot then landed after the rev-1/rev-2 rows.
+///
+/// `note.create` is driven one poll at a time and the store sampled (via a
+/// second connection) between polls; the invariant is asserted on the first
+/// sample that sees the note, the two writes are issued right there while
+/// creation is still in flight, and the outcome is asserted once more after
+/// it completes.
+#[tokio::test]
+async fn note_create_snapshot_is_visible_with_the_row() {
+    let (tmp, svc, ws, _seed) = setup("seed").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let mut create = svc.create_note(
+        ws.clone(),
+        NoteCreate {
+            title: "Fresh".into(),
+            content: Some("abc".into()),
+            tags: None,
+            parent_id: None,
+        },
+        None,
+        None,
+    );
+    let find_fresh = || async {
+        other
+            .list_notes(&ws)
+            .await
+            .expect("list notes")
+            .into_iter()
+            .find(|n| n.title == "Fresh")
+    };
+    let write_both = |fresh_id: NoteId| {
+        let other_svc = &other_svc;
+        let ws = &ws;
+        async move {
+            let a = other_svc
+                .set_note_content(
+                    ws.clone(),
+                    fresh_id.clone(),
+                    "aXbc".into(),
+                    false,
+                    Some(0),
+                    None,
+                )
+                .await
+                .expect("exact write at rev 0");
+            assert_eq!((a.new_content.as_str(), a.rev), ("aXbc", 1));
+            let b = other_svc
+                .set_note_content(ws.clone(), fresh_id, "abcY".into(), false, Some(0), None)
+                .await
+                .expect("stale write merges from the rev-0 base");
+            assert_eq!((b.new_content.as_str(), b.rev), ("aXbcY", 2));
+        }
+    };
+
+    let mut observed_mid_flight = false;
+    let created = loop {
+        let state =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(create.as_mut().poll(cx))).await;
+        if let std::task::Poll::Ready(done) = state {
+            break done.expect("note.create");
+        }
+        if observed_mid_flight {
+            continue;
+        }
+        let Some(fresh) = find_fresh().await else {
+            continue;
+        };
+        assert_eq!((fresh.content.as_str(), fresh.rev), ("abc", 0));
+        assert_eq!(
+            other
+                .get_note_version_content_by_rev(&ws, &fresh.id, 0)
+                .await
+                .expect("lookup"),
+            Some("abc".to_string()),
+            "the fresh row is visible, so its rev-0 snapshot must be too"
+        );
+        write_both(fresh.id).await;
+        observed_mid_flight = true;
+    };
+    if !observed_mid_flight {
+        write_both(created.note.id.clone()).await;
+    }
+
+    let stored = other
+        .get_note(&ws, &created.note.id)
+        .await
+        .expect("final note");
+    assert_eq!((stored.content.as_str(), stored.rev), ("aXbcY", 2));
+    assert_eq!(
+        newest_version_rev(&other, &ws, &created.note.id).await,
+        Some(2),
+        "history stays in rev order: no late rev-0 row after the rev-2 write"
+    );
+}
+
+/// Race a metadata-only write against a user `note.setContent` that completes
+/// while the metadata write is parked on the write pool (same choreography as
+/// [`surgical_write_races_user_save`]): the metadata op reads rev 0 with the
+/// old content, the user's save lands at rev 1, then the metadata write
+/// proceeds without an `expectedVersion` gate. Returns the final stored note.
+async fn metadata_write_races_user_save(
+    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, intent_core::Result<()>>,
+) -> Note {
+    let (tmp, svc, ws, id) = setup_versioned("abc").await;
+    let other = Store::open(&tmp.path).await.expect("open second store");
+    let other_svc = Services::new(other.clone());
+
+    let held = svc
+        .store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write conn");
+    let mut fut = op(&svc, ws.clone(), id.clone());
+    let parked = poll_until(&mut fut, 20, || async {
+        svc.store.get_note(&ws, &id).await.expect("get note");
+        false
+    })
+    .await;
+    assert!(!parked);
+
+    let saved = other_svc
+        .set_note_content(ws.clone(), id.clone(), "aXbc".into(), false, Some(0), None)
+        .await
+        .expect("user save");
+    assert_eq!(saved.rev, 1);
+    drop(held);
+
+    fut.await.expect("metadata write");
+    let stored = other.get_note(&ws, &id).await.expect("final note");
+    assert_eq!(
+        stored.rev, 2,
+        "metadata write lands on top of the user save"
+    );
+    assert_eq!(
+        stored.content, "aXbc",
+        "metadata-only write must not rewrite content it read before the user save"
+    );
+    // No snapshot for the metadata rev: the base lookup by the new rev falls
+    // back to the user's rev-1 snapshot, which is exactly the stored content.
+    assert_eq!(newest_version_rev(&other, &ws, &id).await, Some(1));
+    assert_eq!(
+        other
+            .get_note_version_content_by_rev(&ws, &id, stored.rev)
+            .await
+            .expect("lookup"),
+        Some(stored.content.clone()),
+        "base for the metadata rev is the persisted content"
+    );
+    stored
+}
+
+/// Regression (intentd#1817 re-verification): `note.updateMetadata` that read
+/// rev 0 no longer reverts a user `setContent` that landed at rev 1. Before
+/// the fix the write was a full-row `UPDATE` carrying the stale `abc`, so the
+/// acknowledged insertion vanished and rev 2 resolved to a base (`aXbc`) that
+/// no longer matched the row — a false base for every later merge.
+#[tokio::test]
+async fn note_update_metadata_preserves_completed_user_save() {
+    let stored = metadata_write_races_user_save(|svc, ws, id| {
+        Box::pin(async move {
+            svc.update_note_metadata(ws, id, Some("Renamed".into()), None, None, None)
+                .await
+                .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(stored.title, "Renamed");
+}
+
+/// Same race for the metadata arm of `note.update` (title/tags without
+/// `content`).
+#[tokio::test]
+async fn note_update_metadata_arm_preserves_completed_user_save() {
+    let stored = metadata_write_races_user_save(|svc, ws, id| {
+        Box::pin(async move {
+            svc.update_note(
+                ws,
+                id,
+                NoteUpdateInput {
+                    tags: Some(vec!["t".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(stored.tags, vec!["t".to_string()]);
+}
+
+/// Same race for a task-metadata write (`task.markAsTask`): the `task_json`
+/// column lands, the content does not move.
+#[tokio::test]
+async fn task_metadata_write_preserves_completed_user_save() {
+    use intent_core::TaskStatus;
+    let stored = metadata_write_races_user_save(|svc, ws, id| {
+        Box::pin(async move {
+            svc.mark_as_task(
+                ws,
+                id,
+                "not_started".into(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await;
+    assert_eq!(
+        stored.metadata.task.map(|t| t.status),
+        Some(TaskStatus::NotStarted)
+    );
+}
+
+/// Read-merge-persist loop converges under contention: four writers that all
+/// read rev 0 and insert a distinct line race through `set_note_content`
+/// concurrently; whichever lands first makes the others stale, and each
+/// stale writer re-fetches, re-merges and retries until its versioned write
+/// lands — every line survives and `rev` advances once per writer.
+#[tokio::test]
+async fn set_content_retry_loop_converges_under_concurrent_versioned_writes() {
+    let base = "l1\nl2\nl3\nl4\nl5";
+    let (_tmp, svc, ws, id) = setup_versioned(base).await;
+
+    let mut handles = Vec::new();
+    for i in 1..=4 {
+        let svc = svc.clone();
+        let ws = ws.clone();
+        let id = id.clone();
+        let incoming = base.replace(&format!("l{i}\n"), &format!("l{i}\nw{i}\n"));
+        handles.push(tokio::spawn(async move {
+            svc.set_note_content(ws, id, incoming, false, Some(0), None)
+                .await
+        }));
+    }
+    let mut revs = Vec::new();
+    for h in handles {
+        let r = h
+            .await
+            .expect("join")
+            .expect("every concurrent writer lands");
+        revs.push(r.rev);
+    }
+    revs.sort_unstable();
+    assert_eq!(revs, vec![1, 2, 3, 4]);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 4);
+    assert_eq!(stored.content, "l1\nw1\nl2\nw2\nl3\nw3\nl4\nw4\nl5");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.setContent concurrent").await;
 }
 
 #[tokio::test]
@@ -2414,7 +3965,8 @@ async fn read_asset_reads_base64_from_assets_root() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
-    let root = std::env::temp_dir().join(format!("intentd-assets-{}", uuid::Uuid::new_v4()));
+    let root_guard = test_tempdir("intentd-assets-");
+    let root = root_guard.path().to_path_buf();
     std::fs::create_dir_all(root.join(&ws.0)).expect("mkdir");
     std::fs::write(root.join(&ws.0).join("img.png"), b"hello").expect("write asset");
     let svc = Services::new(store).with_assets_root(root.clone());
@@ -2426,7 +3978,6 @@ async fn read_asset_reads_base64_from_assets_root() {
     assert_eq!(r.asset_id, "img.png");
     assert_eq!(r.mime_type, "image/png");
     assert_eq!(r.data, "aGVsbG8="); // base64("hello")
-    let _ = std::fs::remove_dir_all(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -3898,6 +5449,244 @@ async fn note_add_stamps_user_author_when_caller_is_none() {
     assert_eq!(last.author.id, "user");
     assert_eq!(last.author.name, "User");
     assert_eq!(last.author.author_type, "user");
+}
+
+/// `rev` of the newest `note_version` row for `(ws, id)`, by version number.
+async fn newest_version_rev(store: &Store, ws: &WorkspaceId, id: &NoteId) -> Option<i64> {
+    sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT rev FROM note_version WHERE workspace_id = ?1 AND note_id = ?2 \
+         ORDER BY v DESC LIMIT 1",
+    )
+    .bind(ws.as_str())
+    .bind(id.as_str())
+    .fetch_one(store.read_pool())
+    .await
+    .expect("newest version row")
+}
+
+/// The post-write invariant every persisted content write must uphold: the
+/// newest `note_version` row carries the note's current `rev`, and the base
+/// lookup by that rev yields exactly the persisted content.
+async fn assert_snapshot_at_current_rev(svc: &Services, ws: &WorkspaceId, id: &NoteId, path: &str) {
+    let note = svc.store.get_note(ws, id).await.expect("get note");
+    assert_eq!(
+        newest_version_rev(&svc.store, ws, id).await,
+        Some(note.rev),
+        "{path}: newest note_version row must carry the post-write rev"
+    );
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(ws, id, note.rev)
+            .await
+            .expect("lookup"),
+        Some(note.content),
+        "{path}: base lookup by rev must yield the persisted content"
+    );
+}
+
+/// Every persisted content write snapshots the note at its post-write `rev`:
+/// the base a later writer sends as `expectedVersion` resolves, via
+/// `get_note_version_content_by_rev`, to exactly the content that write
+/// produced. Covers every `note.*` content path (create / setContent / add /
+/// edit / editLines / update / restoreVersion), the direct `task.*` content
+/// writes (`updateStatus`, `update`, `createPrerequisite`, and linked-checkbox
+/// materialization from `updateNoteStatus`), the `comment.add` anchor rewrite
+/// and the `primitive.*` append.
+#[tokio::test]
+async fn note_writes_record_post_write_rev_on_version_snapshot() {
+    let (_tmp, svc, ws, id) = setup("body\n- [ ] alpha\n- [ ] beta").await;
+
+    let created = svc
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Fresh".into(),
+                content: Some("fresh body".into()),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create")
+        .note;
+    assert_snapshot_at_current_rev(&svc, &ws, &created.id, "note.create").await;
+
+    let before = svc.store.get_note(&ws, &id).await.expect("get");
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        "replaced\n- [ ] alpha\n- [ ] beta".into(),
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("set content");
+    let after_set = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(after_set.rev, before.rev + 1);
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.setContent").await;
+
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: "more".into(),
+            heading: None,
+            position: None,
+        },
+        None,
+    )
+    .await
+    .expect("add");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.add").await;
+    // The earlier base is still recoverable by its own rev.
+    assert_eq!(
+        svc.store
+            .get_note_version_content_by_rev(&ws, &id, after_set.rev)
+            .await
+            .expect("lookup"),
+        Some(after_set.content.clone())
+    );
+
+    svc.edit_note(
+        ws.clone(),
+        id.clone(),
+        NoteEditInput {
+            old: "replaced".into(),
+            new: "edited".into(),
+        },
+        None,
+    )
+    .await
+    .expect("edit");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.edit").await;
+
+    svc.edit_note_lines(
+        ws.clone(),
+        id.clone(),
+        NoteEditLinesInput {
+            start: 1,
+            end: 1,
+            content: "lines".into(),
+        },
+        None,
+    )
+    .await
+    .expect("editLines");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.editLines").await;
+
+    svc.update_note(
+        ws.clone(),
+        id.clone(),
+        NoteUpdateInput {
+            content: Some("updated\n- [ ] alpha\n- [ ] beta".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.update").await;
+
+    svc.restore_note_version(ws.clone(), id.clone(), 1, None)
+        .await
+        .expect("restore");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "note.restoreVersion").await;
+
+    svc.task_update_status(ws.clone(), id.clone(), "alpha".into(), "done".into(), None)
+        .await
+        .expect("task.updateStatus");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "task.updateStatus").await;
+
+    svc.task_update(
+        ws.clone(),
+        id.clone(),
+        3,
+        Some("beta renamed".into()),
+        Some("in-progress".into()),
+        None,
+        None,
+    )
+    .await
+    .expect("task.update");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "task.update").await;
+
+    svc.comment_add(
+        ws.clone(),
+        id.clone(),
+        "beta renamed".into(),
+        "renamed".into(),
+        "note".into(),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("comment.add");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "comment.add").await;
+
+    svc.primitive_add_cli(
+        ws.clone(),
+        id.clone(),
+        "cargo test".into(),
+        "run tests".into(),
+        None,
+    )
+    .await
+    .expect("primitive.addCli");
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "primitive.addCli").await;
+
+    // Task paths: a child task note is created, and flipping its status
+    // materializes the linked checkbox onto the parent.
+    svc.mark_as_task(
+        ws.clone(),
+        id.clone(),
+        "not_started".into(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("markAsTask");
+    let child = svc
+        .create_prerequisite(
+            ws.clone(),
+            id.clone(),
+            "Child".into(),
+            Some("child body".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("createPrerequisite")
+        .prerequisite_note_id;
+    assert_snapshot_at_current_rev(&svc, &ws, &child, "task.createPrerequisite").await;
+
+    svc.set_note_content(
+        ws.clone(),
+        id.clone(),
+        format!("- [ ] [Child](intent://local/task/{})", child.as_str()),
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("link child");
+    let linked_rev = svc.store.get_note(&ws, &id).await.expect("get").rev;
+    svc.task_update_note_status(ws.clone(), child.clone(), "complete".into(), None, None)
+        .await
+        .expect("updateNoteStatus");
+    let materialized = svc.store.get_note(&ws, &id).await.expect("get");
+    assert!(
+        materialized.rev > linked_rev && materialized.content.starts_with("- [x]"),
+        "materialization must have rewritten the parent: {materialized:?}"
+    );
+    assert_snapshot_at_current_rev(&svc, &ws, &id, "linked-checkbox materialization").await;
 }
 
 #[tokio::test]
@@ -8594,6 +10383,67 @@ mod change_event_parity {
         );
     }
 
+    /// Regression (intent#4283): `agent_activity_end` must register the idle
+    /// debouncer atomically with dropping the in-flight count. Before the
+    /// fix the count was released first and the debouncer inserted after, so
+    /// a concurrent `workspace_activity` read landing in the gap saw count 0
+    /// with no pending debouncer and derived a transient `Idle` inside the
+    /// grace window — `workspace.get` served `idle` while the immediately
+    /// following `workspace.list` served `agent_running` / `in_progress`.
+    /// A spinning reader on its own OS thread hammers the derivation across
+    /// many begin/end cycles; with a debounce window far longer than the
+    /// test, `Idle` must never be observed once the first session is in
+    /// flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activity_end_never_exposes_transient_idle_inside_grace_window() {
+        use intent_core::WorkspaceActivity;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let _guard = DebounceEnvGuard::new("30000");
+        let h = harness().await;
+
+        // First session in flight before the reader starts: the pre-begin
+        // `Idle` is legitimate and must not count.
+        h.services.agent_activity_begin(&h.ws).await;
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let idle_seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let reader = {
+            let services = h.services.clone();
+            let ws = h.ws.clone();
+            let stop = stop.clone();
+            let idle_seen = idle_seen.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if services.workspace_activity(&ws) == WorkspaceActivity::Idle {
+                        idle_seen.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        };
+
+        // Each `end` is the `1 → 0` edge (debouncer scheduled); each `begin`
+        // re-enters flight and cancels it. The reader must see
+        // `AgentRunning` throughout.
+        for _ in 0..500 {
+            h.services.agent_activity_end(&h.ws);
+            h.services.agent_activity_begin(&h.ws).await;
+        }
+        h.services.agent_activity_end(&h.ws);
+
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("reader thread");
+        assert_eq!(
+            idle_seen.load(Ordering::Relaxed),
+            0,
+            "workspace_activity derived a transient Idle inside the grace window"
+        );
+        assert_eq!(
+            h.services.workspace_activity(&h.ws),
+            WorkspaceActivity::AgentRunning,
+            "grace window still pending after the last end"
+        );
+    }
+
     /// Regression for STAB-N: workspace mutation paths must derive `activity`
     /// from live agent state before returning the `Workspace` on the wire (§9.9).
     /// When a workspace has agents in-flight, mutations that return a `Workspace`
@@ -9336,6 +11186,67 @@ mod change_event_parity {
         );
     }
 
+    /// Every note `workspace.duplicate` copies is snapshotted at its
+    /// post-insert `rev`, so the rev a client loads from the duplicate is a
+    /// recoverable merge base.
+    #[tokio::test]
+    async fn workspace_duplicate_copied_notes_record_post_write_rev_on_version_snapshot() {
+        use intent_core::WorkspaceCreate;
+        let h = harness().await;
+        let source = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Rev dup source".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        h.services
+            .create_note(
+                source.id.clone(),
+                NoteCreate {
+                    title: "Copied".into(),
+                    content: Some("copied body".into()),
+                    tags: None,
+                    parent_id: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create note");
+
+        let dup = h
+            .services
+            .duplicate_workspace(source.id.clone(), None)
+            .await
+            .expect("duplicate");
+        let copied = h
+            .store
+            .list_notes(&dup.id)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|n| n.title == "Copied")
+            .expect("copied note present");
+        assert_eq!(
+            crate::tests::newest_version_rev(&h.store, &dup.id, &copied.id).await,
+            Some(copied.rev),
+            "newest note_version row must carry the copied note's rev"
+        );
+        assert_eq!(
+            h.store
+                .get_note_version_content_by_rev(&dup.id, &copied.id, copied.rev)
+                .await
+                .expect("lookup"),
+            Some("copied body".to_string())
+        );
+    }
+
     /// NULL fallback: a pre-migration row (no persisted override) resolves
     /// `workspace.getAutoCommit` against the global setting with
     /// `source: "global"`, and `effective_auto_commit` follows the global.
@@ -9658,6 +11569,41 @@ mod change_event_parity {
         );
     }
 
+    /// Concurrent `note.list` callers may both observe a missing spec before
+    /// either creates it. Both calls still succeed with the same seeded row,
+    /// while the insert winner alone captures a version and emits the event.
+    #[tokio::test]
+    async fn concurrent_note_lists_reseed_missing_spec_once() {
+        use intent_core::NoteId;
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+
+        let (first, second) =
+            tokio::join!(h.services.list_notes(&h.ws), h.services.list_notes(&h.ws),);
+        for notes in [first.expect("first list"), second.expect("second list")] {
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].id, NoteId::from("spec"));
+            assert_eq!(notes[0].content, "");
+        }
+
+        let event = recv_one(&mut sub).await;
+        assert_envelope(&event, &h.ws.0, "note:created");
+        assert_eq!(event["data"]["noteId"], "spec");
+        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        assert!(quiet.is_err(), "concurrent reseed must emit exactly once");
+
+        let versions = h
+            .store
+            .list_note_versions(&h.ws, &NoteId::from("spec"))
+            .await
+            .expect("versions");
+        assert_eq!(
+            versions.len(),
+            1,
+            "concurrent reseed must capture one version"
+        );
+    }
+
     /// A workspace that already has a `spec` note is untouched by `note.list`:
     /// no spurious `note:created`, no extra version snapshot, no rev bump.
     #[tokio::test]
@@ -9859,7 +11805,7 @@ mod change_event_parity {
         assert!(none.is_err(), "chief list must not publish a reseed event");
     }
 
-    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Self-heal for workspaces damaged by the pre-#110 global-note-identity
     /// bug: on `note.list` with no `id='spec'` note but exactly one top-level,
     /// non-task note titled "Spec", the stray is *adopted* — its `note.id` is
@@ -9937,7 +11883,7 @@ mod change_event_parity {
             author_type: "user".to_string(),
         };
         h.store
-            .append_note_version(&stray, &author, &stray_ts)
+            .append_note_version(&stray, &author, &stray_ts, stray.rev)
             .await
             .expect("v1");
 
@@ -11146,21 +13092,11 @@ mod change_event_parity {
             .contains_key(&(h.ws.clone(), intent_core::NoteId::from(id)))
     }
 
-    fn seed_crdt_session(h: &Harness, id: &str, content: &str) {
-        let nid = intent_core::NoteId::from(id);
-        h.services
-            .crdt_notes
-            .apply_full_content(&h.ws, &nid, content, content);
-        assert!(h.services.crdt_notes.has_session(&h.ws, &nid));
-    }
-
     /// A materialized parent write is a surgical content mutation like
-    /// `note.edit`: it drops the parent's cached CRDT session (so the next
-    /// `note.setContent` reseeds from the persisted marker) and schedules its
-    /// line-attribution recompute. Parents left untouched — and the task note
-    /// itself — keep their sessions and schedule nothing.
+    /// `note.edit`: it schedules the parent's line-attribution recompute.
+    /// Parents left untouched — and the task note itself — schedule nothing.
     #[tokio::test]
-    async fn materialization_invalidates_parent_crdt_and_schedules_attribution_recompute() {
+    async fn materialization_schedules_parent_attribution_recompute() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
         insert_task_note(&h, T2, TaskStatus::NotStarted).await;
@@ -11174,38 +13110,23 @@ mod change_event_parity {
             .insert_note(&note(&h.ws, FRESH, &other))
             .await
             .expect("insert other");
-        seed_crdt_session(&h, "spec", &body);
-        seed_crdt_session(&h, FRESH, &other);
 
         set_status(&h, T1, "complete").await;
 
         assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
         assert!(
-            !h.services.crdt_notes.has_session(&h.ws, &spec_id()),
-            "rewritten parent drops its CRDT session"
-        );
-        assert!(
             attribution_recompute_scheduled(&h, "spec"),
             "rewritten parent schedules a line-attribution recompute"
         );
-        assert!(h
-            .services
-            .crdt_notes
-            .has_session(&h.ws, &intent_core::NoteId::from(FRESH)));
         assert!(!attribution_recompute_scheduled(&h, FRESH));
         assert!(!attribution_recompute_scheduled(&h, T1));
-
-        // The marker already matches: no rewrite, so no invalidation either.
-        seed_crdt_session(&h, "spec", &linked("[x]", "T", T1));
-        set_status(&h, T1, "complete").await;
-        assert!(h.services.crdt_notes.has_session(&h.ws, &spec_id()));
     }
 
     /// Redirected writes through `task.updateStatus` / `task.update` behave as
-    /// on every other materializing path: the redirect target's parents are
-    /// invalidated too (here the parent is the note the call addressed).
+    /// on every other materializing path: the redirect target's parent (here
+    /// the note the call addressed) schedules its recompute too.
     #[tokio::test]
-    async fn redirected_write_invalidates_parent_crdt() {
+    async fn redirected_write_schedules_parent_attribution_recompute() {
         let h = harness().await;
         insert_task_note(&h, T1, TaskStatus::NotStarted).await;
         let body = linked("[ ]", "T", T1);
@@ -11213,7 +13134,6 @@ mod change_event_parity {
             .insert_note(&note(&h.ws, "spec", &body))
             .await
             .expect("insert spec");
-        seed_crdt_session(&h, "spec", &body);
 
         h.services
             .task_update(
@@ -11229,7 +13149,6 @@ mod change_event_parity {
             .expect("task.update");
 
         assert_eq!(note_content(&h, "spec").await.0, linked("[x]", "T", T1));
-        assert!(!h.services.crdt_notes.has_session(&h.ws, &spec_id()));
         assert!(attribution_recompute_scheduled(&h, "spec"));
     }
 
@@ -11571,7 +13490,8 @@ mod mcp_callback {
 
         // The registry holds the canonical entry, claimable by nonce.
         let echo = json!({ "output": format!("…\"attachmentId\": \"{nonce}\"…") });
-        let mut batch = registry.claim_at_tool_result(&agent_id, Some(&echo), "unrelated_tool");
+        let mut batch =
+            registry.claim_at_tool_result(&agent_id, Some(&echo), "unrelated_tool", None);
         assert_eq!(batch.len(), 1, "one registered entry claimable by nonce");
         let claimed = batch.remove(0);
         assert_eq!(claimed.id, nonce);
@@ -11629,7 +13549,8 @@ mod mcp_callback {
             .claim_at_tool_result(
                 &intent_core::AgentId::from_string("agent-any"),
                 None,
-                "workspace_api"
+                "workspace_api",
+                None
             )
             .is_empty());
     }
@@ -11677,7 +13598,7 @@ mod mcp_callback {
 
         // No nonce can be echoed (the envelope was discarded), so the claim
         // rides the workspace_api FIFO fallback.
-        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api", None);
         assert_eq!(
             batch.len(),
             1,
@@ -11734,11 +13655,11 @@ mod mcp_callback {
             .expect("tools/call returns a response");
         assert_eq!(resp["result"]["isError"], json!(false));
 
-        let first = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        let first = registry.claim_at_tool_result(&agent_id, None, "workspace_api", None);
         assert_eq!(first.len(), 1, "exactly one entry in the claimed batch");
         assert!(
             registry
-                .claim_at_tool_result(&agent_id, None, "workspace_api")
+                .claim_at_tool_result(&agent_id, None, "workspace_api", None)
                 .is_empty(),
             "no second batch left behind (double registration)"
         );
@@ -11788,13 +13709,13 @@ mod mcp_callback {
             .expect("tools/call returns a response");
         assert_eq!(resp["result"]["isError"], json!(false));
 
-        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api", None);
         assert_eq!(batch.len(), 2, "both proposals registered as one batch");
         assert_eq!(batch[0].name, "First");
         assert_eq!(batch[1].name, "Second");
         assert!(
             registry
-                .claim_at_tool_result(&agent_id, None, "workspace_api")
+                .claim_at_tool_result(&agent_id, None, "workspace_api", None)
                 .is_empty(),
             "single batch — nothing left after the claim"
         );
@@ -11843,7 +13764,7 @@ mod mcp_callback {
             .expect("tools/call returns a response");
         assert_eq!(resp["result"]["isError"], json!(false));
 
-        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api");
+        let batch = registry.claim_at_tool_result(&agent_id, None, "workspace_api", None);
         assert_eq!(batch.len(), 1, "bulk-op proposal registered");
         assert_eq!(batch[0].mime_type, "application/vnd.intent.proposal+json");
         let payload: serde_json::Value =
@@ -11864,7 +13785,7 @@ mod drafts_events {
     use std::time::Duration;
 
     use intent_core::events::DRAFT_CHANGED;
-    use intent_core::{AgentId, ClientId, WorkspaceId};
+    use intent_core::{AgentId, ClientHostInfo, ClientId, WorkspaceId};
     use intent_store::Store;
     use serde_json::json;
 
@@ -11879,7 +13800,7 @@ mod drafts_events {
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let client = ClientId::from_string("cli-secret");
         store
-            .upsert_client(&client, None, None)
+            .upsert_client(&client, None, None, &ClientHostInfo::default())
             .await
             .expect("client");
         let agent = AgentId::from_string("agent-1");
@@ -11954,7 +13875,7 @@ mod drafts_events {
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
         let client = ClientId::from_string("cli-attach");
         store
-            .upsert_client(&client, None, None)
+            .upsert_client(&client, None, None, &ClientHostInfo::default())
             .await
             .expect("client");
         let agent = AgentId::from_string("agent-1");
@@ -12072,11 +13993,11 @@ mod pr {
     use intent_store::Store;
     use serde_json::json;
 
-    use super::{workspace, TempDb};
+    use super::{test_tempdir, workspace, TempDb};
     use crate::Services;
 
     // Test stub: one independent bool per scripted scenario.
-    #[allow(clippy::struct_excessive_bools)]
+    #[expect(clippy::struct_excessive_bools)]
     #[derive(Default)]
     struct StubForge {
         fail_threads: bool,
@@ -13886,7 +15807,7 @@ mod pr {
         assert_eq!(evs.len(), 1);
     }
 
-    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     #[tokio::test]
     async fn refresh_all_pauses_between_workspaces() {
         // Inter-workspace pause (intent-hq/monorepo#703): the sweep sleeps
@@ -13989,18 +15910,8 @@ mod pr {
     // stubbed forge.
     // ------------------------------------------------------------------------
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn unique_dir(prefix: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn unique_dir(prefix: &str) -> tempfile::TempDir {
+        test_tempdir(&format!("{prefix}-"))
     }
 
     /// Commit everything in the worktree on the current branch, returning the oid.
@@ -14026,12 +15937,21 @@ mod pr {
     /// `feature` with an `origin` bare remote and a linked `o/r` repository.
     async fn ac_setup(
         forge: StubForge,
-    ) -> (TempDb, TempDir, TempDir, Services, WorkspaceId, PathBuf) {
+    ) -> (
+        TempDb,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Services,
+        WorkspaceId,
+        PathBuf,
+    ) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
 
-        let work = unique_dir("intentd-ac-work");
-        let bare = unique_dir("intentd-ac-bare");
+        let work_dir = unique_dir("intentd-ac-work");
+        let work = work_dir.path().to_path_buf();
+        let bare_dir = unique_dir("intentd-ac-bare");
+        let bare = bare_dir.path().to_path_buf();
         let mut opts = git2::RepositoryInitOptions::new();
         opts.initial_head("feature");
         let repo = git2::Repository::init_opts(&work, &opts).unwrap();
@@ -14055,7 +15975,7 @@ mod pr {
         store.insert_workspace(&ws).await.expect("ws");
 
         let svc = Services::new(store).with_source_control(Arc::new(forge));
-        (tmp, TempDir(work.clone()), TempDir(bare), svc, ws_id, work)
+        (tmp, work_dir, bare_dir, svc, ws_id, work)
     }
 
     #[tokio::test]
@@ -14109,7 +16029,7 @@ mod pr {
         assert_eq!(st["existingPR"]["number"], 7);
 
         // The bare remote now carries the feature branch.
-        let bare_repo = git2::Repository::open_bare(bare.0.clone()).unwrap();
+        let bare_repo = git2::Repository::open_bare(bare.path()).unwrap();
         assert!(bare_repo.find_reference("refs/heads/feature").is_ok());
 
         // mergePR via the stubbed forge.
@@ -14132,6 +16052,52 @@ mod pr {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].number, 7);
         assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+    }
+
+    /// Undoing a commit that renamed a file re-attributes BOTH sides of the
+    /// rename (monorepo#4594): the soft reset leaves a staged `R`, which the
+    /// display status collapses under the new path only, but attribution is
+    /// per path and the old path's deletion must be attributable too so the
+    /// next agent checkpoint lands it.
+    #[tokio::test]
+    async fn undo_commit_restores_attribution_for_both_sides_of_a_rename() {
+        let (_t, _w, _b, svc, ws, work) = ac_setup(StubForge::default()).await;
+        let repo = git2::Repository::open(&work).unwrap();
+        let base = repo.head().unwrap().target().unwrap().to_string();
+
+        std::fs::rename(work.join("README.md"), work.join("GUIDE.md")).unwrap();
+        commit_all(&repo, "chore: rename readme");
+
+        let res = svc
+            .accept_changes_execute(
+                ws.clone(),
+                json!({
+                    "action": "undo-commit",
+                    "upToCommitHash": base,
+                    "undoCommitsMetadata": [{
+                        "agentId": "agent-a",
+                        "files": ["README.md", "GUIDE.md"],
+                    }],
+                }),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(res["success"], true, "result: {res}");
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let row = |p: &str| {
+            rows.iter()
+                .find(|r| r.path == p)
+                .unwrap_or_else(|| panic!("no attribution row for {p}: {rows:?}"))
+        };
+        let old = row("README.md");
+        assert_eq!(old.status, "deleted");
+        assert_eq!(old.stage, "staged");
+        assert_eq!(old.agent_id.as_deref(), Some("agent-a"));
+        let new = row("GUIDE.md");
+        assert_eq!(new.status, "added");
+        assert_eq!(new.stage, "staged");
+        assert_eq!(new.agent_id.as_deref(), Some("agent-a"));
     }
 
     #[tokio::test]
@@ -14188,11 +16154,11 @@ mod pr {
     async fn add_remote_initializes_and_returns_status() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("store");
-        let dir = TempDir(unique_dir("intentd-ac-addremote"));
+        let dir = unique_dir("intentd-ac-addremote");
         let ws_id = WorkspaceId::new();
         let mut ws = workspace(&ws_id);
         ws.branch = "feature".into();
-        ws.worktree_path = Some(dir.0.to_string_lossy().to_string());
+        ws.worktree_path = Some(dir.path().to_string_lossy().to_string());
         store.insert_workspace(&ws).await.unwrap();
         let svc = Services::new(store).with_source_control(Arc::new(StubForge::default()));
 
@@ -14440,24 +16406,19 @@ mod pr {
     /// (`current_branch_at` reads the symbolic target, so no commit is needed).
     struct SweepRepo {
         dir: PathBuf,
+        _guard: tempfile::TempDir,
     }
 
     impl SweepRepo {
         fn init(branch: &str, origin: Option<&str>) -> Self {
-            let dir = std::env::temp_dir().join(format!("intentd-groot-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-groot-");
+            let dir = guard.path().to_path_buf();
             let repo = git2::Repository::init(&dir).unwrap();
             repo.set_head(&format!("refs/heads/{branch}")).unwrap();
             if let Some(url) = origin {
                 repo.remote("origin", url).unwrap();
             }
-            Self { dir }
-        }
-    }
-
-    impl Drop for SweepRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            Self { dir, _guard: guard }
         }
     }
 
@@ -14523,8 +16484,8 @@ mod pr {
         let (_t, svc, ws) = sweep_setup(&parent.dir).await;
 
         // Seed a root whose directory no longer exists (auto-prune target).
-        let gone_dir = std::env::temp_dir().join(format!("intentd-gone-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&gone_dir).unwrap();
+        let gone_guard = test_tempdir("intentd-gone-");
+        let gone_dir = gone_guard.path().to_path_buf();
         let gone = sweep_root(&ws.id, &gone_dir, None);
         svc.store().upsert_workspace_git_root(&gone).await.unwrap();
         std::fs::remove_dir_all(&gone_dir).unwrap();
@@ -14746,7 +16707,8 @@ mod pr {
 
         // Root at guard/repo where `guard` is later made unsearchable, so a
         // stat of the root's path fails with PermissionDenied, not NotFound.
-        let guard = std::env::temp_dir().join(format!("intentd-guard-{}", uuid::Uuid::new_v4()));
+        let guard_dir = test_tempdir("intentd-guard-");
+        let guard = guard_dir.path().to_path_buf();
         let repo_dir = guard.join("repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
         let root = sweep_root(&ws.id, &repo_dir, None);
@@ -14763,7 +16725,6 @@ mod pr {
 
         // Restore permissions so the tempdir can be cleaned up.
         std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&guard);
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
         assert_eq!(roots.len(), 1, "root must survive the transient error");
@@ -15174,8 +17135,8 @@ mod pr {
         let primary = SweepRepo::init("main", None);
         let (_t, svc, ws) = sweep_setup(&primary.dir).await;
         // A plain directory, not a git repo: current-branch read fails.
-        let plain = std::env::temp_dir().join(format!("intentd-plain-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&plain).unwrap();
+        let plain_dir = test_tempdir("intentd-plain-");
+        let plain = plain_dir.path().to_path_buf();
         let mut root = sweep_root(&ws.id, &plain, Some(("o", "r")));
         root.pull_requests = Some(vec![pool_entry(
             43,
@@ -15186,7 +17147,6 @@ mod pr {
 
         let sc: Arc<dyn SourceControl> = Arc::new(StubForge::default());
         let outcome = svc.refresh_git_root_pr(root, &sc).await.unwrap();
-        let _ = std::fs::remove_dir_all(&plain);
         assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
 
         let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
@@ -15730,23 +17690,18 @@ mod file_tracking {
     /// A self-cleaning git repository seeded with one commit.
     struct GitRepo {
         dir: PathBuf,
-    }
-
-    impl Drop for GitRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
+        _guard: tempfile::TempDir,
     }
 
     fn init_git_repo() -> GitRepo {
-        let dir = std::env::temp_dir().join(format!("intentd-ft-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = test_tempdir("intentd-ft-");
+        let dir = guard.path().to_path_buf();
         let repo = Repository::init(&dir).unwrap();
         let mut cfg = repo.config().unwrap();
         cfg.set_str("user.name", "Test").unwrap();
         cfg.set_str("user.email", "test@example.com").unwrap();
         commit_file(&dir, "seed.txt", "seed\n", "seed commit");
-        GitRepo { dir }
+        GitRepo { dir, _guard: guard }
     }
 
     fn commit_file(dir: &std::path::Path, rel: &str, contents: &str, message: &str) {
@@ -18243,6 +20198,11 @@ mod file_tracking {
 
     /// The fallback TTL bounds staleness for changes no daemon signal reports:
     /// an out-of-band edit is picked up once the cached entry expires.
+    ///
+    /// The TTL is generous and expiry is synthesized by advancing the paused
+    /// runtime clock (intent-hq/intent#4880): with a millisecond TTL measured
+    /// against the wall clock, a scheduling stall between the two "inside the
+    /// TTL" reads expired the entry early under package load.
     #[tokio::test]
     async fn git_status_cache_expires_after_its_ttl() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18251,9 +20211,10 @@ mod file_tracking {
         let repo = init_git_repo();
         let (_t, svc, ws_id) = svc_with_repo(&repo).await;
 
+        let ttl = std::time::Duration::from_secs(3600);
         let scans = Arc::new(AtomicUsize::new(0));
         let svc = svc
-            .with_git_status_cache_ttl(std::time::Duration::from_millis(50))
+            .with_git_status_cache_ttl(ttl)
             .with_git_status_scan_probe({
                 let scans = Arc::clone(&scans);
                 Arc::new(move || {
@@ -18279,7 +20240,13 @@ mod file_tracking {
         );
         assert_eq!(scans.load(Ordering::SeqCst), 1, "no rescan inside the TTL");
 
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        // Age the cached entry past the TTL on the runtime clock, then hand
+        // the clock back before the read: the scan and the store's
+        // pool-acquire timeouts are tokio timers a paused clock would
+        // auto-advance.
+        tokio::time::pause();
+        tokio::time::advance(ttl * 2).await;
+        tokio::time::resume();
         let expired = svc.git_status(ws_id, None).await.unwrap();
         assert_eq!(
             scans.load(Ordering::SeqCst),
@@ -18812,51 +20779,6 @@ mod file_tracking {
         assert_eq!(details["fileDetails"], serde_json::json!([]));
     }
 
-    /// `parse_github_owner_repo` accepts the `ssh://` URL form (with
-    /// optional user and numeric port) alongside https and scp-like remotes,
-    /// and keeps the strict `github.com` host check for all three
-    /// (monorepo#2053 review).
-    #[test]
-    fn parse_github_owner_repo_handles_ssh_url_form() {
-        let parse = Services::parse_github_owner_repo;
-        let ok = Some(("intent-hq".to_string(), "intentd".to_string()));
-
-        // ssh:// forms.
-        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd"), ok);
-        assert_eq!(parse("ssh://github.com/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("ssh://git@github.com:22/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("ssh://git@github.com/intent-hq/intentd.git/"), ok);
-
-        // Strict host check on ssh:// too.
-        assert_eq!(
-            parse("ssh://git@github.com.evil.com/intent-hq/intentd.git"),
-            None
-        );
-        assert_eq!(parse("ssh://git@gitlab.com/intent-hq/intentd.git"), None);
-        // A non-numeric "port" stays part of the host and is rejected.
-        assert_eq!(
-            parse("ssh://git@github.com.evil/intent-hq/intentd.git"),
-            None
-        );
-        assert_eq!(
-            parse("ssh://git@github.com:evil/intent-hq/intentd.git"),
-            None
-        );
-        // No owner/repo path.
-        assert_eq!(parse("ssh://git@github.com"), None);
-        assert_eq!(parse("ssh://git@github.com/intentd.git"), None);
-
-        // The existing https and scp-like forms still parse.
-        assert_eq!(parse("https://github.com/intent-hq/intentd.git"), ok);
-        assert_eq!(parse("git@github.com:intent-hq/intentd.git"), ok);
-        assert_eq!(
-            parse("https://github.com.evil.com/intent-hq/intentd.git"),
-            None
-        );
-        assert_eq!(parse("git@github.com.evil:intent-hq/intentd.git"), None);
-    }
-
     /// `register_git_root` emits `gitRoot:registered` on first registration
     /// and `gitRoot:updated` on re-registration; `unregister_git_root` emits
     /// `gitRoot:unregistered` (monorepo#2053).
@@ -19053,17 +20975,15 @@ mod file_tracking {
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
 
         // Directory without a `.git` entry.
-        let plain = std::env::temp_dir().join(format!("intentd-ft-plain-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&plain).unwrap();
+        let plain = test_tempdir("intentd-ft-plain-");
         let err = svc
             .git_root_register(
                 ws_id.clone(),
-                plain.to_string_lossy().into_owned(),
+                plain.path().to_string_lossy().into_owned(),
                 agent.clone(),
             )
             .await
             .unwrap_err();
-        let _ = std::fs::remove_dir_all(&plain);
         assert!(matches!(err, crate::Error::InvalidParams(_)), "{err:?}");
 
         // The workspace's own primary root is tracked implicitly.
@@ -21644,22 +23564,17 @@ mod rules {
     use intent_store::Store;
     use serde_json::Value;
 
-    use super::{workspace, TempDb};
+    use super::{test_tempdir, workspace, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
-    struct TempTree(std::path::PathBuf);
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    struct TempTree(std::path::PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     /// A worktree containing a `CLAUDE.md` workspace rule file.
     fn worktree() -> TempTree {
-        let dir = std::env::temp_dir().join(format!("intentd-rules-svc-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let guard = test_tempdir("intentd-rules-svc-");
+        let dir = guard.path().to_path_buf();
         std::fs::write(dir.join("CLAUDE.md"), "ALWAYS run the linter.").unwrap();
-        TempTree(dir)
+        TempTree(dir, guard)
     }
 
     async fn setup(dir: &std::path::Path) -> (TempDb, Store, Services, WorkspaceId) {
@@ -22291,6 +24206,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -22438,6 +24354,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true),
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -22576,6 +24493,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -22709,6 +24627,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(false), // CoW not supported!
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -22841,6 +24760,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // CoW capable!
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -22978,6 +24898,7 @@ mod rules {
             diff_summary: None,
             token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -23080,6 +25001,7 @@ mod rules {
         };
 
         let workspace = intent_core::Workspace {
+            browser_client_id: None,
             pending_delete_at: None,
             context_links: None,
             waiting: false,
@@ -23240,6 +25162,7 @@ mod rules {
         // false — the old direct-mode-only predicate never fired here even
         // though delegates ARE sandboxed (agent_ops is_standalone_checkout).
         let workspace = intent_core::Workspace {
+            browser_client_id: None,
             pending_delete_at: None,
             context_links: None,
             waiting: false,
@@ -23505,6 +25428,7 @@ mod rules {
 
         // microVM workspace
         let workspace = intent_core::Workspace {
+            browser_client_id: None,
             pending_delete_at: None,
             context_links: None,
             waiting: false,
@@ -24109,12 +26033,7 @@ mod known_repo {
     async fn create_workspace_derives_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
-        struct TempRepo(PathBuf);
-        impl Drop for TempRepo {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
+        struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -24123,8 +26042,8 @@ mod known_repo {
 
         // Helper: init a git repo with an origin remote and an initial commit.
         let make_repo = |remote_url: &str| -> TempRepo {
-            let dir = std::env::temp_dir().join(format!("intentd-origin-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-origin-");
+            let dir = guard.path().to_path_buf();
             let repo = Repository::init(&dir).unwrap();
             let mut cfg = repo.config().unwrap();
             cfg.set_str("user.name", "Test").unwrap();
@@ -24139,7 +26058,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            TempRepo(dir)
+            TempRepo(dir, guard)
         };
 
         // GitHub https remote → owner and name derived.
@@ -24217,9 +26136,8 @@ mod known_repo {
 
         // No origin remote → owner stays None, name falls back to basename.
         let no_remote = {
-            let dir =
-                std::env::temp_dir().join(format!("intentd-noremote-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-noremote-");
+            let dir = guard.path().to_path_buf();
             let repo = Repository::init(&dir).unwrap();
             let mut cfg = repo.config().unwrap();
             cfg.set_str("user.name", "Test").unwrap();
@@ -24233,7 +26151,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            TempRepo(dir)
+            TempRepo(dir, guard)
         };
         let noremote_ws = svc
             .create_workspace(
@@ -24358,21 +26276,16 @@ mod known_repo {
         );
     }
 
-    /// `workspace.list` backfills `repository_owner` and `repository_name` for
+    /// Startup prewarming backfills `repository_owner` and `repository_name` for
     /// existing workspaces with a `repositoryPath` and missing owner/name:
     /// derive from the `origin` remote URL (same helper as `workspace.create`),
     /// persist, and emit `workspace:updated` with the changed fields (STAB-64
     /// backfill).
     #[tokio::test]
-    async fn list_workspaces_backfills_owner_and_name_from_origin_remote() {
+    async fn startup_prewarm_backfills_owner_and_name_from_origin_remote() {
         use git2::{Repository, Signature};
 
-        struct TempRepo(PathBuf);
-        impl Drop for TempRepo {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
+        struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -24385,14 +26298,8 @@ mod known_repo {
         // Manually create a workspace row with repository_path but missing owner/name
         // (simulates old workspace created before the create derivation landed).
         let make_repo = |url: &str| -> TempRepo {
-            let dir = std::env::temp_dir().join(format!(
-                "intentd-backfill-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
+            let guard = test_tempdir("intentd-backfill-");
+            let dir = guard.path().to_path_buf();
             let repo = Repository::init(&dir).unwrap();
             repo.remote("origin", url).unwrap();
             let mut index = repo.index().unwrap();
@@ -24401,7 +26308,7 @@ mod known_repo {
             let sig = Signature::now("Test", "test@example.com").unwrap();
             repo.commit(Some("HEAD"), &sig, &sig, "seed commit", &tree, &[])
                 .unwrap();
-            TempRepo(dir)
+            TempRepo(dir, guard)
         };
 
         let repo_path = make_repo("https://github.com/octocat/hello-world.git");
@@ -24445,6 +26352,7 @@ mod known_repo {
             agent_summary: None,
             diff_summary: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,
@@ -24466,9 +26374,18 @@ mod known_repo {
                     ..Default::default()
                 });
 
-        // Trigger workspace.list → spawns backfill
-        let list = svc.list_workspaces(false).await.expect("list workspaces");
-        assert!(list.iter().any(|w| w.id == id), "workspace appears in list");
+        let probes_before = repository_backfill_probe_count(&repo_path.0);
+        let listed = svc.list_workspaces(false).await.expect("list workspaces");
+        assert!(listed.iter().any(|workspace| workspace.id == id));
+        tokio::task::yield_now().await;
+        assert_eq!(
+            repository_backfill_probe_count(&repo_path.0),
+            probes_before,
+            "workspace.list must not probe repository paths"
+        );
+
+        // Startup prewarm loads candidates once, then spawns the backfill.
+        svc.prewarm_repository_metadata().await;
 
         // Wait for the backfill to complete and emit workspace:updated
         let mut updated_event = None;
@@ -24531,6 +26448,117 @@ mod known_repo {
             Some("hello-world"),
             "repositoryName persisted"
         );
+
+        // A repository path that appears after startup uses the same
+        // background probe and does not require another daemon prewarm.
+        let path_update_repo = make_repo("git@github.com:octocat/path-update.git");
+        let path_update_id = WorkspaceId::from_string("path-update-test".to_string());
+        let mut path_update_ws = workspace(&path_update_id);
+        path_update_ws.repository_path = None;
+        path_update_ws.repository_owner = None;
+        path_update_ws.repository_name = None;
+        store
+            .insert_workspace(&path_update_ws)
+            .await
+            .expect("insert path-update workspace");
+        svc.update_workspace(
+            path_update_id.clone(),
+            WorkspaceUpdate {
+                repository_path: Some(path_update_repo.0.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update repository path");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let updated = store
+                .get_workspace(&path_update_id)
+                .await
+                .expect("get path-update workspace");
+            if updated.repository_owner.as_deref() == Some("octocat") {
+                assert_eq!(updated.repository_name.as_deref(), Some("path-update"));
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "repository-path update backfill did not complete"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A stale probe for repository A must not populate repository B after the
+    /// workspace path changes; B's own candidate remains able to fill the row.
+    #[tokio::test]
+    async fn repository_owner_backfill_skips_candidate_after_path_change() {
+        use git2::Repository;
+
+        let repo_a = tempfile::tempdir().expect("repo A tempdir");
+        let git_a = Repository::init(repo_a.path()).expect("init repo A");
+        git_a
+            .remote("origin", "https://github.com/owner-a/repo-a.git")
+            .expect("repo A origin");
+        let repo_b = tempfile::tempdir().expect("repo B tempdir");
+        let git_b = Repository::init(repo_b.path()).expect("init repo B");
+        git_b
+            .remote("origin", "https://github.com/owner-b/repo-b.git")
+            .expect("repo B origin");
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let bus = crate::events::bus::EventBus::new(store.clone());
+        let svc = Services::new(store.clone()).with_event_bus(bus);
+        let id = WorkspaceId::from_string("backfill-path-race-test".to_string());
+        let path_a = repo_a.path().to_string_lossy().into_owned();
+        let path_b = repo_b.path().to_string_lossy().into_owned();
+        let mut ws = workspace(&id);
+        ws.repository_path = Some(path_a.clone());
+        store.insert_workspace(&ws).await.expect("insert workspace");
+
+        let candidate_a = BackfillCandidate {
+            workspace_id: id.clone(),
+            repository_path: path_a,
+        };
+        ws.repository_path = Some(path_b.clone());
+        store
+            .update_workspace(&ws)
+            .await
+            .expect("change repository path to B");
+
+        svc.backfill_one_workspace(candidate_a)
+            .await
+            .expect("stale A backfill");
+        let after_a = store.get_workspace(&id).await.expect("get after A");
+        assert_eq!(after_a.repository_owner, None);
+        assert_eq!(after_a.repository_name, None);
+        assert!(
+            store
+                .events_by_type(&id, "workspace:updated", 10)
+                .await
+                .expect("events after A")
+                .is_empty(),
+            "stale A candidate must not emit workspace:updated"
+        );
+
+        svc.backfill_one_workspace(BackfillCandidate {
+            workspace_id: id.clone(),
+            repository_path: path_b,
+        })
+        .await
+        .expect("current B backfill");
+        let after_b = store.get_workspace(&id).await.expect("get after B");
+        assert_eq!(after_b.repository_owner.as_deref(), Some("owner-b"));
+        assert_eq!(after_b.repository_name.as_deref(), Some("repo-b"));
+        assert_eq!(
+            store
+                .events_by_type(&id, "workspace:updated", 10)
+                .await
+                .expect("events after B")
+                .len(),
+            1,
+            "current B candidate emits workspace:updated"
+        );
     }
 }
 
@@ -24538,18 +26566,12 @@ mod worktree_provisioning {
     use super::*;
     use intent_core::WorkspaceCreate;
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Commit everything in the worktree on the current branch, returning the oid.
@@ -27486,21 +29508,15 @@ mod setup_lifecycle_events {
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::TempDb;
+    use super::{test_tempdir, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Init a git repo with one commit; returns (guard, head branch).
@@ -27802,9 +29818,8 @@ mod file_ops_service {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
 
-        let dir = std::env::temp_dir().join(format!("intentd-fileapi-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-fileapi-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
@@ -27843,8 +29858,6 @@ mod file_ops_service {
             .file_read(ws.clone(), "../escape".to_string(), None)
             .await;
         assert!(matches!(denied, Err(Error::Internal(_))));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `file.placeAttachment` wired through `WorkspaceApi`: a base64 payload
@@ -27860,9 +29873,8 @@ mod file_ops_service {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
 
-        let dir = std::env::temp_dir().join(format!("intentd-placeatt-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-placeatt-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         git2::Repository::init(&dir).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
@@ -27878,6 +29890,7 @@ mod file_ops_service {
                 Some(format!("data:application/json;base64,{b64}")),
                 None,
                 Some("application/json".to_string()),
+                None,
             )
             .await
             .expect("place");
@@ -27919,6 +29932,7 @@ mod file_ops_service {
                 Some(base64::engine::general_purpose::STANDARD.encode(b"{}")),
                 None,
                 None,
+                None,
             )
             .await
             .expect("place config.json");
@@ -27942,6 +29956,7 @@ mod file_ops_service {
                 None,
                 Some(src.to_string_lossy().into_owned()),
                 None,
+                None,
             )
             .await
             .expect("place from sourcePath");
@@ -27959,12 +29974,17 @@ mod file_ops_service {
             (None, Some("relative/path.txt".to_string())),
         ] {
             let res = svc
-                .file_place_attachment(ws.clone(), "f.bin".to_string(), data, source_path, None)
+                .file_place_attachment(
+                    ws.clone(),
+                    "f.bin".to_string(),
+                    data,
+                    source_path,
+                    None,
+                    None,
+                )
                 .await;
             assert!(matches!(res, Err(Error::InvalidParams(_))), "{res:?}");
         }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `file.getAttachmentInfo` (PROTOCOL §5.9): serves the registry row with
@@ -27977,9 +29997,8 @@ mod file_ops_service {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
-        let dir = std::env::temp_dir().join(format!("intentd-attinfo-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-attinfo-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
@@ -27992,6 +30011,7 @@ mod file_ops_service {
                 Some(base64::engine::general_purpose::STANDARD.encode(b"hello")),
                 None,
                 Some("text/plain".to_string()),
+                None,
             )
             .await
             .expect("place");
@@ -28019,8 +30039,398 @@ mod file_ops_service {
         std::fs::remove_file(dir.join(".intent/attachments/notes.txt")).unwrap();
         let info2 = svc.file_get_attachment_info(id).await.expect("info 2");
         assert_eq!(info2["exists"], serde_json::json!(false));
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    /// Idempotent `file.placeAttachment` (intent-hq/intent#4691): a same-key
+    /// retry with the same payload replays the ORIGINAL result plus
+    /// `replayed: true` and places nothing; a different payload under the
+    /// same key is `InvalidParams`; keys are per-workspace; the binding is
+    /// durable across a store reopen (daemon restart); `getAttachmentInfo`
+    /// resolves a key (unknown → `InvalidParams`); a binding older than the
+    /// 7-day retention is swept lazily and the retry places afresh; the
+    /// `sourcePath` arm fingerprints on `(fileName, size)` only; and an
+    /// absent key is byte-identical to today (no `replayed` marker).
+    #[tokio::test]
+    async fn file_place_attachment_idempotency_key_replay_conflict_restart_expiry() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let other_ws = WorkspaceId::new();
+        let dir_guard = test_tempdir("intentd-attidem-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
+        let other_guard = test_tempdir("intentd-attidem-other-");
+        let other_dir = std::fs::canonicalize(other_guard.path()).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let mut w2 = workspace(&other_ws);
+        w2.worktree_path = Some(other_dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w2).await.expect("other ws");
+        let svc = Services::new(store);
+
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let attachments = |root: &std::path::Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(root.join(".intent/attachments"))
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| n != ".gitignore")
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+
+        // Absent key: unchanged shape, no `replayed` marker.
+        let plain = svc
+            .file_place_attachment(
+                ws.clone(),
+                "plain.txt".to_string(),
+                Some(b64(b"plain")),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("plain place");
+        assert!(plain.get("replayed").is_none(), "{plain}");
+
+        // First keyed placement: same result shape as an unkeyed one.
+        let first = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("first keyed place");
+        assert!(first.get("replayed").is_none(), "{first}");
+        let first_id = first["attachmentId"].as_str().unwrap().to_string();
+        assert_eq!(
+            first["path"],
+            serde_json::json!(".intent/attachments/report.txt")
+        );
+        assert_eq!(attachments(&dir), vec!["plain.txt", "report.txt"]);
+
+        // Lost-reply replay: identical result + `replayed: true`, nothing new
+        // on disk, same registry row.
+        let replay = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("replay");
+        let mut expected = first.clone();
+        expected["replayed"] = serde_json::json!(true);
+        assert_eq!(replay, expected);
+        assert_eq!(attachments(&dir), vec!["plain.txt", "report.txt"]);
+
+        // Same key, different bytes → conflict (nothing placed).
+        let conflict = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v2")),
+                None,
+                None,
+                Some("key-A".to_string()),
+            )
+            .await;
+        match conflict {
+            Err(Error::InvalidParams(m)) => {
+                assert!(m.contains("different payload"), "{m}");
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        // Same key, same bytes, different fileName → also a conflict.
+        let renamed = svc
+            .file_place_attachment(
+                ws.clone(),
+                "renamed.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                None,
+                Some("key-A".to_string()),
+            )
+            .await;
+        assert!(
+            matches!(renamed, Err(Error::InvalidParams(_))),
+            "{renamed:?}"
+        );
+        assert_eq!(attachments(&dir), vec!["plain.txt", "report.txt"]);
+
+        // Cross-workspace isolation: the same key in another workspace is a
+        // fresh binding.
+        let other = svc
+            .file_place_attachment(
+                other_ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"other bytes")),
+                None,
+                None,
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("other ws place");
+        assert!(other.get("replayed").is_none(), "{other}");
+        assert_ne!(other["attachmentId"], first["attachmentId"]);
+
+        // Lookup by key: found (per workspace) / unknown.
+        let by_key = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-A".to_string())
+            .await
+            .expect("lookup by key");
+        assert_eq!(by_key["attachmentId"], serde_json::json!(first_id));
+        assert_eq!(by_key["fileName"], serde_json::json!("report.txt"));
+        assert_eq!(by_key["mimeType"], serde_json::json!("text/plain"));
+        assert_eq!(by_key["exists"], serde_json::json!(true));
+        let other_by_key = svc
+            .file_get_attachment_info_by_key(other_ws.clone(), "key-A".to_string())
+            .await
+            .expect("lookup other ws");
+        assert_eq!(other_by_key["attachmentId"], other["attachmentId"]);
+        let unknown = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-nope".to_string())
+            .await;
+        match unknown {
+            Err(Error::InvalidParams(m)) => {
+                assert!(m.contains("unknown idempotency key"), "{m}");
+            }
+            other => panic!("expected unknown key, got {other:?}"),
+        }
+
+        // Key validation: empty / padded / oversized keys are rejected.
+        for bad in ["", " key", "key ", &"k".repeat(129)] {
+            let res = svc
+                .file_place_attachment(
+                    ws.clone(),
+                    "v.txt".to_string(),
+                    Some(b64(b"v")),
+                    None,
+                    None,
+                    Some(bad.to_string()),
+                )
+                .await;
+            assert!(
+                matches!(res, Err(Error::InvalidParams(_))),
+                "{bad:?}: {res:?}"
+            );
+        }
+        let empty_lookup = svc
+            .file_get_attachment_info_by_key(ws.clone(), String::new())
+            .await;
+        assert!(matches!(empty_lookup, Err(Error::InvalidParams(_))));
+
+        // `sourcePath` arm: `(fileName, size)` fingerprint — same name and
+        // size replays even when the bytes differ; a different size conflicts.
+        let src = dir.join("src-a.bin");
+        std::fs::write(&src, b"AAAA").unwrap();
+        let sp_first = svc
+            .file_place_attachment(
+                ws.clone(),
+                "copied.bin".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+                None,
+                Some("key-SP".to_string()),
+            )
+            .await
+            .expect("sourcePath place");
+        std::fs::write(&src, b"BBBB").unwrap();
+        let sp_replay = svc
+            .file_place_attachment(
+                ws.clone(),
+                "copied.bin".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+                None,
+                Some("key-SP".to_string()),
+            )
+            .await
+            .expect("sourcePath replay");
+        assert_eq!(sp_replay["replayed"], serde_json::json!(true));
+        assert_eq!(sp_replay["attachmentId"], sp_first["attachmentId"]);
+        std::fs::write(&src, b"CCCCC").unwrap();
+        let sp_conflict = svc
+            .file_place_attachment(
+                ws.clone(),
+                "copied.bin".to_string(),
+                None,
+                Some(src.to_string_lossy().into_owned()),
+                None,
+                Some("key-SP".to_string()),
+            )
+            .await;
+        assert!(
+            matches!(sp_conflict, Err(Error::InvalidParams(_))),
+            "{sp_conflict:?}"
+        );
+        // A missing source under a key still classifies as the source error.
+        let sp_missing = svc
+            .file_place_attachment(
+                ws.clone(),
+                "gone.bin".to_string(),
+                None,
+                Some(dir.join("gone.bin").to_string_lossy().into_owned()),
+                None,
+                Some("key-GONE".to_string()),
+            )
+            .await;
+        match sp_missing {
+            Err(Error::InvalidParams(m)) => assert!(m.contains("does not exist"), "{m}"),
+            other => panic!("expected source error, got {other:?}"),
+        }
+
+        // Daemon restart: the binding lives in the store, so a reopened
+        // service stack replays it.
+        drop(svc);
+        let store = Store::open(&tmp.path).await.expect("reopen store");
+        let svc = Services::new(store);
+        let after_restart = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("replay after restart");
+        assert_eq!(after_restart, expected);
+        assert_eq!(
+            attachments(&dir),
+            vec!["copied.bin", "plain.txt", "report.txt"]
+        );
+
+        // Expiry: back-date the binding past the 7-day retention. The next
+        // keyed call sweeps it and places afresh (collision-suffixed, new
+        // id, no `replayed`); the key now resolves to the new row.
+        sqlx::query("UPDATE attachment_idempotency_keys SET created_at = ? WHERE key = ?")
+            .bind(intent_core::iso_minutes_ago(8 * 24 * 60))
+            .bind("key-A")
+            .execute(svc.store().write_pool())
+            .await
+            .expect("back-date binding");
+        let expired_lookup = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-A".to_string())
+            .await;
+        assert!(
+            matches!(expired_lookup, Err(Error::InvalidParams(_))),
+            "{expired_lookup:?}"
+        );
+        let fresh = svc
+            .file_place_attachment(
+                ws.clone(),
+                "report.txt".to_string(),
+                Some(b64(b"report v1")),
+                None,
+                Some("text/plain".to_string()),
+                Some("key-A".to_string()),
+            )
+            .await
+            .expect("place after expiry");
+        assert!(fresh.get("replayed").is_none(), "{fresh}");
+        assert_ne!(fresh["attachmentId"], serde_json::json!(first_id));
+        assert_eq!(fresh["fileName"], serde_json::json!("report-2.txt"));
+        let rebound = svc
+            .file_get_attachment_info_by_key(ws.clone(), "key-A".to_string())
+            .await
+            .expect("lookup rebound key");
+        assert_eq!(rebound["attachmentId"], fresh["attachmentId"]);
+        // The original row is untouched by the sweep.
+        let original = svc
+            .file_get_attachment_info(first_id)
+            .await
+            .expect("original row survives");
+        assert_eq!(original["fileName"], serde_json::json!("report.txt"));
+    }
+
+    /// Concurrent same-key placements (intent-hq/intent#4691) yield exactly
+    /// one registry row and one file: the per-`(workspace, key)` in-flight
+    /// guard serializes the callers, so one places and the rest replay.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_place_attachment_idempotency_key_concurrent_callers_yield_one_row() {
+        use base64::Engine as _;
+
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        let dir_guard = test_tempdir("intentd-attidem-race-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
+        let mut w = workspace(&ws);
+        w.worktree_path = Some(dir.to_string_lossy().into_owned());
+        store.insert_workspace(&w).await.expect("ws");
+        let svc = std::sync::Arc::new(Services::new(store));
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"racing bytes");
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let svc = svc.clone();
+            let ws = ws.clone();
+            let b64 = b64.clone();
+            handles.push(tokio::spawn(async move {
+                svc.file_place_attachment(
+                    ws,
+                    "race.bin".to_string(),
+                    Some(b64),
+                    None,
+                    None,
+                    Some("key-race".to_string()),
+                )
+                .await
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.expect("join").expect("keyed place"));
+        }
+
+        let ids: std::collections::BTreeSet<String> = results
+            .iter()
+            .map(|r| r["attachmentId"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 1, "{results:?}");
+        let placed = results
+            .iter()
+            .filter(|r| r.get("replayed").is_none())
+            .count();
+        assert_eq!(placed, 1, "exactly one caller places: {results:?}");
+        assert!(
+            results
+                .iter()
+                .filter(|r| r["replayed"] == serde_json::json!(true))
+                .count()
+                == 7,
+            "{results:?}"
+        );
+        for r in &results {
+            assert_eq!(r["fileName"], serde_json::json!("race.bin"), "{r}");
+        }
+        let files: Vec<String> = std::fs::read_dir(dir.join(".intent/attachments"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".gitignore")
+            .collect();
+        assert_eq!(files, vec!["race.bin"]);
+        // The in-flight registry is drained once every caller has released.
+        assert!(svc
+            .attachment_idempotency_inflight
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     /// `ws.file.getAttachment` backing op: copies the registered file into
@@ -28036,9 +30446,8 @@ mod file_ops_service {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
-        let dir = std::env::temp_dir().join(format!("intentd-attget-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir = std::fs::canonicalize(&dir).unwrap();
+        let dir_guard = test_tempdir("intentd-attget-");
+        let dir = std::fs::canonicalize(dir_guard.path()).unwrap();
         let mut w = workspace(&ws);
         w.worktree_path = Some(dir.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.expect("ws");
@@ -28051,6 +30460,7 @@ mod file_ops_service {
                 Some(base64::engine::general_purpose::STANDARD.encode(b"pdf bytes")),
                 None,
                 Some("application/pdf".to_string()),
+                None,
             )
             .await
             .expect("place");
@@ -28120,8 +30530,6 @@ mod file_ops_service {
         }
         // No partial copy left behind.
         assert!(!dir.join("elsewhere/spec.pdf").exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Containment: a tampered registry row (escaping `stored_path` or
@@ -28134,7 +30542,10 @@ mod file_ops_service {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
-        let dir = std::env::temp_dir().join(format!("intentd-atttamper-{}", uuid::Uuid::new_v4()));
+        // The workspace root is a child of the swept tempdir so the escape
+        // targets below (siblings of the root) are swept with it.
+        let base = test_tempdir("intentd-atttamper-");
+        let dir = base.path().join("ws");
         std::fs::create_dir_all(&dir).unwrap();
         let dir = std::fs::canonicalize(&dir).unwrap();
         let mut w = workspace(&ws);
@@ -28142,10 +30553,7 @@ mod file_ops_service {
         store.insert_workspace(&w).await.expect("ws");
 
         // A file OUTSIDE the workspace root that a tampered row points at.
-        let outside = dir.parent().unwrap().join(format!(
-            "intentd-atttamper-outside-{}.txt",
-            uuid::Uuid::new_v4()
-        ));
+        let outside = dir.parent().unwrap().join("outside.txt");
         std::fs::write(&outside, b"secret").unwrap();
 
         let escaping = intent_store::AttachmentRecord {
@@ -28222,12 +30630,9 @@ mod file_ops_service {
             Err(Error::NotFound(msg)) => assert!(msg.contains("unknown attachment id"), "{msg}"),
             other => panic!("expected NotFound, got {other:?}"),
         }
-
-        let _ = std::fs::remove_file(&outside);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Containment integration test: delegate an agent with isolation=cow, perform a
     /// file write through the agent-scoped ops path (`caller_agent_id` → `resolve_root`),
     /// and assert the write landed in the sandbox and the user's directory is untouched.
@@ -28404,6 +30809,7 @@ mod file_ops_service {
                     Some(base64::engine::general_purpose::STANDARD.encode(b"# brief")),
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("place attachment");
@@ -28432,7 +30838,7 @@ mod file_ops_service {
         let _ = fs::remove_dir_all(&test_root);
     }
 
-    #[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Wire-contract test: agent.delegate returns effectiveIsolation "pending"
     /// when an eligible `CoW` provisioning kicks off (monorepo#871 — the clone
     /// runs in a background task, off the delegate critical path). The settled
@@ -29845,36 +32251,48 @@ mod clone_orchestration {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use intent_core::{WorkspaceApi, WorkspaceCreate};
+    use intent_core::{WorkspaceApi, WorkspaceCreate, WorkspaceId};
     use intent_store::Store;
 
-    use super::TempDb;
-    use crate::{EventBus, Services, SubscriptionFilter};
+    use super::{test_tempdir, TempDb};
+    use crate::{Error, EventBus, Services, SubscriptionFilter};
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Init a small git repo with one commit; returns the guard.
     fn seed_repo(prefix: &str) -> TempDir {
         let dir = unique_dir(prefix);
-        let repo = git2::Repository::init(&dir.0).unwrap();
+        seed_repo_at(&dir.0);
+        dir
+    }
+
+    /// Init a small git repo at `<tmp>/Mixed-Owner/Mixed-Repo`: explicitly
+    /// mixed-case owner/repo segments so the raw `file://` pair always
+    /// differs from the case-folded cache slot, regardless of the tempdir's
+    /// random suffix. Returns the guard and the repo path.
+    fn seed_mixed_case_repo(prefix: &str) -> (TempDir, PathBuf) {
+        let dir = unique_dir(prefix);
+        let repo_dir = dir.0.join("Mixed-Owner").join("Mixed-Repo");
+        seed_repo_at(&repo_dir);
+        (dir, repo_dir)
+    }
+
+    /// Init a small git repo with one commit at `dir` (created if missing).
+    fn seed_repo_at(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let repo = git2::Repository::init(dir).unwrap();
         {
             let mut cfg = repo.config().unwrap();
             cfg.set_str("user.name", "Tester").unwrap();
             cfg.set_str("user.email", "t@e.dev").unwrap();
         }
-        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
+        std::fs::write(dir.join("README.md"), "init\n").unwrap();
         let mut index = repo.index().unwrap();
         index
             .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
@@ -29884,7 +32302,6 @@ mod clone_orchestration {
         let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
         repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
             .unwrap();
-        dir
     }
 
     async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
@@ -29899,11 +32316,28 @@ mod clone_orchestration {
         types
     }
 
+    /// Expected `<root>/.repo-cache/<owner>/<repo>` slot for `url`. The cache
+    /// key comes from the host-agnostic URL parse and is folded by the same
+    /// `cache_path_for` helper the daemon uses; persisted owner/name do not
+    /// (only strict `github.com` URLs seed them), so tests must not derive
+    /// the slot from the workspace row.
+    fn expected_cache_dir(root: &std::path::Path, url: &str) -> PathBuf {
+        let (owner, repo) = intent_core::GitRemoteUrl::parse(url)
+            .and_then(|u| u.repo_slug())
+            .expect("owner/repo")
+            .identity_parts();
+        intent_git::repo_cache::cache_path_for(
+            &intent_git::repo_cache::cache_root_for(root),
+            &owner,
+            &repo,
+        )
+    }
+
     /// `githubUrl` → daemon clones via `file://` (fast, hermetic), sets
     /// `repositoryPath` to the clone target, and streams `git:clone:progress`
     /// + `git:clone:done` under the new workspace id before the row insert
     /// and `workspace:created`. Owner/name derivation from a real GitHub URL
-    /// is covered by `clone_ops::tests::parse_owner_repo_handles_https_and_ssh`.
+    /// is covered by `intent_core::git_remote_url` goldens.
     #[tokio::test]
     async fn create_clones_github_url_before_worktree() {
         let source = seed_repo("intentd-clone-src");
@@ -29955,6 +32389,119 @@ mod clone_orchestration {
         assert!(
             done_pos < ws_pos,
             "clone completes before workspace insert: {types:?}"
+        );
+    }
+
+    /// A non-`github.com` clone URL whose path happens to end in
+    /// `<owner>/<repo>` must not persist a GitHub identity: the
+    /// `crossWorkspace.*` sibling predicate trusts owner/name as GitHub
+    /// provenance, so a `file://…/acme/widget.git` (or GitLab) clone at a
+    /// distinct path must not become a sibling of `github.com/acme/widget`.
+    /// Exercised on both create paths — explicit `clonePath` and the
+    /// self-contained repo-cache hydration.
+    #[tokio::test]
+    async fn non_github_url_clone_is_not_sibling_of_github_identity() {
+        let parent = unique_dir("intentd-nongh-src");
+        let source = parent.0.join("acme").join("widget.git");
+        seed_repo_at(&source);
+        let url = format!("file://{}", source.to_string_lossy());
+        // Sanity: the host-agnostic parse (cache key) does yield acme/widget,
+        // so the persisted row must be distinguishing on the host alone.
+        assert_eq!(
+            intent_core::GitRemoteUrl::parse(&url).and_then(|u| u.repo_slug()),
+            Some(intent_core::RepoRef::new("acme", "widget"))
+        );
+
+        let root = unique_dir("intentd-nongh-root");
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let github = WorkspaceId::from("ws-github");
+        let mut gh = super::workspace(&github);
+        gh.repository_path = Some("/root/ws-github/widget".to_string());
+        gh.repository_owner = Some("acme".to_string());
+        gh.repository_name = Some("widget".to_string());
+        store.insert_workspace(&gh).await.unwrap();
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_event_bus(bus);
+
+        let clone_target = unique_dir("intentd-nongh-target");
+        let explicit = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    clone_path: Some(
+                        clone_target
+                            .0
+                            .join("checkout")
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create with clonePath")
+            .workspace;
+        let hydrated = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    github_url: Some(url.clone()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create via repo cache")
+            .workspace;
+
+        for (label, ws) in [("clonePath", &explicit), ("cache", &hydrated)] {
+            assert_eq!(
+                ws.repository_owner, None,
+                "{label}: non-github URL must not seed repositoryOwner"
+            );
+            assert_ne!(
+                ws.repository_path.as_deref(),
+                gh.repository_path.as_deref(),
+                "{label}: distinct checkout path"
+            );
+            let v = svc
+                .cross_workspace_list_siblings(ws.id.clone())
+                .await
+                .expect("siblings");
+            let ids: Vec<&str> = v
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|s| s["id"].as_str().unwrap())
+                .collect();
+            assert!(
+                !ids.contains(&"ws-github"),
+                "{label}: github workspace listed as sibling: {ids:?}"
+            );
+            for (from, to) in [
+                (ws.id.clone(), github.clone()),
+                (github.clone(), ws.id.clone()),
+            ] {
+                let err = svc
+                    .cross_workspace_list_notes(from, to)
+                    .await
+                    .expect_err("denied");
+                match err {
+                    Error::Internal(m) => assert!(m.contains("Access denied"), "{label}: {m}"),
+                    other => panic!("{label}: expected Internal, got {other:?}"),
+                }
+            }
+        }
+        let v = svc
+            .cross_workspace_list_siblings(github)
+            .await
+            .expect("siblings");
+        assert!(
+            v.as_array().expect("array").is_empty(),
+            "github workspace has no siblings: {v}"
         );
     }
 
@@ -30095,10 +32642,11 @@ mod clone_orchestration {
 
     /// Cache miss: the first `githubUrl`-only create clones into the repo
     /// cache, hydrates a standalone checkout, streams `git:clone:*` frames
-    /// before `workspace:created`, and derives owner/name from the URL.
+    /// before `workspace:created`. A non-`github.com` URL keys the cache but
+    /// does not seed `repositoryOwner` (basename fallback still names the row).
     #[tokio::test]
     async fn create_hydrates_from_cache_on_miss() {
-        let source = seed_repo("intentd-hydrate-src");
+        let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate-src");
         let root = unique_dir("intentd-hydrate-root");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30108,7 +32656,7 @@ mod clone_orchestration {
             .with_event_bus(bus.clone());
         let mut sub = bus.subscribe(SubscriptionFilter::default());
 
-        let url = format!("file://{}", source.0.to_string_lossy());
+        let url = format!("file://{}", source_dir.to_string_lossy());
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -30134,19 +32682,21 @@ mod clone_orchestration {
             persisted.execution_environment, ws.execution_environment,
             "derived executionEnvironment round-trips through the store"
         );
-        // Owner/name derived from the URL (file:// → last two segments).
-        assert!(ws.repository_owner.is_some(), "owner derived from URL");
+        // A `file://` URL is not a GitHub identity: owner stays unset; name
+        // falls back to the checkout basename (the slugged URL last segment).
+        assert_eq!(
+            ws.repository_owner, None,
+            "non-github URL must not seed repositoryOwner"
+        );
+        let checkout = PathBuf::from(ws.repository_path.as_deref().unwrap());
         assert_eq!(
             ws.repository_name.as_deref(),
-            source.0.file_name().map(|n| n.to_str().unwrap()),
-            "name derived from URL"
+            checkout.file_name().map(|n| n.to_str().unwrap()),
+            "name falls back to the checkout basename"
         );
-        // The cache exists at `<root>/.repo-cache/<owner>/<repo>`.
-        let cache = root
-            .0
-            .join(".repo-cache")
-            .join(ws.repository_owner.as_deref().unwrap())
-            .join(ws.repository_name.as_deref().unwrap());
+        // The cache exists at `<root>/.repo-cache/<owner>/<repo>`, keyed by
+        // the host-agnostic URL parse.
+        let cache = expected_cache_dir(&root.0, &url);
         assert!(cache.join(".git").exists(), "repo cache populated");
         // The clone event stream ran before the workspace insert.
         let types = drain_event_types(&mut sub).await;
@@ -30168,7 +32718,7 @@ mod clone_orchestration {
     /// and hydrates a second, independent checkout.
     #[tokio::test]
     async fn second_create_hydrates_from_refreshed_cache_without_reclone() {
-        let source = seed_repo("intentd-hydrate2-src");
+        let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate2-src");
         let root = unique_dir("intentd-hydrate2-root");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30177,7 +32727,7 @@ mod clone_orchestration {
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
-        let url = format!("file://{}", source.0.to_string_lossy());
+        let url = format!("file://{}", source_dir.to_string_lossy());
         let ws1 = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -30189,11 +32739,7 @@ mod clone_orchestration {
             .await
             .expect("first create")
             .workspace;
-        let cache = root
-            .0
-            .join(".repo-cache")
-            .join(ws1.repository_owner.as_deref().unwrap())
-            .join(ws1.repository_name.as_deref().unwrap());
+        let cache = expected_cache_dir(&root.0, &url);
         let marker = cache.join(".git").join("intent-cache-marker");
         std::fs::write(&marker, "keep").unwrap();
 
@@ -30400,7 +32946,7 @@ mod clone_orchestration {
             "worktree is distinct from the cloned repo"
         );
         assert!(
-            !root.0.join(".repo-cache").exists(),
+            !intent_git::repo_cache::cache_root_for(&root.0).exists(),
             "explicit clonePath must not touch the repo cache"
         );
     }
@@ -30410,7 +32956,7 @@ mod clone_orchestration {
     /// untouched for future creates.
     #[tokio::test]
     async fn delete_hydrated_workspace_removes_checkout_keeps_cache() {
-        let source = seed_repo("intentd-hydrate-del-src");
+        let (_source, source_dir) = seed_mixed_case_repo("intentd-hydrate-del-src");
         let root = unique_dir("intentd-hydrate-del-root");
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -30419,7 +32965,7 @@ mod clone_orchestration {
             .with_workspaces_root(root.0.clone())
             .with_event_bus(bus.clone());
 
-        let url = format!("file://{}", source.0.to_string_lossy());
+        let url = format!("file://{}", source_dir.to_string_lossy());
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -30432,11 +32978,7 @@ mod clone_orchestration {
             .expect("create")
             .workspace;
         let checkout = PathBuf::from(ws.repository_path.as_deref().unwrap());
-        let cache = root
-            .0
-            .join(".repo-cache")
-            .join(ws.repository_owner.as_deref().unwrap())
-            .join(ws.repository_name.as_deref().unwrap());
+        let cache = expected_cache_dir(&root.0, &url);
         assert!(checkout.exists() && cache.exists());
 
         svc.delete_workspace(ws.id.clone()).await.expect("delete");
@@ -30978,26 +33520,30 @@ mod repo_warm_cache {
     use std::time::Duration;
 
     use intent_core::{Error, WorkspaceApi};
+    use intent_git::repo_cache::{cache_path_for, cache_root_for};
     use intent_store::Store;
 
-    use super::TempDb;
+    use super::{test_tempdir, TempDb};
     use crate::Services;
 
-    /// Drop guard removing a temp directory tree.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Temp directory tree swept on drop (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     fn unique_dir(prefix: &str) -> TempDir {
-        let p = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
+        let guard = test_tempdir(&format!("{prefix}-"));
+        TempDir(guard.path().to_path_buf(), guard)
     }
 
-    /// Init a small git repo with one commit; returns the guard.
+    /// The on-disk cache slot for `owner`/`repo`: the daemon case-folds both
+    /// segments while the warm result echoes the raw case, so derive the
+    /// slot through the daemon's own `cache_path_for` rather than joining.
+    fn cache_slot(root: &std::path::Path, owner: &str, repo: &str) -> PathBuf {
+        cache_path_for(&cache_root_for(root), owner, repo)
+    }
+
+    /// Init a small git repo with one commit; returns the guard. Pass a
+    /// mixed-case `prefix` so the repo segment (the dir name) always differs
+    /// from its case-folded cache slot.
     fn seed_repo(prefix: &str) -> TempDir {
         let dir = unique_dir(prefix);
         let repo = git2::Repository::init(&dir.0).unwrap();
@@ -31033,10 +33579,11 @@ mod repo_warm_cache {
         loop {
             match svc.repo_warm_cache(url.to_string()).await {
                 Ok(v) => {
-                    let cache = root
-                        .join(".repo-cache")
-                        .join(v["owner"].as_str().unwrap())
-                        .join(v["repo"].as_str().unwrap());
+                    let cache = cache_slot(
+                        root,
+                        v["owner"].as_str().unwrap(),
+                        v["repo"].as_str().unwrap(),
+                    );
                     // The accepted re-warm proves the flag cleared; the
                     // populated cache proves the first ensure ran.
                     assert!(cache.join(".git").exists(), "repo cache populated");
@@ -31059,7 +33606,7 @@ mod repo_warm_cache {
     /// in-flight flag so a later warm is accepted again.
     #[tokio::test]
     async fn warm_starts_populates_cache_and_clears_flag() {
-        let source = seed_repo("intentd-warm-src");
+        let source = seed_repo("Intentd-Warm-Src");
         let root = unique_dir("intentd-warm-root");
         let (svc, _db) = services_with_root(&root).await;
 
@@ -31088,16 +33635,18 @@ mod repo_warm_cache {
     /// while the lock holder runs on the blocking pool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn second_warm_rejected_while_in_flight() {
-        let source = seed_repo("intentd-warm-busy-src");
+        let source = seed_repo("Intentd-Warm-Busy-Src");
         let root = unique_dir("intentd-warm-busy-root");
         let (svc, _db) = services_with_root(&root).await;
 
         let url = format!("file://{}", source.0.to_string_lossy());
-        let (owner, repo) = crate::clone_ops::parse_owner_repo(&url).unwrap();
-        let cache_path = root.0.join(".repo-cache").join(&owner).join(&repo);
+        let slot = intent_core::GitRemoteUrl::parse(&url)
+            .and_then(|u| u.repo_slug())
+            .unwrap();
+        let cache_path = cache_slot(&root.0, &slot.owner, &slot.name);
 
-        // Park the warm's ensure behind the per-repo cache lock so the
-        // in-flight window is deterministic.
+        // Park the warm's ensure behind the per-repo cache lock (keyed by
+        // the case-folded slot) so the in-flight window is deterministic.
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
         let lock_holder = tokio::spawn(async move {
@@ -31121,8 +33670,8 @@ mod repo_warm_cache {
                 owner: busy_owner,
                 repo: busy_repo,
             }) => {
-                assert_eq!(busy_owner, owner, "busy error names the warming owner");
-                assert_eq!(busy_repo, repo, "busy error names the warming repo");
+                assert_eq!(busy_owner, slot.owner, "busy error names the warming owner");
+                assert_eq!(busy_repo, slot.name, "busy error names the warming repo");
             }
             other => panic!("expected WarmInFlight, got {other:?}"),
         }
@@ -31260,19 +33809,6 @@ mod line_attribution_hooks {
         .expect("comment.add");
         assert_debouncer_scheduled(&svc, &ws, &id);
     }
-
-    #[tokio::test]
-    async fn spawn_crdt_session_sweep_loop_returns_abortable_handle() {
-        let (_tmp, svc, _ws, _id) = setup("").await;
-        let handle = svc.spawn_crdt_session_sweep_loop();
-        assert!(!handle.is_finished(), "sweep loop should stay running");
-        handle.abort();
-        let joined = handle.await;
-        assert!(
-            matches!(&joined, Err(e) if e.is_cancelled()),
-            "aborted sweep loop must join with a cancellation error: {joined:?}",
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -31282,17 +33818,18 @@ mod browser_exec_reverse {
     use std::sync::{Arc, Mutex};
 
     use intent_core::{
-        AgentReverseDispatch, BoxFuture, Error, ReverseDispatchError, WorkspaceApi, WorkspaceId,
+        AgentReverseDispatch, BoxFuture, ClientHostInfo, ClientId, Error, ReverseDispatchError,
+        ReverseTarget, WorkspaceApi, WorkspaceId,
     };
     use intent_store::Store;
     use serde_json::{json, Value};
 
-    use super::{TempDb, WorkspacesRoot};
+    use super::{workspace, TempDb, WorkspacesRoot};
     use crate::Services;
 
     #[derive(Default)]
     struct RecordingDispatch {
-        calls: Mutex<Vec<(String, Value)>>,
+        calls: Mutex<Vec<(String, Value, ReverseTarget)>>,
         reply: Mutex<Option<Value>>,
         err: Mutex<Option<ReverseDispatchError>>,
     }
@@ -31318,11 +33855,12 @@ mod browser_exec_reverse {
             &'a self,
             method: &'a str,
             params: Value,
+            target: ReverseTarget,
         ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
             self.calls
                 .lock()
                 .unwrap()
-                .push((method.to_string(), params.clone()));
+                .push((method.to_string(), params.clone(), target));
             let reply = self.reply.lock().unwrap().clone();
             let err = self.err.lock().unwrap().clone();
             Box::pin(async move {
@@ -31334,16 +33872,47 @@ mod browser_exec_reverse {
         }
     }
 
+    /// Services over a store that knows workspace `ws-1` and the hello'd
+    /// client `desktop-a` (both are foreign keys of a registry tab row).
     async fn services_with(
         dispatch: Arc<dyn AgentReverseDispatch>,
     ) -> (TempDb, WorkspacesRoot, Services) {
         let tmp = TempDb::new();
         let root = WorkspacesRoot::new();
         let store = Store::open(&tmp.path).await.expect("open store");
+        store
+            .insert_workspace(&workspace(&WorkspaceId::from("ws-1")))
+            .await
+            .expect("ws");
+        store
+            .upsert_client(
+                &ClientId::from_string("desktop-a"),
+                Some("Desktop A"),
+                Some(&json!({ "browserExec": true })),
+                &ClientHostInfo::default(),
+            )
+            .await
+            .expect("client");
         let svc = Services::new(store)
             .with_workspaces_root(root.path().to_path_buf())
             .with_reverse_dispatch(dispatch);
         (tmp, root, svc)
+    }
+
+    /// Register an open, unclaimed `tab_id` of `ws-1` hosted by `host`, the
+    /// way the host's own `browser.upsertTab` report would.
+    async fn register_tab(svc: &Services, tab_id: &str, host: &str) {
+        svc.browser_upsert_tab(
+            ClientId::from_string(host),
+            serde_json::from_value(json!({
+                "tabId": tab_id,
+                "workspaceId": "ws-1",
+                "url": "https://a.test/",
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("tab registered");
     }
 
     #[tokio::test]
@@ -31355,7 +33924,7 @@ mod browser_exec_reverse {
         let err = svc
             .browser_exec(
                 WorkspaceId::from("ws-1"),
-                vec![json!({"action":"listTabs"})],
+                vec![json!({"action":"screenshot"})],
                 None,
                 None,
             )
@@ -31368,19 +33937,20 @@ mod browser_exec_reverse {
     async fn browser_exec_forwards_actions_and_returns_single_result_envelope() {
         let dispatch = RecordingDispatch::with_reply(json!({
             "success": true,
-            "results": [{ "action": "listTabs", "success": true, "result": [] }],
+            "results": [{ "action": "screenshot", "success": true, "result": {} }],
         }));
         let (_tmp, _root, svc) = services_with(dispatch.clone()).await;
+        register_tab(&svc, "tab-1", "desktop-a").await;
         let out = svc
             .browser_exec(
                 WorkspaceId::from("ws-1"),
-                vec![json!({ "action": "listTabs" })],
+                vec![json!({ "action": "screenshot" })],
                 Some("tab-1".to_string()),
                 None,
             )
             .await
             .expect("ok");
-        assert_eq!(out["action"], "listTabs");
+        assert_eq!(out["action"], "screenshot");
         assert_eq!(out["success"], true);
         let calls = dispatch.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
@@ -31391,6 +33961,87 @@ mod browser_exec_reverse {
         // into the forwarded reverse-RPC params so the FE sees the same
         // envelope shape the client-triggered `browser.exec` path emits.
         assert_eq!(calls[0].1["workspaceId"], "ws-1");
+        // REV-2 Model 10: an unpinned workspace whose only tab is unclaimed
+        // has no driving client yet — the first-connected eligible client
+        // is asked (the pin / claimed-host cases live in `browser_routing`).
+        assert_eq!(calls[0].2, ReverseTarget::Default);
+    }
+
+    /// REV-2 Model 5: every `tabId` an agent batch names must be an open
+    /// registry tab of the calling workspace; nothing is forwarded otherwise.
+    #[tokio::test]
+    async fn browser_exec_rejects_unknown_or_foreign_tab_ids_before_forwarding() {
+        let dispatch = RecordingDispatch::with_reply(json!({ "success": true, "results": [] }));
+        let (_tmp, _root, svc) = services_with(dispatch.clone()).await;
+        register_tab(&svc, "tab-1", "desktop-a").await;
+        for (actions, tab_id, missing) in [
+            (
+                vec![json!({ "action": "screenshot" })],
+                Some("ghost"),
+                "ghost",
+            ),
+            (
+                vec![json!({ "action": "closeTab", "tabId": "ghost" })],
+                None,
+                "ghost",
+            ),
+            (
+                vec![
+                    json!({ "action": "screenshot", "tabId": "tab-1" }),
+                    json!({ "action": "closeTab", "tabId": "ghost" }),
+                ],
+                None,
+                "ghost",
+            ),
+        ] {
+            let err = svc
+                .browser_exec(
+                    WorkspaceId::from("ws-1"),
+                    actions,
+                    tab_id.map(str::to_string),
+                    None,
+                )
+                .await
+                .expect_err("unknown tab");
+            assert!(
+                matches!(&err, Error::InvalidParams(m) if m == &format!("browser.exec: tab not found: {missing}")),
+                "{err:?}"
+            );
+        }
+        // A registered tab of ANOTHER workspace is equally unknown here.
+        let err = svc
+            .browser_exec(
+                WorkspaceId::from("ws-2"),
+                vec![json!({ "action": "screenshot" })],
+                Some("tab-1".to_string()),
+                None,
+            )
+            .await
+            .expect_err("foreign tab");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("tab not found: tab-1")));
+        assert!(dispatch.calls.lock().unwrap().is_empty());
+    }
+
+    /// REV-2 Model 5: `listTabs` is answered from the registry, so it never
+    /// shares a batch with FE-executed actions.
+    #[tokio::test]
+    async fn browser_exec_rejects_list_tabs_mixed_with_other_actions() {
+        let dispatch = RecordingDispatch::with_reply(json!({ "success": true, "results": [] }));
+        let (_tmp, _root, svc) = services_with(dispatch.clone()).await;
+        let err = svc
+            .browser_exec(
+                WorkspaceId::from("ws-1"),
+                vec![
+                    json!({ "action": "listTabs" }),
+                    json!({ "action": "screenshot" }),
+                ],
+                None,
+                None,
+            )
+            .await
+            .expect_err("mixed batch");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("listTabs")));
+        assert!(dispatch.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -31416,7 +34067,7 @@ mod browser_exec_reverse {
         let err = svc
             .browser_exec(
                 WorkspaceId::from("ws-1"),
-                vec![json!({ "action": "listTabs" })],
+                vec![json!({ "action": "screenshot" })],
                 None,
                 None,
             )
@@ -31442,6 +34093,7 @@ mod browser_exec_reverse {
             }],
         }));
         let (_tmp, _root, svc) = services_with(dispatch).await;
+        register_tab(&svc, "tab-9", "desktop-a").await;
         let out = svc
             .browser_exec(
                 WorkspaceId::from("ws-1"),
@@ -31463,7 +34115,7 @@ mod browser_exec_reverse {
             "success": false,
             "error": "1 of 2 actions failed",
             "results": [
-                { "action": "listTabs", "success": true, "result": [] },
+                { "action": "screenshot", "success": true, "result": {} },
                 {
                     "action": "claimTab",
                     "success": false,
@@ -31474,11 +34126,12 @@ mod browser_exec_reverse {
             ],
         }));
         let (_tmp, _root, svc) = services_with(dispatch).await;
+        register_tab(&svc, "tab-3", "desktop-a").await;
         let out = svc
             .browser_exec(
                 WorkspaceId::from("ws-1"),
                 vec![
-                    json!({ "action": "listTabs" }),
+                    json!({ "action": "screenshot" }),
                     json!({ "action": "claimTab", "tabId": "tab-3", "width": 1280 }),
                 ],
                 None,
@@ -31511,13 +34164,14 @@ mod browser_exec_reverse {
             }],
         }));
         let (_tmp, _root, svc) = services_with(dispatch).await;
+        register_tab(&svc, "tab-9", "desktop-a").await;
         let out = svc
             .browser_exec(
                 WorkspaceId::from("ws-1"),
                 vec![
                     json!({ "action": "resizeTab", "tabId": "tab-9", "width": 375 }),
                     json!({ "action": "screenshot" }),
-                    json!({ "action": "listTabs" }),
+                    json!({ "action": "getAccessibilityTree" }),
                 ],
                 None,
                 None,
@@ -31541,13 +34195,1510 @@ mod browser_exec_reverse {
         let err = svc
             .browser_exec(
                 WorkspaceId::from("ws-1"),
-                vec![json!({ "action": "listTabs" })],
+                vec![json!({ "action": "screenshot" })],
                 None,
                 None,
             )
             .await
             .expect_err("no per-action detail to preserve");
         assert!(matches!(err, Error::Internal(m) if m.contains("CDP not attached")));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REV-2: per-workspace browser-client pin — `client.list`,
+// `workspace.getBrowserClient` / `setBrowserClient`, and the target
+// `browser_exec` dispatches with (unpinned / pinned live / pinned offline /
+// no eligible client).
+// ---------------------------------------------------------------------------
+mod browser_client_pin {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use intent_core::{
+        AgentReverseDispatch, BoxFuture, ClientHostInfo, ClientId, Error, ResolvedClient,
+        ReverseDispatchError, ReverseLiveClient, ReverseTarget, WorkspaceApi, WorkspaceId,
+        CHIEF_WORKSPACE_ID,
+    };
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{EventBus, Services, SubscriptionFilter};
+
+    /// A dispatcher with a fixed set of live clients: `browser_exec == true`
+    /// entries are eligible. `Default` resolves to the first eligible
+    /// client; `Client` / `Pinned` to the named client when eligible. Every
+    /// dispatch is answered with a success envelope echoing the first
+    /// action's name and the resolved host, so tests can see who was asked.
+    pub(super) struct FakeRegistry {
+        clients: Vec<(ClientId, Option<String>, bool)>,
+        pub(super) calls: Mutex<Vec<(String, Value, ReverseTarget)>>,
+    }
+
+    impl FakeRegistry {
+        pub(super) fn new(clients: &[(&str, Option<&str>, bool)]) -> Arc<Self> {
+            Arc::new(Self {
+                clients: clients
+                    .iter()
+                    .map(|(id, name, eligible)| {
+                        (
+                            ClientId::from_string(*id),
+                            name.map(str::to_string),
+                            *eligible,
+                        )
+                    })
+                    .collect(),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl AgentReverseDispatch for FakeRegistry {
+        fn is_connected(&self) -> bool {
+            self.clients.iter().any(|c| c.2)
+        }
+        fn resolve(&self, target: &ReverseTarget) -> Result<ResolvedClient, ReverseDispatchError> {
+            let found = match target {
+                ReverseTarget::Default => self.clients.iter().find(|c| c.2),
+                ReverseTarget::Client(id) | ReverseTarget::Pinned(id) => {
+                    self.clients.iter().find(|c| &c.0 == id && c.2)
+                }
+            };
+            match (found, target) {
+                (Some(c), _) => Ok(ResolvedClient {
+                    client_id: c.0.clone(),
+                    name: c.1.clone(),
+                }),
+                (None, ReverseTarget::Default) => Err(ReverseDispatchError::NoClient),
+                (None, ReverseTarget::Client(id) | ReverseTarget::Pinned(id)) => {
+                    Err(ReverseDispatchError::ClientOffline {
+                        client_id: id.clone(),
+                        name: self
+                            .clients
+                            .iter()
+                            .find(|c| &c.0 == id)
+                            .and_then(|c| c.1.clone()),
+                        pinned: matches!(target, ReverseTarget::Pinned(_)),
+                    })
+                }
+            }
+        }
+        fn live_clients(&self) -> Vec<ReverseLiveClient> {
+            self.clients
+                .iter()
+                .map(|(id, name, eligible)| ReverseLiveClient {
+                    client_id: id.clone(),
+                    name: name.clone(),
+                    capabilities: json!({ "browserExec": eligible }),
+                    host: ClientHostInfo::default(),
+                    connections: 1,
+                    transports: vec!["wss".to_string()],
+                    connected_at: "2026-09-06T00:00:00Z".to_string(),
+                })
+                .collect()
+        }
+        fn dispatch<'a>(
+            &'a self,
+            method: &'a str,
+            params: Value,
+            target: ReverseTarget,
+        ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
+            let action = params["actions"][0]["action"].clone();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params, target.clone()));
+            let resolved = self.resolve(&target).map(|r| {
+                json!({
+                    "success": true,
+                    "results": [{ "action": action, "success": true, "result": { "host": r.client_id } }],
+                })
+            });
+            Box::pin(async move { resolved })
+        }
+    }
+
+    pub(super) async fn setup(
+        registry: Arc<FakeRegistry>,
+    ) -> (TempDb, WorkspacesRoot, Services, EventBus, WorkspaceId) {
+        let tmp = TempDb::new();
+        let root = WorkspacesRoot::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        // Both clients have hello'd at some point (persisted `client` rows).
+        for (id, name) in [("desktop-a", "Desktop A"), ("desktop-b", "Desktop B")] {
+            store
+                .upsert_client(
+                    &ClientId::from_string(id),
+                    Some(name),
+                    Some(&json!({ "browserExec": true })),
+                    &ClientHostInfo::default(),
+                )
+                .await
+                .expect("client");
+        }
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.path().to_path_buf())
+            .with_event_bus(bus.clone())
+            .with_reverse_dispatch(registry);
+        (tmp, root, svc, bus, ws)
+    }
+
+    fn actions() -> Vec<Value> {
+        vec![json!({ "action": "screenshot" })]
+    }
+
+    #[tokio::test]
+    async fn client_list_projects_live_clients() {
+        let reg =
+            FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true), ("aux", None, false)]);
+        let (_t, _r, svc, _bus, _ws) = setup(reg).await;
+        let clients = svc.client_list().await.expect("list");
+        let wire = serde_json::to_value(&clients).unwrap();
+        assert_eq!(
+            wire,
+            json!([
+                {
+                    "clientId": "desktop-a", "name": "Desktop A",
+                    "capabilities": { "browserExec": true }, "connections": 1,
+                    "transports": ["wss"], "connectedAt": "2026-09-06T00:00:00Z"
+                },
+                {
+                    "clientId": "aux",
+                    "capabilities": { "browserExec": false }, "connections": 1,
+                    "transports": ["wss"], "connectedAt": "2026-09-06T00:00:00Z"
+                }
+            ]),
+            "name is omitted (not null) when the hello carried none"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_list_is_empty_without_a_dispatcher() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let svc = Services::new(store);
+        assert!(svc.client_list().await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn unpinned_workspace_reports_default_and_dispatches_default() {
+        let reg = FakeRegistry::new(&[
+            ("desktop-a", Some("Desktop A"), true),
+            ("desktop-b", Some("Desktop B"), true),
+        ]);
+        let (_t, _r, svc, _bus, ws) = setup(reg.clone()).await;
+        let state = svc.get_workspace_browser_client(ws.clone()).await.unwrap();
+        assert_eq!(
+            state,
+            json!({
+                "source": "default",
+                "resolved": { "clientId": "desktop-a", "name": "Desktop A" }
+            }),
+            "clientId is omitted when unpinned"
+        );
+        let out = svc
+            .browser_exec(ws.clone(), actions(), None, None)
+            .await
+            .expect("dispatch");
+        assert_eq!(out["result"]["host"], "desktop-a");
+        assert_eq!(reg.calls.lock().unwrap()[0].2, ReverseTarget::Default);
+    }
+
+    #[tokio::test]
+    async fn no_eligible_client_resolves_null_and_dispatch_says_no_client() {
+        let reg = FakeRegistry::new(&[("aux", None, false)]);
+        let (_t, _r, svc, _bus, ws) = setup(reg).await;
+        let state = svc.get_workspace_browser_client(ws.clone()).await.unwrap();
+        assert_eq!(state, json!({ "source": "default", "resolved": null }));
+        let err = svc
+            .browser_exec(ws, actions(), None, None)
+            .await
+            .expect_err("nothing eligible");
+        assert!(matches!(err, Error::Internal(m) if m == "browser.exec: no client connected"));
+    }
+
+    #[tokio::test]
+    async fn pinned_live_client_is_reported_and_dispatched_to() {
+        let reg = FakeRegistry::new(&[
+            ("desktop-a", Some("Desktop A"), true),
+            ("desktop-b", Some("Desktop B"), true),
+        ]);
+        let (_t, _r, svc, bus, ws) = setup(reg.clone()).await;
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(ws.0.clone()),
+            ..Default::default()
+        });
+
+        let echoed = svc
+            .set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-b")))
+            .await
+            .expect("pin");
+        let expected = json!({
+            "clientId": "desktop-b",
+            "source": "workspace",
+            "resolved": { "clientId": "desktop-b", "name": "Desktop B" }
+        });
+        assert_eq!(echoed, expected, "set echoes the get shape");
+        assert_eq!(
+            svc.get_workspace_browser_client(ws.clone()).await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            svc.get_workspace(ws.clone())
+                .await
+                .unwrap()
+                .browser_client_id,
+            Some(ClientId::from_string("desktop-b")),
+            "the pin rides the Workspace payload"
+        );
+
+        // `workspace:updated` carries the self-sufficient delta.
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        let ev = serde_json::to_value(&batch[0]).unwrap();
+        assert_eq!(ev["type"], "workspace:updated");
+        assert_eq!(
+            ev["data"]["changes"],
+            json!({ "browserClientId": "desktop-b" })
+        );
+
+        // Dispatch goes to the pin, not the first-connected client.
+        let out = svc
+            .browser_exec(ws.clone(), actions(), None, None)
+            .await
+            .expect("dispatch");
+        assert_eq!(out["result"]["host"], "desktop-b");
+        assert_eq!(
+            reg.calls.lock().unwrap()[0].2,
+            ReverseTarget::Pinned(ClientId::from_string("desktop-b"))
+        );
+
+        // Clearing with `null` returns to the default and echoes `null` in
+        // the change delta.
+        let cleared = svc
+            .set_workspace_browser_client(ws.clone(), None)
+            .await
+            .expect("clear");
+        assert_eq!(
+            cleared,
+            json!({
+                "source": "default",
+                "resolved": { "clientId": "desktop-a", "name": "Desktop A" }
+            })
+        );
+        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
+        let ev = serde_json::to_value(&batch[0]).unwrap();
+        assert_eq!(ev["data"]["changes"], json!({ "browserClientId": null }));
+        assert_eq!(svc.get_workspace(ws).await.unwrap().browser_client_id, None);
+    }
+
+    /// Regression (#1760 review): racing setters must not publish
+    /// `workspace:updated` deltas out of order relative to the durable pin.
+    /// The last delta a subscriber sees always equals what the store holds,
+    /// and each reply echoes the pin *that call* committed — never a value a
+    /// racing setter committed between this call's publish and its read-back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_setters_publish_deltas_in_commit_order() {
+        const ROUNDS: usize = 24;
+        let reg = FakeRegistry::new(&[
+            ("desktop-a", Some("Desktop A"), true),
+            ("desktop-b", Some("Desktop B"), true),
+        ]);
+        let (_t, _r, svc, bus, ws) = setup(reg).await;
+        let svc = Arc::new(svc);
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(ws.0.clone()),
+            ..Default::default()
+        });
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..ROUNDS {
+            let svc = svc.clone();
+            let ws = ws.clone();
+            let target = match i % 3 {
+                0 => Some(ClientId::from_string("desktop-a")),
+                1 => Some(ClientId::from_string("desktop-b")),
+                _ => None,
+            };
+            tasks.spawn(async move {
+                let requested = target.as_ref().map_or(Value::Null, |c| c.as_str().into());
+                let reply = svc
+                    .set_workspace_browser_client(ws, target)
+                    .await
+                    .expect("set");
+                (requested, reply)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let (requested, reply) = joined.expect("join");
+            let echoed = reply.get("clientId").cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                echoed, requested,
+                "a reply echoes its own committed pin, not a racing setter's: {reply}"
+            );
+        }
+
+        let mut deltas: Vec<Value> = Vec::new();
+        while deltas.len() < ROUNDS {
+            let batch = tokio::time::timeout(Duration::from_secs(5), sub.recv())
+                .await
+                .expect("all deltas delivered")
+                .expect("subscription open");
+            for ev in &batch {
+                let ev = serde_json::to_value(ev).unwrap();
+                assert_eq!(ev["type"], "workspace:updated");
+                deltas.push(ev["data"]["changes"]["browserClientId"].clone());
+            }
+        }
+        assert_eq!(deltas.len(), ROUNDS);
+
+        let durable = svc
+            .get_workspace(ws)
+            .await
+            .unwrap()
+            .browser_client_id
+            .map_or(Value::Null, |c| c.as_str().into());
+        assert_eq!(
+            deltas.last().unwrap(),
+            &durable,
+            "the last published delta is the committed pin: {deltas:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_offline_client_is_a_hard_error_not_a_fallback() {
+        // desktop-b hello'd before (client row exists) but is not live now.
+        let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
+        let (_t, _r, svc, _bus, ws) = setup(reg.clone()).await;
+        let echoed = svc
+            .set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-b")))
+            .await
+            .expect("an offline-but-known client can be pinned");
+        assert_eq!(
+            echoed,
+            json!({ "clientId": "desktop-b", "source": "workspace", "resolved": null })
+        );
+        let err = svc
+            .browser_exec(ws, actions(), None, None)
+            .await
+            .expect_err("pinned offline");
+        assert!(
+            matches!(
+                &err,
+                Error::Internal(m)
+                    if m == "browser.exec: browser client \"Desktop B\" (desktop-b) for this workspace is not connected"
+            ),
+            "the offline name comes from the persisted client row: {err:?}"
+        );
+        // The first-connected client was never consulted.
+        assert_eq!(
+            reg.calls.lock().unwrap()[0].2,
+            ReverseTarget::Pinned(ClientId::from_string("desktop-b"))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_rejects_never_seen_client_chief_and_unknown_workspace() {
+        let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
+        let (_t, _r, svc, _bus, ws) = setup(reg).await;
+        let err = svc
+            .set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("ghost")))
+            .await
+            .expect_err("never hello'd");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("ghost")));
+        assert_eq!(
+            svc.get_workspace(ws.clone())
+                .await
+                .unwrap()
+                .browser_client_id,
+            None,
+            "a rejected set leaves the pin untouched"
+        );
+
+        // A row minted only to key an anonymous connection's drafts is not a
+        // hello'd client: it has a `client` row but is still rejected.
+        let anon = ClientId::from_string("anon-draft");
+        svc.ensure_client(anon.clone()).await.expect("placeholder");
+        assert!(svc.store.get_client(&anon).await.unwrap().is_some());
+        let err = svc
+            .set_workspace_browser_client(ws.clone(), Some(anon))
+            .await
+            .expect_err("draft-only client");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("anon-draft")));
+        assert_eq!(
+            svc.get_workspace(ws.clone())
+                .await
+                .unwrap()
+                .browser_client_id,
+            None
+        );
+
+        let chief = WorkspaceId::from(CHIEF_WORKSPACE_ID);
+        let err = svc
+            .set_workspace_browser_client(chief.clone(), Some(ClientId::from_string("desktop-a")))
+            .await
+            .expect_err("chief");
+        assert!(matches!(err, Error::InvalidParams(_)));
+        assert_eq!(
+            svc.get_workspace_browser_client(chief).await.unwrap(),
+            json!({
+                "source": "default",
+                "resolved": { "clientId": "desktop-a", "name": "Desktop A" }
+            }),
+            "chief always reads as the default"
+        );
+
+        let missing = WorkspaceId::from("ws-none");
+        assert!(matches!(
+            svc.get_workspace_browser_client(missing.clone()).await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            svc.set_workspace_browser_client(missing, None).await,
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// Upgrade path: pre-0117 `client` rows have no `last_hello_at`. The
+    /// migration backfills it from `last_seen` only for rows with a `name`
+    /// (the hello upsert always carried one; the anonymous-draft placeholder
+    /// never did), so a previously connected, currently offline client stays
+    /// pinnable after upgrade while a pre-upgrade draft-only placeholder is
+    /// rejected until it hellos. Pre-upgrade rows are shaped by nulling the
+    /// stamp directly, and the backfill statement is re-run from 0117.
+    #[tokio::test]
+    async fn pre_upgrade_named_row_is_pinnable_and_nameless_row_is_not() {
+        let reg = FakeRegistry::new(&[]);
+        let (_t, _r, svc, _bus, ws) = setup(reg).await;
+        let named = ClientId::from_string("desktop-a");
+        let nameless = ClientId::from_string("legacy-anon");
+        svc.ensure_client(nameless.clone())
+            .await
+            .expect("placeholder");
+        sqlx::query("UPDATE client SET last_hello_at = NULL")
+            .execute(svc.store.write_pool())
+            .await
+            .expect("shape pre-upgrade rows");
+        for id in [&named, &nameless] {
+            assert_eq!(
+                svc.store
+                    .get_client(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .last_hello_at,
+                None
+            );
+        }
+        let backfill = include_str!("../../intent-store/migrations/0117_client_host_identity.sql")
+            .lines()
+            .find(|l| l.starts_with("UPDATE client SET last_hello_at"))
+            .expect("0117 backfill statement");
+        sqlx::raw_sql(backfill)
+            .execute(svc.store.write_pool())
+            .await
+            .expect("re-run backfill");
+
+        let state = svc
+            .set_workspace_browser_client(ws.clone(), Some(named.clone()))
+            .await
+            .expect("pre-upgrade named row is pinnable");
+        assert_eq!(state["clientId"], "desktop-a");
+        assert_eq!(state["source"], "workspace");
+        assert_eq!(
+            state["resolved"],
+            Value::Null,
+            "pinned but not connected resolves to null"
+        );
+
+        let err = svc
+            .set_workspace_browser_client(ws.clone(), Some(nameless))
+            .await
+            .expect_err("pre-upgrade nameless row fails closed");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("legacy-anon")));
+        assert_eq!(
+            svc.get_workspace(ws).await.unwrap().browser_client_id,
+            Some(named),
+            "the rejected set leaves the existing pin untouched"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REV-2 routing (Model 3–6 & 10): the driving client (pin → claimed-tab host
+// → first-connected), registry-answered `listTabs`, claim / pin migration of
+// tab rows, and the tab-addressed `browser.navigateTab` / `browser.closeTab`.
+// ---------------------------------------------------------------------------
+mod browser_routing {
+    use std::time::Duration;
+
+    use intent_core::{
+        AgentId, BrowserTab, ClientId, Error, ReverseTarget, WorkspaceApi, WorkspaceId,
+    };
+    use serde_json::{json, Value};
+
+    use super::browser_client_pin::{setup, FakeRegistry};
+    use crate::{EventBus, Services, SubscriptionFilter};
+
+    fn agent(id: &str) -> AgentId {
+        AgentId::from_string(id)
+    }
+
+    /// Register an open tab of `ws` on `host`, owned by `owner` when given.
+    /// Both the workspace and the host client are foreign keys of the row,
+    /// so they are created on demand (`setup` already knows `desktop-a` /
+    /// `desktop-b` and the primary workspace). User tabs report
+    /// `displayed: true`, agent tabs `false` (hidden).
+    async fn register_tab(
+        svc: &Services,
+        ws: &WorkspaceId,
+        tab_id: &str,
+        host: &str,
+        owner: Option<&str>,
+    ) -> BrowserTab {
+        if svc.store.get_workspace(ws).await.is_err() {
+            svc.store
+                .insert_workspace(&super::workspace(ws))
+                .await
+                .unwrap();
+        }
+        let host_id = ClientId::from_string(host);
+        if svc.store.get_client(&host_id).await.unwrap().is_none() {
+            svc.store
+                .upsert_client(
+                    &host_id,
+                    None,
+                    Some(&json!({ "browserExec": true })),
+                    &intent_core::ClientHostInfo::default(),
+                )
+                .await
+                .unwrap();
+        }
+        svc.browser_upsert_tab(
+            ClientId::from_string(host),
+            serde_json::from_value(json!({
+                "tabId": tab_id,
+                "workspaceId": ws.0,
+                "url": format!("https://{tab_id}.test/"),
+                "title": tab_id,
+                "ownerAgentId": owner,
+                "visibility": "hidden",
+                "emulatedSize": owner.map(|_| json!({ "width": 1280, "height": 800 })),
+                "displayed": owner.is_none(),
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("tab registered")
+    }
+
+    async fn tab_events(bus: &EventBus, ws: &WorkspaceId, want: usize) -> Vec<Value> {
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(ws.0.clone()),
+            ..Default::default()
+        });
+        let mut out = Vec::new();
+        while out.len() < want {
+            let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+                .await
+                .expect("event delivered")
+                .expect("subscription open");
+            for ev in &batch {
+                let ev = serde_json::to_value(ev).unwrap();
+                if ev["type"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("browser:"))
+                {
+                    out.push(ev);
+                }
+            }
+        }
+        out
+    }
+
+    fn two_clients() -> std::sync::Arc<FakeRegistry> {
+        FakeRegistry::new(&[
+            ("desktop-a", Some("Desktop A"), true),
+            ("desktop-b", Some("Desktop B"), true),
+        ])
+    }
+
+    /// Model 10: without a pin, the host of the workspace's claimed tabs is
+    /// the driving client — even when another eligible client connected
+    /// first — and `workspace.getBrowserClient` reports it as `resolved`.
+    #[tokio::test]
+    async fn claimed_tab_host_is_the_driving_client_when_unpinned() {
+        let reg = two_clients();
+        let (_t, _r, svc, _bus, ws) = setup(reg.clone()).await;
+        register_tab(&svc, &ws, "user-tab", "desktop-a", None).await;
+        register_tab(&svc, &ws, "agent-tab", "desktop-b", Some("agent-1")).await;
+
+        let state = svc.get_workspace_browser_client(ws.clone()).await.unwrap();
+        assert_eq!(
+            state,
+            json!({
+                "source": "default",
+                "resolved": { "clientId": "desktop-b", "name": "Desktop B" }
+            })
+        );
+        let out = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "openTab", "url": "https://c.test/" })],
+                None,
+                Some(agent("agent-2")),
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(out["result"]["host"], "desktop-b");
+        assert_eq!(
+            reg.calls.lock().unwrap()[0].2,
+            ReverseTarget::Client(ClientId::from_string("desktop-b"))
+        );
+    }
+
+    /// Model 5: an agent `listTabs` is answered from the registry — every
+    /// host aggregated, no reverse call — with the FE field names plus the
+    /// host fields, filtered by `scope`.
+    #[tokio::test]
+    async fn list_tabs_is_answered_from_the_registry_across_hosts() {
+        let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
+        let (_t, _r, svc, _bus, ws) = setup(reg.clone()).await;
+        register_tab(&svc, &ws, "t-user", "desktop-a", None).await;
+        register_tab(&svc, &ws, "t-mine", "desktop-b", Some("agent-1")).await;
+        register_tab(&svc, &ws, "t-other", "desktop-b", Some("agent-2")).await;
+        let other_ws = WorkspaceId::new();
+        register_tab(&svc, &other_ws, "t-foreign", "desktop-a", None).await;
+
+        let out = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                Some(agent("agent-1")),
+            )
+            .await
+            .expect("list");
+        assert_eq!(out["action"], "listTabs");
+        assert_eq!(out["success"], true);
+        let tabs = out["result"].as_array().expect("array");
+        let ids: Vec<&str> = tabs.iter().map(|t| t["tabId"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["t-user", "t-mine", "t-other"]);
+        assert_eq!(
+            tabs[0],
+            json!({
+                "tabId": "t-user", "workspaceId": ws.0, "url": "https://t-user.test/",
+                "title": "t-user", "ownerAgentId": null, "mode": "native",
+                "visibility": "hidden", "displayed": true, "hostClientId": "desktop-a",
+                "hostName": "Desktop A", "hostConnected": true
+            })
+        );
+        assert_eq!(tabs[1]["ownerAgentId"], "agent-1");
+        assert_eq!(tabs[1]["mode"], "emulated");
+        assert_eq!(tabs[1]["width"], 1280);
+        assert_eq!(tabs[1]["displayed"], false);
+        assert_eq!(tabs[1]["hostClientId"], "desktop-b");
+        assert_eq!(tabs[1]["hostConnected"], false, "desktop-b is not live");
+        assert!(tabs[1].get("hostName").is_none());
+        assert!(reg.calls.lock().unwrap().is_empty(), "no reverse call");
+
+        let mine = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs", "scope": "mine" })],
+                None,
+                Some(agent("agent-1")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mine["result"].as_array().unwrap().len(), 1);
+        assert_eq!(mine["result"][0]["tabId"], "t-mine");
+        let unclaimed = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs", "scope": "unclaimed" })],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(unclaimed["result"][0]["tabId"], "t-user");
+        assert_eq!(unclaimed["result"].as_array().unwrap().len(), 1);
+
+        let no_agent = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs", "scope": "mine" })],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_agent["success"], false, "mine needs an agent caller");
+        let err = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs", "scope": "yours" })],
+                None,
+                None,
+            )
+            .await
+            .expect_err("bad scope");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("scope")));
+        // A present non-string scope is rejected, not read as the default.
+        for bad in [json!(42), json!({}), json!([])] {
+            let err = svc
+                .browser_exec(
+                    ws.clone(),
+                    vec![json!({ "action": "listTabs", "scope": bad })],
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("non-string scope");
+            assert!(matches!(err, Error::InvalidParams(m) if m.contains("scope")));
+        }
+        // The registry answer still honours the tab-id contract: an unknown
+        // tab named by the envelope or the action is `-32602`.
+        for (action, envelope) in [
+            (json!({ "action": "listTabs" }), Some("ghost".to_string())),
+            (json!({ "action": "listTabs", "tabId": "ghost" }), None),
+        ] {
+            let err = svc
+                .browser_exec(ws.clone(), vec![action], envelope, None)
+                .await
+                .expect_err("unknown tab");
+            assert!(matches!(err, Error::InvalidParams(m) if m.contains("tab not found: ghost")));
+        }
+        let scoped = svc
+            .browser_exec(
+                ws,
+                vec![json!({ "action": "listTabs" })],
+                Some("t-user".to_string()),
+                None,
+            )
+            .await
+            .expect("known envelope tab");
+        assert_eq!(scoped["success"], true);
+    }
+
+    /// intent-hq/intent#4835: `displayed` rides the registry-answered
+    /// `listTabs` entry exactly as the host last reported it — a host that
+    /// never reported it yields no key (never a default `false`), and a
+    /// later report flipping it is diffed into `browser:tab-updated {
+    /// changes: { displayed } }` and reflected on the next list.
+    #[tokio::test]
+    async fn list_tabs_carries_displayed_as_reported() {
+        let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
+        let (_t, _r, svc, bus, ws) = setup(reg).await;
+        let host = ClientId::from_string("desktop-a");
+        let report = |displayed: Option<bool>| -> intent_core::BrowserTabInput {
+            serde_json::from_value(json!({
+                "tabId": "t-legacy",
+                "workspaceId": ws.0,
+                "url": "https://t-legacy.test/",
+                "visibility": "visible",
+                "displayed": displayed,
+            }))
+            .unwrap()
+        };
+        svc.browser_upsert_tab(host.clone(), report(None))
+            .await
+            .expect("registered without displayed");
+        let list = || {
+            svc.browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+        };
+        let out = list().await.expect("list");
+        assert_eq!(out["result"][0]["tabId"], "t-legacy");
+        assert!(
+            out["result"][0].get("displayed").is_none(),
+            "never reported ⇒ omitted, not false: {}",
+            out["result"][0]
+        );
+
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 1).await }
+        });
+        tokio::task::yield_now().await;
+        let updated = svc
+            .browser_upsert_tab(host.clone(), report(Some(true)))
+            .await
+            .expect("re-reported with displayed");
+        assert_eq!(updated.displayed, Some(true));
+        let evs = events.await.unwrap();
+        assert_eq!(evs[0]["type"], "browser:tab-updated");
+        assert_eq!(evs[0]["data"]["changes"], json!({ "displayed": true }));
+        assert_eq!(evs[0]["data"]["tab"]["displayed"], true);
+        assert_eq!(list().await.unwrap()["result"][0]["displayed"], true);
+
+        svc.browser_upsert_tab(host, report(Some(false)))
+            .await
+            .expect("flipped displayed");
+        assert_eq!(list().await.unwrap()["result"][0]["displayed"], false);
+    }
+
+    /// Model 5: a `claimTab` the driving client executed on a tab another
+    /// client hosted re-homes the row (host + owner) with one
+    /// `browser:tab-updated`; a failed claim moves nothing. The move clears
+    /// the previous host's `displayed` fact (`changes.displayed: null`, absent
+    /// on the event `tab` and the next list) until the new host reports it;
+    /// a same-host owner-only claim keeps it (intent-hq/intent#4835).
+    #[tokio::test]
+    async fn successful_claim_migrates_the_tab_to_the_driving_client() {
+        let reg = two_clients();
+        let (_t, _r, svc, bus, ws) = setup(reg.clone()).await;
+        register_tab(&svc, &ws, "user-tab", "desktop-b", None).await;
+
+        let out = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "claimTab", "tabId": "user-tab", "width": 1024 })],
+                None,
+                Some(agent("agent-1")),
+            )
+            .await
+            .expect("claim");
+        assert_eq!(out["action"], "claimTab");
+        assert_eq!(reg.calls.lock().unwrap()[0].2, ReverseTarget::Default);
+        // The fake's canned reply carries no `result.tabId` — the FE's
+        // success marker — so nothing counts as a confirmed claim and the
+        // row is untouched.
+        let row = svc
+            .store
+            .get_browser_tab("user-tab")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.host_client_id, ClientId::from_string("desktop-b"));
+        assert!(row.owner_agent_id.is_none());
+        assert_eq!(row.displayed, Some(true), "desktop-b reported the fact");
+
+        // Now drive the migration the way a confirmed `claimTab` does.
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 1).await }
+        });
+        tokio::task::yield_now().await;
+        svc.browser_tab_claim_migrate(
+            "user-tab",
+            &ClientId::from_string("desktop-a"),
+            Some(&agent("agent-1")),
+        )
+        .await
+        .expect("migrate");
+        let row = svc
+            .store
+            .get_browser_tab("user-tab")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
+        assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        assert_eq!(
+            row.displayed, None,
+            "desktop-a has not reported the layout fact yet"
+        );
+        let evs = events.await.unwrap();
+        assert_eq!(evs[0]["type"], "browser:tab-updated");
+        assert_eq!(
+            evs[0]["data"]["changes"],
+            json!({ "hostClientId": "desktop-a", "ownerAgentId": "agent-1", "displayed": null })
+        );
+        assert!(evs[0]["data"]["tab"].get("displayed").is_none());
+        let listed = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed["result"][0]["tabId"], "user-tab");
+        assert!(listed["result"][0].get("displayed").is_none());
+        // Re-homing the same tab to its current host and owner is a no-op
+        // (no event).
+        svc.browser_tab_claim_migrate(
+            "user-tab",
+            &ClientId::from_string("desktop-a"),
+            Some(&agent("agent-1")),
+        )
+        .await
+        .unwrap();
+        assert!(svc
+            .store
+            .list_browser_tabs(&ws)
+            .await
+            .unwrap()
+            .iter()
+            .all(|t| t.host_client_id == ClientId::from_string("desktop-a")));
+
+        // A claim of a tab the driving client already hosts records the
+        // owner immediately (no wait for the host's own report) with
+        // `changes: { ownerAgentId }` only — the host's `displayed` stays.
+        register_tab(&svc, &ws, "local-tab", "desktop-a", None).await;
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 1).await }
+        });
+        tokio::task::yield_now().await;
+        svc.browser_tab_claim_migrate(
+            "local-tab",
+            &ClientId::from_string("desktop-a"),
+            Some(&agent("agent-1")),
+        )
+        .await
+        .expect("same-host claim");
+        let row = svc
+            .store
+            .get_browser_tab("local-tab")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
+        assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        assert_eq!(row.displayed, Some(true), "same-host claim keeps the fact");
+        let evs = events.await.unwrap();
+        assert_eq!(evs[0]["type"], "browser:tab-updated");
+        assert_eq!(evs[0]["data"]["tab"]["tabId"], "local-tab");
+        assert_eq!(evs[0]["data"]["tab"]["displayed"], true);
+        assert_eq!(
+            evs[0]["data"]["changes"],
+            json!({ "ownerAgentId": "agent-1" })
+        );
+    }
+
+    /// Model 5 (end to end through `browser_exec`): the FE's real success
+    /// envelope for `claimTab` carries `result.tabId`, which is what triggers
+    /// the migration.
+    #[tokio::test]
+    async fn claim_reply_with_tab_id_migrates_through_browser_exec() {
+        use std::sync::{Arc, Mutex};
+
+        use intent_core::{AgentReverseDispatch, BoxFuture, ResolvedClient, ReverseDispatchError};
+
+        struct ClaimOk(Mutex<Vec<ReverseTarget>>);
+        impl AgentReverseDispatch for ClaimOk {
+            fn is_connected(&self) -> bool {
+                true
+            }
+            fn resolve(
+                &self,
+                target: &ReverseTarget,
+            ) -> Result<ResolvedClient, ReverseDispatchError> {
+                Ok(ResolvedClient {
+                    client_id: match target {
+                        ReverseTarget::Default => ClientId::from_string("desktop-a"),
+                        ReverseTarget::Client(c) | ReverseTarget::Pinned(c) => c.clone(),
+                    },
+                    name: None,
+                })
+            }
+            fn dispatch<'a>(
+                &'a self,
+                _method: &'a str,
+                params: Value,
+                target: ReverseTarget,
+            ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
+                self.0.lock().unwrap().push(target);
+                let tab_id = params["actions"][0]["tabId"].clone();
+                Box::pin(async move {
+                    Ok(json!({
+                        "success": true,
+                        "results": [{
+                            "action": "claimTab", "success": true,
+                            "result": { "tabId": tab_id, "ownerAgentId": "agent-1", "width": 1024, "height": 800 }
+                        }],
+                    }))
+                })
+            }
+        }
+
+        let tmp = super::TempDb::new();
+        let root = super::WorkspacesRoot::new();
+        let store = intent_store::Store::open(&tmp.path).await.unwrap();
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&super::workspace(&ws))
+            .await
+            .unwrap();
+        // The driving client has hello'd (its `client` row exists).
+        store
+            .upsert_client(
+                &ClientId::from_string("desktop-a"),
+                Some("Desktop A"),
+                Some(&json!({ "browserExec": true })),
+                &intent_core::ClientHostInfo::default(),
+            )
+            .await
+            .unwrap();
+        let bus = EventBus::new(store.clone());
+        let dispatch = Arc::new(ClaimOk(Mutex::new(Vec::new())));
+        let svc = Services::new(store)
+            .with_workspaces_root(root.path().to_path_buf())
+            .with_event_bus(bus.clone())
+            .with_reverse_dispatch(dispatch.clone());
+        register_tab(&svc, &ws, "user-tab", "desktop-b", None).await;
+
+        let out = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "claimTab", "tabId": "user-tab", "width": 1024 })],
+                None,
+                Some(agent("agent-1")),
+            )
+            .await
+            .expect("claim");
+        assert_eq!(out["success"], true);
+        assert_eq!(
+            dispatch.0.lock().unwrap().as_slice(),
+            [ReverseTarget::Default]
+        );
+        let row = svc
+            .store
+            .get_browser_tab("user-tab")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.host_client_id, ClientId::from_string("desktop-a"));
+        assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        // desktop-a now hosts a claimed tab, so it is the driving client by
+        // its own right — a later call resolves `Client(desktop-a)`.
+        svc.browser_exec(
+            ws.clone(),
+            vec![json!({ "action": "claimTab", "tabId": "user-tab", "width": 800 })],
+            None,
+            Some(agent("agent-1")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dispatch.0.lock().unwrap()[1],
+            ReverseTarget::Client(ClientId::from_string("desktop-a"))
+        );
+    }
+
+    /// Model 3 & 10 (one host per workspace): a claim whose dispatch to the
+    /// pinned client is still in flight when `workspace.setBrowserClient`
+    /// switches the pin commits against the driving client *at commit
+    /// time* — the claimed rows land on the new pin, never on the client
+    /// that executed the claim — and the tab events stay gated.
+    #[tokio::test]
+    async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client() {
+        use std::sync::{Arc, Mutex};
+
+        use intent_core::{AgentReverseDispatch, BoxFuture, ResolvedClient, ReverseDispatchError};
+        use tokio::sync::Notify;
+
+        struct HeldClaim {
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+            targets: Mutex<Vec<ReverseTarget>>,
+        }
+        impl AgentReverseDispatch for HeldClaim {
+            fn is_connected(&self) -> bool {
+                true
+            }
+            fn resolve(
+                &self,
+                target: &ReverseTarget,
+            ) -> Result<ResolvedClient, ReverseDispatchError> {
+                Ok(ResolvedClient {
+                    client_id: match target {
+                        ReverseTarget::Default => ClientId::from_string("desktop-a"),
+                        ReverseTarget::Client(c) | ReverseTarget::Pinned(c) => c.clone(),
+                    },
+                    name: None,
+                })
+            }
+            fn dispatch<'a>(
+                &'a self,
+                _method: &'a str,
+                params: Value,
+                target: ReverseTarget,
+            ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
+                self.targets.lock().unwrap().push(target);
+                let results: Vec<Value> = params["actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|a| {
+                        json!({
+                            "action": "claimTab", "success": true,
+                            "result": { "tabId": a["tabId"], "ownerAgentId": "agent-1", "width": 1024, "height": 800 }
+                        })
+                    })
+                    .collect();
+                Box::pin(async move {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                    Ok(json!({ "success": true, "results": results }))
+                })
+            }
+        }
+
+        let tmp = super::TempDb::new();
+        let root = super::WorkspacesRoot::new();
+        let store = intent_store::Store::open(&tmp.path).await.unwrap();
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&super::workspace(&ws))
+            .await
+            .unwrap();
+        for (id, name) in [("desktop-a", "Desktop A"), ("desktop-b", "Desktop B")] {
+            store
+                .upsert_client(
+                    &ClientId::from_string(id),
+                    Some(name),
+                    Some(&json!({ "browserExec": true })),
+                    &intent_core::ClientHostInfo::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let bus = EventBus::new(store.clone());
+        let dispatch = Arc::new(HeldClaim {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            targets: Mutex::new(Vec::new()),
+        });
+        let svc = Arc::new(
+            Services::new(store)
+                .with_workspaces_root(root.path().to_path_buf())
+                .with_event_bus(bus.clone())
+                .with_reverse_dispatch(dispatch.clone()),
+        );
+        // Unclaimed tabs on both clients; the pin is desktop-a.
+        register_tab(&svc, &ws, "tab-on-a", "desktop-a", None).await;
+        register_tab(&svc, &ws, "tab-on-b", "desktop-b", None).await;
+        svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-a")))
+            .await
+            .expect("pin a");
+
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 2).await }
+        });
+        tokio::task::yield_now().await;
+
+        // The claim dispatches to the pinned client and its reply is held.
+        let claim = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws.clone();
+            async move {
+                svc.browser_exec(
+                    ws,
+                    vec![
+                        json!({ "action": "claimTab", "tabId": "tab-on-a", "width": 1024 }),
+                        json!({ "action": "claimTab", "tabId": "tab-on-b", "width": 1024 }),
+                    ],
+                    None,
+                    Some(agent("agent-1")),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), dispatch.started.notified())
+            .await
+            .expect("claim dispatched");
+        assert_eq!(
+            dispatch.targets.lock().unwrap().as_slice(),
+            [ReverseTarget::Pinned(ClientId::from_string("desktop-a"))]
+        );
+
+        // The pin switches while the claim is in flight; nothing is claimed
+        // yet, so the setter migrates no row.
+        svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-b")))
+            .await
+            .expect("pin b");
+        for (id, host) in [("tab-on-a", "desktop-a"), ("tab-on-b", "desktop-b")] {
+            let row = svc.store.get_browser_tab(id).await.unwrap().unwrap();
+            assert_eq!(row.host_client_id, ClientId::from_string(host));
+            assert!(row.owner_agent_id.is_none());
+        }
+
+        // The held reply lands: both rows commit to the *current* driving
+        // client (desktop-b), not the executor (desktop-a).
+        dispatch.release.notify_one();
+        let out = claim.await.unwrap().expect("claim");
+        assert_eq!(out["results"].as_array().map(Vec::len), Some(2));
+        assert_eq!(out["results"][0]["success"], true);
+        assert_eq!(out["results"][1]["success"], true);
+        for id in ["tab-on-a", "tab-on-b"] {
+            let row = svc.store.get_browser_tab(id).await.unwrap().unwrap();
+            assert_eq!(
+                row.host_client_id,
+                ClientId::from_string("desktop-b"),
+                "{id} must live on the driving client"
+            );
+            assert_eq!(row.owner_agent_id, Some(agent("agent-1")));
+        }
+        let evs = events.await.unwrap();
+        assert_eq!(evs[0]["type"], "browser:tab-updated");
+        assert_eq!(evs[0]["data"]["tab"]["tabId"], "tab-on-a");
+        // The re-homed row drops desktop-a's `displayed` fact; the same-host
+        // row keeps desktop-b's.
+        assert_eq!(
+            evs[0]["data"]["changes"],
+            json!({ "hostClientId": "desktop-b", "ownerAgentId": "agent-1", "displayed": null })
+        );
+        assert_eq!(evs[1]["type"], "browser:tab-updated");
+        assert_eq!(evs[1]["data"]["tab"]["tabId"], "tab-on-b");
+        assert_eq!(
+            evs[1]["data"]["changes"],
+            json!({ "ownerAgentId": "agent-1" })
+        );
+        // desktop-b is the one host of the workspace: a later agent call
+        // resolves the pin, and clearing it keeps the claimed-tab host.
+        assert_eq!(
+            svc.driving_client_target(&ws).await.unwrap(),
+            ReverseTarget::Pinned(ClientId::from_string("desktop-b"))
+        );
+        svc.set_workspace_browser_client(ws.clone(), None)
+            .await
+            .expect("clear pin");
+        assert_eq!(
+            svc.driving_client_target(&ws).await.unwrap(),
+            ReverseTarget::Client(ClientId::from_string("desktop-b"))
+        );
+    }
+
+    /// Model 10: setting the pin moves every claimed tab of the workspace to
+    /// the new driving client (one `browser:tab-updated` each, clearing the
+    /// old host's `displayed` fact: `changes.displayed: null`); unclaimed
+    /// tabs and other workspaces stay put (fact retained); clearing the pin
+    /// moves nothing.
+    #[tokio::test]
+    async fn set_browser_client_migrates_claimed_tabs() {
+        let reg = two_clients();
+        let (_t, _r, svc, bus, ws) = setup(reg).await;
+        register_tab(&svc, &ws, "user-tab", "desktop-a", None).await;
+        register_tab(&svc, &ws, "mine-1", "desktop-a", Some("agent-1")).await;
+        register_tab(&svc, &ws, "mine-2", "desktop-a", Some("agent-2")).await;
+        let other_ws = WorkspaceId::new();
+        svc.store
+            .insert_workspace(&super::workspace(&other_ws))
+            .await
+            .unwrap();
+        register_tab(&svc, &other_ws, "elsewhere", "desktop-a", Some("agent-1")).await;
+
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 2).await }
+        });
+        tokio::task::yield_now().await;
+        svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-b")))
+            .await
+            .expect("pin");
+        let evs = events.await.unwrap();
+        let mut moved: Vec<&str> = evs
+            .iter()
+            .map(|e| e["data"]["tab"]["tabId"].as_str().unwrap())
+            .collect();
+        moved.sort_unstable();
+        assert_eq!(moved, ["mine-1", "mine-2"]);
+        for ev in &evs {
+            assert_eq!(ev["type"], "browser:tab-updated");
+            assert_eq!(
+                ev["data"]["changes"],
+                json!({ "hostClientId": "desktop-b", "displayed": null })
+            );
+            assert!(ev["data"]["tab"].get("displayed").is_none());
+        }
+        let row_of = |id: &str| {
+            let svc = svc.clone();
+            let id = id.to_string();
+            async move { svc.store.get_browser_tab(&id).await.unwrap().unwrap() }
+        };
+        let host_of = |id: &str| {
+            let row = row_of(id);
+            async move { row.await.host_client_id.0 }
+        };
+        assert_eq!(host_of("user-tab").await, "desktop-a");
+        assert_eq!(host_of("mine-1").await, "desktop-b");
+        assert_eq!(host_of("mine-2").await, "desktop-b");
+        assert_eq!(host_of("elsewhere").await, "desktop-a");
+        assert_eq!(row_of("user-tab").await.displayed, Some(true), "not moved");
+        assert_eq!(row_of("mine-1").await.displayed, None, "moved: unknown");
+        assert_eq!(
+            row_of("elsewhere").await.displayed,
+            Some(false),
+            "not moved"
+        );
+
+        svc.set_workspace_browser_client(ws.clone(), None)
+            .await
+            .expect("clear");
+        assert_eq!(
+            host_of("mine-1").await,
+            "desktop-b",
+            "clearing moves nothing"
+        );
+        // …and the driving client falls back to the claimed tabs' host.
+        assert_eq!(
+            svc.get_workspace_browser_client(ws).await.unwrap()["resolved"]["clientId"],
+            "desktop-b"
+        );
+    }
+
+    /// Model 4: `browser.navigateTab` goes to the driving client for a
+    /// claimed tab and to the physical host for an unclaimed one; an unknown
+    /// tab is `-32602`, an offline target `-32603`.
+    #[tokio::test]
+    async fn navigate_tab_routes_by_claim_state() {
+        let reg = two_clients();
+        let (_t, _r, svc, _bus, ws) = setup(reg.clone()).await;
+        svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-a")))
+            .await
+            .unwrap();
+        register_tab(&svc, &ws, "user-tab", "desktop-b", None).await;
+        register_tab(&svc, &ws, "agent-tab", "desktop-a", Some("agent-1")).await;
+        register_tab(&svc, &ws, "orphan", "desktop-gone", None).await;
+
+        let out = svc
+            .browser_navigate_tab("agent-tab".into(), "https://x.test/".into())
+            .await
+            .expect("claimed");
+        assert_eq!(out["action"], "navigate");
+        assert_eq!(out["result"]["host"], "desktop-a");
+        let out = svc
+            .browser_navigate_tab("user-tab".into(), "https://x.test/".into())
+            .await
+            .expect("unclaimed");
+        assert_eq!(out["result"]["host"], "desktop-b");
+        {
+            let calls = reg.calls.lock().unwrap();
+            assert_eq!(
+                calls[0].2,
+                ReverseTarget::Pinned(ClientId::from_string("desktop-a"))
+            );
+            assert_eq!(
+                calls[1].2,
+                ReverseTarget::Client(ClientId::from_string("desktop-b"))
+            );
+            assert_eq!(calls[1].1["tabId"], "user-tab");
+            assert_eq!(calls[1].1["workspaceId"], ws.0);
+            assert_eq!(
+                calls[1].1["actions"],
+                json!([{ "action": "navigate", "tabId": "user-tab", "url": "https://x.test/" }])
+            );
+        }
+        let err = svc
+            .browser_navigate_tab("ghost".into(), "https://x.test/".into())
+            .await
+            .expect_err("unknown");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("tab not found: ghost")));
+        let err = svc
+            .browser_navigate_tab("orphan".into(), "https://x.test/".into())
+            .await
+            .expect_err("offline host");
+        assert!(
+            matches!(&err, Error::Internal(m) if m == "browser.navigateTab: browser client desktop-gone for this workspace is not connected"),
+            "{err:?}"
+        );
+    }
+
+    /// Model 6: `browser.closeTab` routes the close to an online target; an
+    /// offline target is an error without `force` and a daemon-side
+    /// tombstone with it — the tab leaves `listTabs`, `browser:tab-closed`
+    /// is published, and the host's stale sync row is dropped.
+    #[tokio::test]
+    async fn close_tab_routes_online_and_force_tombstones_offline() {
+        let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
+        let (_t, _r, svc, bus, ws) = setup(reg.clone()).await;
+        register_tab(&svc, &ws, "live", "desktop-a", None).await;
+        register_tab(&svc, &ws, "stale", "desktop-b", None).await;
+
+        let out = svc
+            .browser_close_tab("live".into(), false)
+            .await
+            .expect("routed close");
+        assert_eq!(out, json!({ "ok": true }));
+        assert_eq!(
+            reg.calls.lock().unwrap()[0].1["actions"],
+            json!([{ "action": "closeTab", "tabId": "live" }])
+        );
+        // The routed close leaves the row to the host's own report.
+        assert!(svc.store.get_browser_tab("live").await.unwrap().is_some());
+
+        let err = svc
+            .browser_close_tab("stale".into(), false)
+            .await
+            .expect_err("offline host");
+        assert!(
+            matches!(&err, Error::Internal(m) if m.contains("\"Desktop B\" (desktop-b) for this workspace is not connected")),
+            "{err:?}"
+        );
+        // The physical host was asked (and found offline) — never the
+        // first-connected client.
+        assert_eq!(
+            reg.calls.lock().unwrap()[1].2,
+            ReverseTarget::Client(ClientId::from_string("desktop-b"))
+        );
+
+        let events = tokio::spawn({
+            let bus = bus.clone();
+            let ws = ws.clone();
+            async move { tab_events(&bus, &ws, 1).await }
+        });
+        tokio::task::yield_now().await;
+        let out = svc
+            .browser_close_tab("stale".into(), true)
+            .await
+            .expect("forced");
+        assert_eq!(out, json!({ "ok": true }));
+        let evs = events.await.unwrap();
+        assert_eq!(evs[0]["type"], "browser:tab-closed");
+        assert_eq!(evs[0]["data"]["tab"]["tabId"], "stale");
+        assert!(svc.store.get_browser_tab("stale").await.unwrap().is_none());
+        let listed = svc
+            .browser_exec(
+                ws.clone(),
+                vec![json!({ "action": "listTabs" })],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed["result"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["result"][0]["tabId"], "live");
+        // desktop-b comes back and still reports the tab: told to drop it.
+        let drop = svc
+            .browser_sync_tabs(
+                ClientId::from_string("desktop-b"),
+                vec![serde_json::from_value(json!({
+                    "tabId": "stale", "workspaceId": ws.0, "url": "https://stale.test/"
+                }))
+                .unwrap()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(drop, ["stale"]);
+        let err = svc
+            .browser_close_tab("ghost".into(), true)
+            .await
+            .expect_err("unknown");
+        assert!(matches!(err, Error::InvalidParams(m) if m.contains("tab not found: ghost")));
     }
 }
 
@@ -32221,20 +36372,41 @@ mod last_activity_events {
     /// its own entry before the delete's sweep runs, so the sweep finds no
     /// handle to abort) — must not emit the spurious `{ idle }` event, and
     /// must still remove its own map entry.
+    ///
+    /// The interleaving is made explicit (intent#4846): the row delete is
+    /// awaited BEFORE `agent_activity_end` arms the timer. Arming first and
+    /// deleting second let the debounce window expire while the real store
+    /// delete was still in flight under package load, so the timer's
+    /// existence probe found the row and emitted the `{ idle }` this test
+    /// forbids. Deleting first produces the same fire-time state the guard
+    /// is for — entry still present, gen/count guards pass, row gone —
+    /// without the timer racing the delete's I/O.
     #[tokio::test]
     async fn idle_timer_firing_against_deleted_workspace_skips_emit() {
         let _guard = DebounceEnvGuard::new("100");
         let h = harness().await;
         let mut sub = subscribe(&h);
 
-        // Last in-flight session ends → idle flip scheduled.
+        // Session enters flight (emits the agent_running flip) while the row
+        // still exists.
         h.services.agent_activity_begin(&h.ws).await;
-        h.services.agent_activity_end(&h.ws);
 
         // Delete the row directly in the store, bypassing the services-layer
-        // sweep — the interleaving where the timer fires while the delete is
-        // mid-flight (entry still present, gen/count guards pass, row gone).
+        // sweep, and await it before the timer is armed: the fire is then
+        // guaranteed to observe the deleted row.
         h.store.delete_workspace(&h.ws).await.expect("row delete");
+
+        // Last in-flight session ends → idle flip scheduled against the
+        // already-deleted id.
+        h.services.agent_activity_end(&h.ws);
+        assert!(
+            h.services
+                .idle_debouncers
+                .lock()
+                .expect("debouncers lock")
+                .contains_key(&h.ws),
+            "idle flip must be pending before the timer fires"
+        );
 
         // Bounded poll: the timer fires, hits the emit-time existence guard,
         // and must still sweep its map entry on the way out.
@@ -32385,25 +36557,51 @@ mod last_activity_events {
                 .expect("raise");
         }
 
-        // Drain all `workspace:attention-changed` events emitted during the burst.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        while timeout(Duration::from_millis(10), sub.recv()).await.is_ok() {}
-
-        // Wait for the debounce window to fire.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Consume the burst's immediate events (`workspace:attention-changed`,
+        // plus any `workspace:displayStatus-changed` a review_required raise
+        // moves) by type until the debounced `workspace:updated` arrives. An
+        // unconditional timed drain raced the debounce timer here: under
+        // package load the window expired while the drain was still consuming,
+        // which discarded the very event asserted below (intent#4886).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut updated: Option<Value> = None;
+        while updated.is_none() {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace:updated delivered")
+                .expect("subscription open");
+            for ev in &batch {
+                let ev = serde_json::to_value(ev).expect("serialize event");
+                if ev["type"] != "workspace:updated" {
+                    continue;
+                }
+                // A second one in the same batch is a coalescing failure.
+                assert!(
+                    updated.is_none(),
+                    "burst coalesced into one workspace:updated, got a second: {ev:?}"
+                );
+                updated = Some(ev);
+            }
+        }
 
         // Should see exactly one workspace:updated { lastActivity }.
-        let ev = recv_one(&mut sub).await;
+        let ev = updated.expect("workspace:updated captured");
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert!(ev["data"]["changes"]["lastActivity"].is_string());
 
-        // No second event (coalesced).
-        assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
-            "burst coalesced into one event"
-        );
+        // No second workspace:updated (coalesced) within a quiet window after
+        // the first. One absolute deadline bounds the whole window, so a
+        // stream of unrelated events cannot keep extending it.
+        let quiet_until = tokio::time::Instant::now() + Duration::from_millis(100);
+        while let Ok(Some(batch)) = tokio::time::timeout_at(quiet_until, sub.recv()).await {
+            for ev in &batch {
+                let ev = serde_json::to_value(ev).expect("serialize event");
+                assert_ne!(
+                    ev["type"], "workspace:updated",
+                    "burst coalesced into one workspace:updated, got a second: {ev:?}"
+                );
+            }
+        }
 
         // The emitted lastActivity matches a fresh workspace.get.
         let ws_after = h.store.get_workspace(&h.ws).await.expect("reload");
@@ -32974,7 +37172,7 @@ mod last_activity_events {
             .await
             .expect("insert session");
 
-        let (auto_entry, _) = h.services.enqueue_message_with_origin(
+        let (auto_entry, _) = h.services.enqueue_message(
             &agent_id,
             "wake".into(),
             None,
@@ -32982,7 +37180,7 @@ mod last_activity_events {
             None,
             None,
             false,
-            false,
+            MessageOrigin::Automatic,
         );
         h.services
             .agent_send_queued_message_now_op(agent_id.clone(), auto_entry.id)
@@ -32993,7 +37191,7 @@ mod last_activity_events {
             "automatic-origin force-send must not schedule lastActivity"
         );
 
-        let (user_entry, _) = h.services.enqueue_message_with_origin(
+        let (user_entry, _) = h.services.enqueue_message(
             &agent_id,
             "human".into(),
             None,
@@ -33001,7 +37199,7 @@ mod last_activity_events {
             None,
             None,
             false,
-            true,
+            MessageOrigin::User,
         );
         h.services
             .agent_send_queued_message_now_op(agent_id, user_entry.id)
@@ -34591,6 +38789,63 @@ mod turn_token_usage {
         }
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
         assert_eq!(ws.token_usage.unwrap().totals.output_tokens, 30);
+    }
+
+    /// #3801: opencode (and the opencode-based unsloth) report the turn's
+    /// LAST-REQUEST counters exactly like codex — both seams fold them with
+    /// SUM keyed on the resolved provider id, so a second, smaller report
+    /// adds to the tally instead of replacing it (and records in full in
+    /// the hourly delta instead of clamping to zero).
+    #[tokio::test]
+    async fn opencode_and_unsloth_last_request_reports_sum_at_both_seams() {
+        for provider in ["opencode", "unsloth"] {
+            let h = harness().await;
+            let agent = AgentId::new();
+            let mut session = agent_session(&agent, &h.ws, "gemma-3-27b-it");
+            session.provider = Some(provider.into());
+            h.store
+                .insert_agent_session(&session)
+                .await
+                .expect("insert session");
+            let now = time::OffsetDateTime::now_utc();
+
+            // Turn 1: the final request of a tool loop cost 70/50.
+            // Turn 2: a short turn whose final request cost 30/20 — REPLACE
+            // would leave the tally at 30/20, cumulative subtraction would
+            // clamp the hourly delta to zero.
+            for (input, output) in [(70, 50), (30, 20)] {
+                h.services
+                    .record_turn_usage_stats(
+                        &agent,
+                        &h.ws,
+                        Some(&acp_usage(input, output, 0, 0)),
+                        Duration::from_secs(1),
+                        now,
+                        true,
+                    )
+                    .await;
+                h.services
+                    .persist_turn_token_usage(
+                        &agent,
+                        &h.ws,
+                        Some(&acp_usage(input, output, 0, 0)),
+                        None,
+                    )
+                    .await;
+            }
+
+            let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+            let usage = ws.token_usage.expect("usage persisted");
+            assert_eq!(usage.totals.input_tokens, 100, "{provider}: sum, not last");
+            assert_eq!(usage.totals.output_tokens, 70, "{provider}");
+            assert_eq!(usage.by_agent_id[&agent.0].input_tokens, 100, "{provider}");
+
+            let rows = h.store.list_usage_stats_hourly().await.expect("stats rows");
+            let input: u64 = rows.iter().map(|r| r.input_tokens).sum();
+            let output: u64 = rows.iter().map(|r| r.output_tokens).sum();
+            assert_eq!(input, 100, "{provider}: each report is its own delta");
+            assert_eq!(output, 70, "{provider}");
+        }
     }
 
     /// #3795: a codex totals-only report (`totalTokens > 0`, every breakdown
@@ -38047,23 +42302,16 @@ mod local_changes {
     use intent_core::{now_iso, Error, WorkspaceId};
     use intent_store::Store;
 
-    use super::{workspace, TempDb};
+    use super::{test_tempdir, workspace, TempDb};
     use crate::Services;
 
-    /// Self-cleaning temp directory.
-    struct TempDir(PathBuf);
+    /// Self-cleaning temp directory (see [`test_tempdir`]).
+    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
     impl TempDir {
         fn new() -> Self {
-            let p = std::env::temp_dir().join(format!("intentd-lc-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&p).unwrap();
-            Self(p)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let guard = test_tempdir("intentd-lc-");
+            Self(guard.path().to_path_buf(), guard)
         }
     }
 
@@ -38185,8 +42433,8 @@ mod local_changes {
         let wt = TempDir::new();
         empty_repo(&wt.0);
         let (_t, svc, ws) = setup(Some(&wt.0), false).await;
-        let gone = std::env::temp_dir().join(format!("intentd-lc-gone-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&gone).unwrap();
+        let gone_guard = test_tempdir("intentd-lc-gone-");
+        let gone = gone_guard.path().to_path_buf();
         let root = git_root(&ws.id, &gone);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
         std::fs::remove_dir_all(&gone).unwrap();

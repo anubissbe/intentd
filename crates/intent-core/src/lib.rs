@@ -24,9 +24,12 @@ pub mod config;
 pub mod discovery_cache;
 pub mod error;
 pub mod events;
+pub mod git_remote_url;
 pub mod ids;
 pub mod model;
 pub mod path_utils;
+pub mod replay_preview;
+pub mod repo_ref;
 pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
@@ -49,6 +52,7 @@ pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
 pub use error::{CloneErrorCategory, Error, Result};
 pub use events::is_known_event_type;
+pub use git_remote_url::GitRemoteUrl;
 pub use ids::{
     AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId,
     CHIEF_WORKSPACE_ID,
@@ -77,11 +81,11 @@ pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
 pub use model::{
     ActorType, AgentActivity, AgentCreateExtra, AgentDelegateInput, AgentLite, AgentMessage,
     AgentMetadata, AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
-    AuthorType, BatchTaskEntry, BatchTaskOptions, CheckoutMode, Client, Comment, CommentAddResult,
-    CommentAnchor, CommentAnchorType, CommentDeleteResult, CommentGetThreadResult,
-    CommentListResult, CommentLocation, CommentResolveThreadResult, CommentRespondResult,
-    CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary, CommentType,
-    CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
+    AuthorType, BatchTaskEntry, BatchTaskOptions, CheckoutMode, Client, ClientHostInfo, Comment,
+    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
+    CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
+    CommentRespondResult, CommentRespondThread, CommentStatus, CommentThread, CommentThreadSummary,
+    CommentType, CommentWire, ContentType, ContextItem, ContextLink, ContextLinkKind, ContextUsage,
     CreatedTaskEntry, DiskUsageBreakdownEntry, Draft, Event, EventActor, EventQueryParams,
     EventSubscribeResult, EventUnsubscribeResult, ExecutionEnvironmentRepoConfig, FileActivity,
     FileStatus, GitAgentCommitResult, GitBranchStatus, GitBranches, GitCommitResult, GitFileStatus,
@@ -106,7 +110,12 @@ pub use model::{
     SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
+pub use model::{
+    BrowserTab, BrowserTabInput, BrowserTabSize, BrowserTabSyncResult, BrowserTabUpsertOutcome,
+    BrowserTabVisibility,
+};
 pub use path_utils::prewarm_login_shell_path;
+pub use repo_ref::RepoRef;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
 pub use server_control::ServerControl;
 pub use settings_file::{
@@ -116,8 +125,10 @@ pub use settings_file::{
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{
     AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
-    RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError, WorkspaceApi,
+    ResolvedClient, RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError,
+    ReverseLiveClient, ReverseTarget, WorkspaceApi,
 };
 pub use turn_attachments::{
-    new_attachment_id, AttachmentPolicy, TurnAttachment, TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
+    is_workspace_api_input, new_attachment_id, AttachmentPolicy, TurnAttachment,
+    TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
 };

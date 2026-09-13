@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::{
-    now_iso, ActorType, AgentId, Event, EventActor, Workspace, WorkspaceActivity,
+    now_iso, ActorType, AgentId, Event, EventActor, MessageOrigin, Workspace, WorkspaceActivity,
     WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
@@ -79,6 +79,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -87,23 +88,18 @@ fn workspace(id: &WorkspaceId) -> Workspace {
     }
 }
 
+/// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
+/// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
 struct TempDb {
     path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl TempDb {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(format!("intentd-goldens-{}.db", uuid::Uuid::new_v4()));
-        Self { path }
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm", ".config.toml"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+        let dir = crate::test_support::test_tempdir("intentd-goldens-");
+        let path = dir.path().join("goldens.db");
+        Self { path, _dir: dir }
     }
 }
 
@@ -336,15 +332,28 @@ fn golden_supervisor_history_wrapper() {
         app_message_id: None,
         created_at: "2026-01-02T03:04:05Z".to_string(),
     };
+    // The default per-block cap (4000) keeps the golden byte-identical.
     let xml = crate::history_xml::format_history_as_xml(
         &[msg("user", "hi <&>"), msg("assistant", "done")],
         crate::history_xml::MAX_HISTORY_CHARS,
+        intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS as usize,
     );
+    // intent#3696: the preamble carries the truncation-hint paragraph so the
+    // model does not mistake abbreviated replayed tool blocks for broken tools.
     assert_eq!(
         xml,
         "<supervisor>\n\
          The previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\n\
          Do NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\
+         \n\
+         Note on this replay: some tool inputs and tool outputs below are abbreviated by the recovery \
+         replay. Any tool_use input or tool_result output longer than 4000 characters is \
+         middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a \
+         truncated=\"true\" original_chars=\"N\" attribute on the element); blocks without that \
+         attribute are complete. Older exchanges may be omitted entirely. Truncation here does NOT \
+         mean the tool failed or returned empty output; the original call ran and its full result was \
+         delivered at the time. If you genuinely need one specific full output, re-run that ONE call \
+         once. Do not re-fetch the same inputs repeatedly.\n\
          \n\
          <exchange>\n\
          \x20 <user_request_or_tool_results>\n\
@@ -1503,11 +1512,22 @@ fn golden_supervisor_history_truncation_markers() {
             json!([{ "type": "text", "text": "reply" }]),
         ),
     ];
+    // intent#3696: the preamble includes the truncation-hint paragraph.
+    let hint = "Note on this replay: some tool inputs and tool outputs below are abbreviated by \
+                the recovery replay. Any tool_use input or tool_result output longer than 4000 \
+                characters is middle-truncated (marked by an inline \"... [N characters \
+                truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on \
+                the element); blocks without that attribute are complete. Older exchanges may be \
+                omitted entirely. Truncation here does NOT mean the tool failed or returned empty \
+                output; the original call ran and its full result was delivered at the time. If \
+                you genuinely need one specific full output, re-run that ONE call once. Do not \
+                re-fetch the same inputs repeatedly.\n\n";
     let preamble_len = "<supervisor>\nThe previous ACP session was lost. Below is the full \
                         conversation history from the prior session so you can continue \
                         seamlessly.\nDo NOT mention session recovery to the user. Just \
                         continue naturally as if nothing happened.\n\n"
-        .len();
+        .len()
+        + hint.len();
     let closing_len = "Continue the conversation from this point. Do not mention session \
                        recovery or interruption.\n</supervisor>"
         .len();
@@ -1521,7 +1541,9 @@ fn golden_supervisor_history_truncation_markers() {
                            </exchange>\n";
     let max_omission = "<!-- 2 earlier exchanges omitted due to size limits -->\n".len();
     let budget = preamble_len + closing_len + max_omission + newest_exchange.len();
-    let xml = crate::history_xml::format_history_as_xml(&messages, budget);
+    let tool_content_chars =
+        intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS as usize;
+    let xml = crate::history_xml::format_history_as_xml(&messages, budget, tool_content_chars);
     assert_eq!(
         xml,
         format!(
@@ -1531,6 +1553,7 @@ fn golden_supervisor_history_truncation_markers() {
              Do NOT mention session recovery to the user. Just continue naturally as if \
              nothing happened.\n\
              \n\
+             {hint}\
              <!-- 1 earlier exchanges omitted due to size limits -->\n\
              {newest_exchange}\
              Continue the conversation from this point. Do not mention session recovery or \
@@ -1540,21 +1563,44 @@ fn golden_supervisor_history_truncation_markers() {
     );
     // Middle-truncation marker: an oversized tool_result is head+tail kept
     // with the exact `... [N characters truncated] ...` line between. Cap is
-    // 4000 chars with 60 reserved for the marker (half-budget 1970).
+    // 4000 chars with 60 reserved for the marker (half-budget 1970). Since
+    // intent#3696 the element also carries `truncated="true" original_chars="N"`.
     let big = "y".repeat(5000);
     let messages = vec![msg(
         "m5",
         "user",
         json!([{ "type": "tool_result", "tool_use_id": "t1", "content": big }]),
     )];
-    let xml =
-        crate::history_xml::format_history_as_xml(&messages, crate::history_xml::MAX_HISTORY_CHARS);
+    let xml = crate::history_xml::format_history_as_xml(
+        &messages,
+        crate::history_xml::MAX_HISTORY_CHARS,
+        tool_content_chars,
+    );
     let expected_block = format!(
-        "    <tool_result tool_use_id=\"t1\" is_error=\"false\">\n\
+        "    <tool_result tool_use_id=\"t1\" is_error=\"false\" truncated=\"true\" original_chars=\"5000\">\n\
          \x20     {}\n... [1060 characters truncated] ...\n{}\n\
          \x20   </tool_result>\n",
         "y".repeat(1970),
         "y".repeat(1970),
+    );
+    assert!(xml.contains(&expected_block), "{xml}");
+    // An under-cap tool_result is byte-identical to the pre-#3696 rendering
+    // (no `truncated` attribute, no marker).
+    let messages = vec![msg(
+        "m6",
+        "user",
+        json!([{ "type": "tool_result", "tool_use_id": "t2", "content": "y".repeat(4000) }]),
+    )];
+    let xml = crate::history_xml::format_history_as_xml(
+        &messages,
+        crate::history_xml::MAX_HISTORY_CHARS,
+        tool_content_chars,
+    );
+    let expected_block = format!(
+        "    <tool_result tool_use_id=\"t2\" is_error=\"false\">\n\
+         \x20     {}\n\
+         \x20   </tool_result>\n",
+        "y".repeat(4000),
     );
     assert!(xml.contains(&expected_block), "{xml}");
 }
@@ -2068,7 +2114,16 @@ async fn golden_snapshot_line_shape() {
     let (_t, svc, ws) = setup().await;
     let owner = AgentId::from("agent-snap");
     seed_agent(&svc, &ws, &owner).await;
-    svc.enqueue_message(&owner, "pending".into(), None, None, None, None, false);
+    svc.enqueue_message(
+        &owner,
+        "pending".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     let line = svc
         .agent_state_snapshot_line(&owner)
         .await

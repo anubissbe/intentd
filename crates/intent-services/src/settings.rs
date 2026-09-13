@@ -867,7 +867,7 @@ fn memory_budget_max_mb() -> f64 {
 /// asymmetry strictly one-directional (catalog bound ≤ parse bound), which is
 /// the invariant every claim in these doc comments depends on.
 // MiB counts above 2^53 do not occur; loss-free in f64.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
     match total_memory_bytes.filter(|&bytes| bytes > 0) {
         // INVARIANT: this bound may be tighter than the `config.toml` parse
@@ -1594,6 +1594,30 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             None,
             f64::from(intent_core::config::DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS),
         ),
+        number(
+            "agents.historyReplayToolContentChars",
+            "History replay tool content chars",
+            "Per-block character cap applied to each tool_use input and tool_result output in the recovery replay that rebuilds a lost ACP session; longer bodies are middle-truncated (500-100000; applies live at replay time, no restart required)",
+            "agents",
+            Some(f64::from(
+                intent_core::config::HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN,
+            )),
+            Some(f64::from(
+                intent_core::config::HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX,
+            )),
+            f64::from(intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS),
+        ),
+        number(
+            "agents.toolPayloadRetentionDays",
+            "Tool payload retention days",
+            "Stored tool payloads older than this many days are shrunk to the replay preview used by the recovery replay; the full body is deleted and cannot be recovered (0 disables the sweep and keeps full bodies forever; max 3650; applies live at each sweep tick, no restart required)",
+            "agents",
+            Some(0.0),
+            Some(f64::from(
+                intent_core::config::TOOL_PAYLOAD_RETENTION_DAYS_MAX,
+            )),
+            f64::from(intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS),
+        ),
         enumerated(
             "agents.flushQueuedMessages",
             "Flush queued messages",
@@ -1759,11 +1783,20 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         number(
             "prMonitor.pollSeconds",
             "PR monitor poll seconds",
-            "How often (in seconds) the centralized loop polls each monitored PR (minimum 10)",
+            "Tick cadence (in seconds) of the centralized loop and the per-PR poll interval floor (minimum 10)",
             "prMonitor",
             Some(10.0),
             Some(3_600.0),
             30.0,
+        ),
+        number(
+            "prMonitor.hourlyRequestBudget",
+            "PR monitor hourly request budget",
+            "Forge REST calls per hour the centralized loop plans to spend across all monitored PRs — a cadence cost model, not a hard ceiling: each PR poll is costed at 3 calls (a single-page estimate; paginated review lists and REST fallbacks cost more), so the per-PR interval stretches above pollSeconds once PRs × 3 × 3600 / budget exceeds it; requests are not counted or blocked against it. 1500 is ~30% of GitHub's 5,000/h core quota (minimum 60, maximum 5000)",
+            "prMonitor",
+            Some(60.0),
+            Some(5_000.0),
+            1_500.0,
         ),
     ]
 }
@@ -1834,6 +1867,26 @@ pub fn max_concurrent_adapters(settings: &SettingsFile) -> u32 {
 #[must_use]
 pub fn report_to_parent_debounce_seconds(settings: &SettingsFile) -> u32 {
     settings.agents.report_to_parent_debounce_seconds
+}
+
+/// The effective `agents.historyReplayToolContentChars` setting: the
+/// per-block character cap applied to each `tool_use` input and
+/// `tool_result` output in the recovery replay. The schema bounds it to
+/// 500–100000, so the value passes through as-is — read live from the
+/// settings snapshot at replay time, no restart required.
+#[must_use]
+pub fn history_replay_tool_content_chars(settings: &SettingsFile) -> usize {
+    settings.agents.history_replay_tool_content_chars as usize
+}
+
+/// The effective `agents.toolPayloadRetentionDays` setting: `Some(days)` when
+/// the payload retention sweep is enabled, `None` when it is `0` (keep full
+/// tool bodies forever, today's behaviour) — read live from the settings
+/// snapshot at each sweep tick, no restart required.
+#[must_use]
+pub fn tool_payload_retention_days(settings: &SettingsFile) -> Option<u32> {
+    let days = settings.agents.tool_payload_retention_days;
+    (days > 0).then_some(days)
 }
 
 /// One-time boot import of legacy `config.toml` keys back into the `SQLite`
@@ -2151,7 +2204,7 @@ pub(crate) fn wire_value(def: &SettingDefinition, value: Value) -> Value {
 /// integers via the schema's lenient deserializer.
 // The `n.abs() <= i64::MAX as f64` guard bounds the float→int cast; the
 // i64::MAX→f64 comparison constant rounding up by one ULP is harmless here.
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn registry_value(def: &SettingDefinition, value: &Value) -> Value {
     if let SettingType::Number { .. } = def.ty {
         if let Some(n) = value.as_f64() {
@@ -2318,6 +2371,13 @@ impl<'a> SettingsService<'a> {
     /// a durable file change without a `settings:changed` event. Returns the
     /// **redacted** applied `{ path, value, origin? }` pairs for the response +
     /// `settings:changed` payload.
+    ///
+    /// A sensitive entry whose value is the [`REDACTED_PLACEHOLDER`] is what a
+    /// client echoes back from `settings.list`/`settings.get` for a secret it
+    /// did not touch (intent#4383): with a stored secret it is a no-op for
+    /// that path (the secret is left as is; the entry is still echoed
+    /// redacted), without one it is `-32602` and the whole batch is rejected
+    /// before anything is applied — the placeholder is never stored.
     pub(crate) async fn update(&self, changes: &Value) -> Result<Vec<Value>> {
         let entries = changes
             .as_array()
@@ -2357,6 +2417,15 @@ impl<'a> SettingsService<'a> {
             }
             def.validate(&value)?;
             validate_bare_model_id(path, &value)?;
+            if def.sensitive
+                && value.as_str() == Some(REDACTED_PLACEHOLDER)
+                && self.secrets.load(def.path).await?.is_none()
+            {
+                return Err(Error::InvalidParams(format!(
+                    "{path}: the redaction placeholder cannot be stored as a secret \
+                     (no secret is currently stored for this setting)"
+                )));
+            }
             planned.push((def, value));
         }
 
@@ -2369,11 +2438,17 @@ impl<'a> SettingsService<'a> {
         let mut mutations = Vec::with_capacity(planned.len());
         for (def, value) in planned {
             let unchanged = if def.sensitive {
-                let desired = match &value {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                self.secrets.load(def.path).await?.as_deref() == Some(desired.as_str())
+                // The placeholder stays in the plan so the entry is echoed
+                // (redacted) even though the secret itself is left untouched.
+                if value.as_str() == Some(REDACTED_PLACEHOLDER) {
+                    false
+                } else {
+                    let desired = match &value {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    self.secrets.load(def.path).await?.as_deref() == Some(desired.as_str())
+                }
             } else if let Some(reg) = self.registry_for(def.path) {
                 match reg.origin(def.path) {
                     Some(SettingOrigin::File) => reg
@@ -2425,14 +2500,20 @@ impl<'a> SettingsService<'a> {
         let mut applied = Vec::with_capacity(planned.len());
         for (def, value) in planned {
             let persisted = if def.sensitive {
-                let secret_value = match &value {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                self.secrets
-                    .store(def.path, &secret_value)
-                    .await
-                    .map(|()| json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
+                if value.as_str() == Some(REDACTED_PLACEHOLDER) {
+                    // Presence was verified during validation: keep the
+                    // stored secret, echo the redacted entry.
+                    Ok(json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
+                } else {
+                    let secret_value = match &value {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    self.secrets
+                        .store(def.path, &secret_value)
+                        .await
+                        .map(|()| json!({ "path": def.path, "value": REDACTED_PLACEHOLDER }))
+                }
             } else if self.registry_for(def.path).is_some() {
                 // Already applied via the registry batch above. Normalize the
                 // echoed value so number-typed settings keep the float wire
@@ -2883,6 +2964,114 @@ mod tests {
         }
     }
 
+    /// Regression (intent#4383): a client that round-trips `settings.list`
+    /// back into `settings.update` echoes the redaction placeholder for every
+    /// sensitive path it did not touch. The placeholder MUST NOT replace the
+    /// stored secret; the entry is echoed (redacted) without a store write,
+    /// and a literal value still replaces as before.
+    #[tokio::test]
+    async fn update_with_redaction_placeholder_keeps_stored_secret() {
+        let tmp = std::env::temp_dir().join(format!(
+            "intentd-settings-placeholder-keep-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::open(&tmp).await.expect("open store");
+        let raw_secrets = Arc::new(InMemorySecretStore::default());
+        let secrets: Arc<dyn SecretStore> = raw_secrets.clone();
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, None);
+
+        svc.update(&json!([{ "path": "linear.token", "value": "lin_original" }]))
+            .await
+            .expect("store the original secret");
+        assert_eq!(
+            raw_secrets.load("linear.token").expect("load"),
+            Some("lin_original".to_string())
+        );
+
+        // Echoing the placeholder is a no-op for the secret; the applied
+        // entry still carries the redacted value.
+        let applied = svc
+            .update(&json!([{ "path": "linear.token", "value": REDACTED_PLACEHOLDER }]))
+            .await
+            .expect("placeholder on a stored secret must be accepted");
+        assert_eq!(
+            applied,
+            vec![json!({ "path": "linear.token", "value": REDACTED_PLACEHOLDER })]
+        );
+        assert_eq!(
+            raw_secrets.load("linear.token").expect("load"),
+            Some("lin_original".to_string()),
+            "placeholder must not clobber the stored secret"
+        );
+
+        // A literal value still replaces the stored secret.
+        svc.update(&json!([{ "path": "linear.token", "value": "lin_rotated" }]))
+            .await
+            .expect("literal replaces");
+        assert_eq!(
+            raw_secrets.load("linear.token").expect("load"),
+            Some("lin_rotated".to_string())
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// Regression (intent#4383): the placeholder on a sensitive path with
+    /// **no** stored secret is `-32602`, and the whole batch is rejected
+    /// atomically — a sibling non-sensitive change in the same batch is not
+    /// applied (registry key stays at its default, config.toml untouched).
+    #[tokio::test]
+    async fn update_with_redaction_placeholder_and_no_secret_rejects_whole_batch() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp =
+            std::env::temp_dir().join(format!("intentd-settings-placeholder-reject-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-placeholder-reject-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let raw_secrets = Arc::new(InMemorySecretStore::default());
+        let secrets: Arc<dyn SecretStore> = raw_secrets.clone();
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let err = svc
+            .update(&json!([
+                { "path": "git.autoCommit", "value": false },
+                { "path": "linear.token", "value": REDACTED_PLACEHOLDER },
+            ]))
+            .await
+            .expect_err("placeholder without a stored secret must be rejected");
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "expected Error::InvalidParams, got {err:?}"
+        );
+        assert_eq!(
+            raw_secrets.load("linear.token").expect("load"),
+            None,
+            "the placeholder must never be stored as a secret"
+        );
+        let got = svc.get("git.autoCommit").await.expect("get sibling");
+        assert_eq!(got["value"], json!(true), "sibling change must not apply");
+        assert_eq!(got["origin"], json!("default"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("autoCommit"), "{text}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
     /// `max_concurrent_agents` reads the effective `agents.maxConcurrent`:
     /// positive value → explicit override; 0 (the schema default) → `None`
     /// (fallback to `default_process_cap()`). Negative / garbled values are
@@ -2950,7 +3139,7 @@ mod tests {
     /// always succeeds; a zero reading is treated as undetected so the max
     /// never collapses onto the minimum.
     #[test]
-    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
+    #[expect(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn memory_budget_max_tracks_detected_ram_with_static_fallback() {
         assert_eq!(
             memory_budget_max_mb_for(Some(48 * 1024 * 1024 * 1024)),
@@ -3000,7 +3189,7 @@ mod tests {
     /// the parse bound, which is every real one but need not be assumed.
     #[test]
     // The advertised max is a small whole-valued float: casts are exact.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn memory_budget_catalog_bound_is_never_looser_than_the_parse_bound() {
         let def = find_definition("agents.memoryBudgetMb").expect("in catalog");
         let max = memory_budget_max_mb();
@@ -3039,7 +3228,7 @@ mod tests {
     /// `settings.update` to config.toml (never `SQLite`) and rejects
     /// out-of-range values.
     #[tokio::test]
-    #[allow(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
+    #[expect(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
     async fn agents_acp_node_max_old_space_mb_round_trip_via_registry() {
         let path = "agents.acpNodeMaxOldSpaceMb";
         let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
@@ -3300,6 +3489,240 @@ mod tests {
             0,
             "0 must pass through — it means disabled, not \"fall back to default\""
         );
+    }
+
+    /// `agents.historyReplayToolContentChars` is a TOML-backed bounded number
+    /// (500–100000, default 4000) in the `agents` category, registered in
+    /// `KNOWN_PATHS`; its catalog default matches the schema default and its
+    /// description states what the cap bounds (chars per `tool_use` input /
+    /// `tool_result` output in the recovery replay). The live accessor passes
+    /// the configured value through.
+    #[test]
+    fn history_replay_tool_content_chars_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.historyReplayToolContentChars")
+            .expect("agents.historyReplayToolContentChars missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(500.0),
+                max: Some(100_000.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(4000.0)));
+        assert_eq!(
+            intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
+            4000
+        );
+        assert_eq!(
+            SettingsFile::default()
+                .agents
+                .history_replay_tool_content_chars,
+            intent_core::config::DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.historyReplayToolContentChars"));
+        for needle in ["tool_use input", "tool_result output", "recovery replay"] {
+            assert!(
+                def.description.contains(needle),
+                "description must state what the cap bounds ({needle}): {}",
+                def.description
+            );
+        }
+        def.validate(&json!(500)).expect("the lower bound is legal");
+        def.validate(&json!(100_000))
+            .expect("the upper bound is legal");
+        assert!(def.validate(&json!(0)).is_err(), "no 0 escape hatch");
+        assert!(def.validate(&json!(499)).is_err());
+        assert!(def.validate(&json!(100_001)).is_err());
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(history_replay_tool_content_chars(&settings), 4000);
+        settings.agents.history_replay_tool_content_chars = 12_000;
+        assert_eq!(history_replay_tool_content_chars(&settings), 12_000);
+    }
+
+    /// `agents.toolPayloadRetentionDays` is a TOML-backed bounded number
+    /// (0 = keep forever, max 3650, default 0) in the `agents` category,
+    /// registered in `KNOWN_PATHS`; its description states that the sweep
+    /// shrinks stored payloads older than N days to the replay preview and
+    /// that 0 disables it. The live accessor maps 0 to `None`.
+    #[test]
+    fn tool_payload_retention_days_catalog_entry_is_toml_backed() {
+        let def = find_definition("agents.toolPayloadRetentionDays")
+            .expect("agents.toolPayloadRetentionDays missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "agents");
+        assert!(matches!(
+            def.ty,
+            SettingType::Number {
+                min: Some(0.0),
+                max: Some(3650.0)
+            }
+        ));
+        assert_eq!(def.default_value, Some(json!(0.0)));
+        assert_eq!(intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS, 0);
+        assert_eq!(
+            SettingsFile::default().agents.tool_payload_retention_days,
+            intent_core::config::DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS,
+        );
+        assert!(KNOWN_PATHS.contains(&"agents.toolPayloadRetentionDays"));
+        for needle in ["older than", "replay preview", "0 disables"] {
+            assert!(
+                def.description.contains(needle),
+                "description must state the retention semantics ({needle}): {}",
+                def.description
+            );
+        }
+        def.validate(&json!(0))
+            .expect("0 is legal — it keeps full bodies forever");
+        def.validate(&json!(3650))
+            .expect("the upper bound is legal");
+        assert!(def.validate(&json!(3651)).is_err());
+        assert!(def.validate(&json!(-1)).is_err());
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(
+            tool_payload_retention_days(&settings),
+            None,
+            "0 must resolve to None — the sweep is disabled"
+        );
+        settings.agents.tool_payload_retention_days = 30;
+        assert_eq!(tool_payload_retention_days(&settings), Some(30));
+    }
+
+    /// Both retention knobs round-trip through the registry-wired service
+    /// exactly like `workspaceApi.maxOutputChars`: defaults read with
+    /// `default` origin, updates persist to config.toml (`file` origin, never
+    /// `SQLite`) and are visible on the live snapshot, out-of-range values
+    /// reject with `-32602` and leave the prior value untouched, and reset
+    /// restores the defaults.
+    #[tokio::test]
+    async fn tool_payload_retention_settings_round_trip_via_registry() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-retention-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-retention-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(4000.0));
+        assert_eq!(got["origin"], json!("default"));
+        let got = svc
+            .get("agents.toolPayloadRetentionDays")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(0.0));
+        assert_eq!(got["origin"], json!("default"));
+
+        svc.update(&json!([
+            { "path": "agents.historyReplayToolContentChars", "value": 8000 },
+            { "path": "agents.toolPayloadRetentionDays", "value": 30 },
+        ]))
+        .await
+        .expect("update");
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(8000.0));
+        assert_eq!(got["origin"], json!("file"));
+        let got = svc
+            .get("agents.toolPayloadRetentionDays")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(30.0));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("historyReplayToolContentChars"), "{text}");
+        assert!(text.contains("toolPayloadRetentionDays"), "{text}");
+        for path in [
+            "agents.historyReplayToolContentChars",
+            "agents.toolPayloadRetentionDays",
+        ] {
+            assert_eq!(
+                store.get_setting(path).await.expect("read settings table"),
+                None,
+                "TOML-backed keys must never write a SQLite settings row"
+            );
+        }
+        // The live snapshot every accessor reads sees the update immediately.
+        let live = registry.snapshot().effective.clone();
+        assert_eq!(history_replay_tool_content_chars(&live), 8000);
+        assert_eq!(tool_payload_retention_days(&live), Some(30));
+
+        // Out-of-range values reject via the typed schema (-32602) and the
+        // prior values are untouched.
+        for (path, value) in [
+            ("agents.historyReplayToolContentChars", 499),
+            ("agents.historyReplayToolContentChars", 100_001),
+            ("agents.toolPayloadRetentionDays", 3651),
+        ] {
+            let err = svc
+                .update(&json!([{ "path": path, "value": value }]))
+                .await
+                .expect_err("out-of-range value must reject");
+            assert!(
+                matches!(err, Error::InvalidParams(ref msg) if msg.contains(path)),
+                "expected InvalidParams naming {path}, got {err:?}"
+            );
+        }
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(8000.0));
+        let got = svc
+            .get("agents.toolPayloadRetentionDays")
+            .await
+            .expect("get");
+        assert_eq!(got["value"], json!(30.0));
+        let live = registry.snapshot().effective.clone();
+        assert_eq!(history_replay_tool_content_chars(&live), 8000);
+        assert_eq!(tool_payload_retention_days(&live), Some(30));
+
+        // 0 (keep forever) is accepted for the retention window.
+        svc.update(&json!([{ "path": "agents.toolPayloadRetentionDays", "value": 0 }]))
+            .await
+            .expect("0 = keep forever must be accepted");
+        assert_eq!(
+            tool_payload_retention_days(&registry.snapshot().effective),
+            None
+        );
+
+        let reset = svc
+            .reset("agents.historyReplayToolContentChars")
+            .await
+            .expect("reset");
+        assert_eq!(reset["value"], json!(4000.0));
+        let reset = svc
+            .reset("agents.toolPayloadRetentionDays")
+            .await
+            .expect("reset");
+        assert_eq!(reset["value"], json!(0.0));
+        let got = svc
+            .get("agents.historyReplayToolContentChars")
+            .await
+            .expect("get");
+        assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
     }
 
     /// `server.maxOutstandingRpcs` is a non-secret TOML-backed bounded number
@@ -3887,33 +4310,56 @@ mod tests {
         );
     }
 
-    /// `[prMonitor]` exposes two TOML-backed numbers with a floor of 10:
-    /// `debounceSeconds` (default 60) and `pollSeconds` (default 30, a
-    /// config-file key the Settings UI does not surface). Both round-trip
-    /// through the registry-wired service and reject sub-floor values.
+    /// `[prMonitor]` exposes three TOML-backed numbers: `debounceSeconds`
+    /// (default 60, floor 10), `pollSeconds` (default 30, floor 10) and
+    /// `hourlyRequestBudget` (default 1500, floor 60, max 5000) — the latter
+    /// two are config-file keys the Settings UI does not surface. All
+    /// round-trip through the registry-wired service and reject sub-floor
+    /// values.
     #[tokio::test]
     async fn pr_monitor_intervals_round_trip_via_registry() {
-        for (path, default) in [
-            ("prMonitor.debounceSeconds", 60.0),
-            ("prMonitor.pollSeconds", 30.0),
+        for (path, default, floor) in [
+            ("prMonitor.debounceSeconds", 60.0, 10.0),
+            ("prMonitor.pollSeconds", 30.0, 10.0),
+            ("prMonitor.hourlyRequestBudget", 1500.0, 60.0),
         ] {
             let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
             assert!(!def.sensitive, "{path} must be non-secret");
             assert!(!def.read_only, "{path} must not be read-only");
             assert_eq!(def.category, "prMonitor");
+            let SettingType::Number { min, .. } = def.ty else {
+                panic!("{path} must be a number setting");
+            };
             assert!(
-                matches!(
-                    def.ty,
-                    SettingType::Number {
-                        min: Some(10.0),
-                        ..
-                    }
-                ),
-                "{path} number with a floor of 10"
+                min.is_some_and(|m| (m - floor).abs() < f64::EPSILON),
+                "{path} floor must be {floor}, got {min:?}"
             );
             assert_eq!(def.default_value, Some(json!(default)), "{path} default");
             assert!(KNOWN_PATHS.contains(&path), "{path} must be TOML-backed");
         }
+        assert!(
+            matches!(
+                find_definition("prMonitor.hourlyRequestBudget").unwrap().ty,
+                SettingType::Number {
+                    max: Some(5000.0),
+                    ..
+                }
+            ),
+            "hourlyRequestBudget caps at 5000"
+        );
+        // The catalog range and the read-time clamp constants must agree.
+        assert_eq!(
+            intent_core::config::MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            60
+        );
+        assert_eq!(
+            intent_core::config::MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            5000
+        );
+        assert_eq!(
+            intent_core::config::DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET,
+            1500
+        );
 
         let tag = uuid::Uuid::new_v4();
         let tmp = std::env::temp_dir().join(format!("intentd-settings-prmon-{tag}.db"));
@@ -3928,6 +4374,7 @@ mod tests {
         for (path, default) in [
             ("prMonitor.debounceSeconds", 60.0),
             ("prMonitor.pollSeconds", 30.0),
+            ("prMonitor.hourlyRequestBudget", 1500.0),
         ] {
             let got = svc.get(path).await.expect("get");
             assert_eq!(got["value"], json!(default), "{path} default");
@@ -4313,7 +4760,7 @@ mod tests {
     /// PROTOCOL §5.12, v4.6); it persists through `settings.update` to
     /// config.toml (never `SQLite`) and rejects out-of-range values.
     #[tokio::test]
-    #[allow(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
+    #[expect(clippy::float_cmp)] // asserting exact literal bounds from the setting definition
     async fn voice_workspace_vocabulary_max_terms_is_a_bounded_toml_number() {
         let path = "voice.workspaceVocabulary.maxTerms";
         let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));

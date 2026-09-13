@@ -58,6 +58,7 @@ fn sample_ws() -> Workspace {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -207,6 +208,7 @@ impl WorkspaceApi for FakeApi {
                         branch: None,
                         dirty_files: vec![],
                         sandbox_branches: vec![],
+                        submodules: vec![],
                     },
                 },
                 total_size_bytes: 100,
@@ -569,6 +571,7 @@ impl WorkspaceApi for FakeApi {
                 created_task_note_ids: vec![],
                 created_tasks: vec![],
                 warnings: vec![],
+                rev: 1,
             })
         })
     }
@@ -664,7 +667,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         _workspace_id: WorkspaceId,
@@ -687,7 +689,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_add(
         &self,
         _workspace_id: WorkspaceId,
@@ -721,7 +722,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_respond(
         &self,
         _workspace_id: WorkspaceId,
@@ -804,7 +804,7 @@ impl WorkspaceApi for FakeApi {
     }
 
     // Small test values: loss-free in f64.
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(clippy::cast_precision_loss)]
     fn event_workspace_summary(
         &self,
         _workspace_id: WorkspaceId,
@@ -1314,7 +1314,6 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         _workspace_id: WorkspaceId,
@@ -5752,7 +5751,7 @@ mod send_message_payload_forwarding {
     /// observed shape.
     #[derive(Default, Debug, Clone)]
     // Unasserted fields are written but never read; kept to document the shape.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     struct Capture {
         workspace_id: Option<WorkspaceId>,
         agent_id: Option<AgentId>,
@@ -5775,7 +5774,6 @@ mod send_message_payload_forwarding {
     }
 
     impl WorkspaceApi for RecordingApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_send_message(
             &self,
             workspace_id: WorkspaceId,
@@ -6410,7 +6408,6 @@ mod edit_and_regenerate {
     }
 
     impl WorkspaceApi for RecordingApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_edit_and_regenerate(
             &self,
             workspace_id: WorkspaceId,
@@ -6541,7 +6538,6 @@ mod edit_and_regenerate {
     struct RejectingApi;
 
     impl WorkspaceApi for RejectingApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_edit_and_regenerate(
             &self,
             _workspace_id: WorkspaceId,
@@ -6800,7 +6796,6 @@ mod oversized_response {
     struct HugeApi;
 
     impl WorkspaceApi for HugeApi {
-        #[allow(clippy::too_many_arguments)]
         fn agent_edit_and_regenerate(
             &self,
             _workspace_id: WorkspaceId,

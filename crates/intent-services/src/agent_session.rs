@@ -26,7 +26,7 @@ use intent_core::events::{
 };
 use intent_core::{
     now_epoch_ms, now_iso, ActorType, AgentId, AgentSession, ContextUsage, Error, EventActor,
-    Result, UsageCost, WorkspaceId, WorkspaceStatus,
+    MessageOrigin, Result, UsageCost, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::NewEvent;
 use serde_json::{json, Value};
@@ -354,6 +354,13 @@ struct Transcript {
     /// long tool runs are legitimately silent. Anonymous updates dropped by
     /// `record_tool` (STAB-124) never enter this set.
     open_tool_calls: HashSet<String>,
+    /// `toolCallId`s whose recorded name came from an authoritative
+    /// identifier (`MappedToolCall::name_authoritative`: MCP `server`/`tool`
+    /// metadata or a namespaced title) on any frame so far. The §7.1 registry
+    /// claim's input-shape gate is withheld for these ids: a foreign tool
+    /// whose arguments happen to be `{ code, summary }` keeps its own name
+    /// and must never claim a `workspace_api` batch (intent-hq/intent#4491).
+    identified_tool_calls: HashSet<String>,
 }
 
 /// The block indices one [`Transcript::record_tool`] call materialized. The
@@ -384,6 +391,7 @@ impl Transcript {
             proposal_index: HashMap::new(),
             usage_cost: None,
             open_tool_calls: HashSet::new(),
+            identified_tool_calls: HashSet::new(),
         }
     }
 
@@ -558,6 +566,9 @@ impl Transcript {
                 index
             }
         };
+        if tc.name_authoritative {
+            self.identified_tool_calls.insert(tc.tool_call_id.clone());
+        }
         let mut result_index = None;
         let mut proposal_indices = Vec::new();
         let completed = tc.status == "completed" || tc.status == "error";
@@ -664,6 +675,26 @@ impl Transcript {
     fn tool_name_for(&self, tool_call_id: &str) -> Option<&str> {
         let &i = self.tool_use_index.get(tool_call_id)?;
         self.blocks[i].get("name").and_then(Value::as_str)
+    }
+
+    /// The input the §7.1 registry claim's input-shape gate may inspect for
+    /// `tc` (intent-hq/intent#4491): the update's own input when it carries
+    /// one (the freshest — `record_tool` is about to replace the block input
+    /// with it, and a first sight with `rawInput: null` persisted only an
+    /// `_acpTitle` placeholder), otherwise the input recorded at first sight
+    /// (`tool_call_update`s are usually input-less). `None` when the call was
+    /// authoritatively identified on this or any earlier frame
+    /// ([`identified_tool_calls`](Self::identified_tool_calls)) — the gate
+    /// is for identifier-less frames only — or when no input exists.
+    fn unidentified_input_for<'a>(&'a self, tc: &'a MappedToolCall) -> Option<&'a Value> {
+        if tc.name_authoritative || self.identified_tool_calls.contains(&tc.tool_call_id) {
+            return None;
+        }
+        if !tc.input.is_null() {
+            return Some(&tc.input);
+        }
+        let &i = self.tool_use_index.get(&tc.tool_call_id)?;
+        self.blocks[i].get("input").filter(|v| !v.is_null())
     }
 
     fn into_blocks(mut self) -> Vec<Value> {
@@ -1088,7 +1119,7 @@ pub(crate) struct HarnessWakeOutcome {
     /// (the persisted-row event pair already carries the id); exercised by
     /// the wake-turn unit tests (hence the allow — the lib build has no
     /// reader).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub message_id: Option<String>,
     /// `true` when the turn's finalized transcript carried no meaningful
     /// content (see [`harness_wake_response_is_empty`]) — the incident
@@ -1219,6 +1250,64 @@ pub(crate) fn resolve_provider_id(
                 .filter(|p| !p.is_empty())
                 .map(std::string::ToString::to_string)
         })
+}
+
+/// Resolve the provider id the agent's failing TURN ran on, for event
+/// annotation: `last_turn_provider` (the identity the turn committed) with
+/// the session's persisted `provider` column — under the same precedence
+/// [`resolve_provider_id`] applies at spawn time — as the fallback, so the
+/// reported id matches the binary the failing turn used.
+///
+/// Only for a turn that actually ran. A failure during spawn / ACP session
+/// setup happens BEFORE the new identity commits, so `last_turn_provider`
+/// still names the previous provider there; that publisher reads the
+/// attempt's resolved provider instead
+/// (`agent_manager::FailedProviderSource::SpawnAttempt`).
+///
+/// Best-effort and non-fatal by construction: a store error or an
+/// unresolvable provider yields `None` and the caller simply omits the field.
+/// Nothing durable hangs off this — it exists so a terminal `agent:failed`
+/// can name the provider that failed without the client having to correlate
+/// a follow-up `agent.get` read against a session whose provider a concurrent
+/// `agent.setModel` may already have changed.
+pub(crate) async fn session_provider_id(
+    services: &Services,
+    workspace_id: &WorkspaceId,
+    agent_id: &AgentId,
+) -> Option<String> {
+    // Prefer `last_turn_provider` — the identity the FAILING turn actually
+    // committed — over the session's current `provider`. The session row is
+    // mutable: a concurrent `agent.setModel` landing between the running
+    // provider's quota rejection and this read would otherwise name the newly
+    // selected provider as the exhausted one, steering the client's retry away
+    // from the only provider that still works. NULL until the agent's first
+    // turn commits, so the session row remains the fallback.
+    if let Ok((_, Some(turn_provider))) = services
+        .store
+        .get_agent_session_last_turn_model(workspace_id, agent_id)
+        .await
+    {
+        if let Some(resolved) = resolve_provider_id(
+            Some(turn_provider.as_str()),
+            derived_default_provider(&services.effective_settings()).as_deref(),
+        ) {
+            return Some(resolved);
+        }
+    }
+    match services
+        .store
+        .get_agent_session_token_usage(workspace_id, agent_id)
+        .await
+    {
+        Ok((_, _, provider, _)) => resolve_provider_id(
+            provider.as_deref(),
+            derived_default_provider(&services.effective_settings()).as_deref(),
+        ),
+        Err(e) => {
+            tracing::warn!(agent = %agent_id, error = %e, "read provider for event annotation failed");
+            None
+        }
+    }
 }
 
 /// The loud `-32602`-style error for provider resolution that falls through
@@ -1434,7 +1523,7 @@ fn select_entry<'a>(
 /// - codex: `{ "sessionTitle": "<agent name>" }?` (present only when a non-blank
 ///   `session_title` is supplied — monorepo#3151; older adapters ignore the
 ///   unknown field). The system prompt stays on the first-turn prepend fallback
-///   because the pinned codex-acp adapter (1.6.2) ignores
+///   because the pinned codex-acp adapter (1.9.0) ignores
 ///   `_meta.developerInstructions` (#479) — it is never moved into `_meta`.
 fn build_session_meta(
     provider_id: &str,
@@ -2694,7 +2783,7 @@ impl Services {
     /// id (monorepo#1022), stamped on the failure-arm `agent:failed` when
     /// present; bare callers (tests, harness paths) may pass `None` and the
     /// field is omitted.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     /// # Errors
     ///
     /// Returns `Error::Internal` if the `session/prompt` request fails or the transport drops mid-turn.
@@ -3396,6 +3485,34 @@ impl Services {
             }
             _ => None,
         };
+        // Quota-exhaustion observation: resolved in the SAME pre-persist seam
+        // as the auth mapping above, for the same reason — this is the last
+        // place the structured `AcpError` still exists, before the final
+        // `map_err` flattens it into the `session/prompt failed: …` wrapper.
+        //
+        // Unlike the auth branch this changes NOTHING durable: the wrapped
+        // error, the persisted `stop_reason`, and the returned error are
+        // byte-identical to before, and the failure stays terminal exactly as
+        // today. The sole consumer is the additive `errorCode`/`providerId`
+        // stamp on the `agent:failed` emit below, which lets the FE offer
+        // "retry on another provider" without string-matching the rendered
+        // prose. Guarded by the same two suppression predicates as that emit
+        // (a pre-output transport failure and an idle timeout both defer their
+        // terminal events to the turn worker) so the provider read only costs
+        // a row on a failure this path actually reports.
+        let (prompt_quota_failure, prompt_quota_provider) = match &result {
+            Err(e)
+                if !pre_output_transport_failure
+                    && !prompt_idle_timeout
+                    && intent_acp::is_quota_exceeded(e) =>
+            {
+                (
+                    true,
+                    session_provider_id(self, workspace_id, agent_id).await,
+                )
+            }
+            _ => (false, None),
+        };
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout {
                 let wrapped = match prompt_auth_message.as_deref() {
@@ -3640,6 +3757,18 @@ impl Services {
                 let mut data = json!({ "agentId": agent_id.0, "error": error_text });
                 if let Some(tid) = turn_id {
                     data["turnId"] = json!(tid);
+                }
+                // Additive quota signal (absent on every other failure, never
+                // `false`/`null`), classified above from the structured
+                // `AcpError`. Same shape and same additive contract as
+                // `sessionCorrupted` on `agent:status-changed`: a structured
+                // restatement of a verdict the daemon already reached, so the
+                // client does not have to re-derive it from prose.
+                if prompt_quota_failure {
+                    crate::agent_manager::stamp_quota_failure(
+                        &mut data,
+                        prompt_quota_provider.as_deref(),
+                    );
                 }
                 self.publish_agent_event(workspace_id, agent_id, AGENT_FAILED, data)
                     .await;
@@ -4089,7 +4218,7 @@ impl Services {
                     "empty harness-wake response on a delegated in-task agent — enqueueing recovery nudge (monorepo#3262)"
                 );
                 let nudge = crate::harness::latest().empty_wake_redrive_nudge();
-                self.enqueue_message_with_origin(
+                self.enqueue_message(
                     agent_id,
                     nudge,
                     None,
@@ -4097,7 +4226,7 @@ impl Services {
                     Some(json!({ "type": "empty_wake_redrive" })),
                     None,
                     false,
-                    false,
+                    MessageOrigin::Automatic,
                 );
                 self.publish_queue_updated(agent_id).await;
                 return true;
@@ -4713,16 +4842,20 @@ impl Services {
                 // the echoed output, `workspace_api` FIFO fallback). A hit
                 // yields the canonical resource items to attach — no echo
                 // parsing; a miss falls back to the legacy lift inside
-                // `record_tool`. `tool_call_update`s are name-less, so the
-                // FIFO gate resolves the name recorded at first sight.
+                // `record_tool`. `tool_call_update`s are name-less (and
+                // usually input-less), so the name gate resolves the name
+                // recorded at first sight and the input-shape gate sees the
+                // freshest input — withheld once the call was identified
+                // authoritatively (intent-hq/intent#4491).
                 let known = transcript.tool_name_for(&tc.tool_call_id).is_some();
                 let registered: Vec<Value> = if tc.status == "completed" {
                     let name = transcript
                         .tool_name_for(&tc.tool_call_id)
                         .unwrap_or(&tc.tool_name)
                         .to_string();
+                    let input = transcript.unidentified_input_for(&tc);
                     self.turn_attachments
-                        .claim_at_tool_result(agent_id, tc.output.as_ref(), &name)
+                        .claim_at_tool_result(agent_id, tc.output.as_ref(), &name, input)
                         .iter()
                         .map(intent_core::TurnAttachment::resource_item)
                         .collect()

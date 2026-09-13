@@ -640,7 +640,7 @@ pub(crate) async fn gc_orphaned_sandboxes(store: &Store) -> Result<()> {
 /// [`merge_sandbox_with`] for the policy-aware variant (all production
 /// callers thread the workspace's auto-commit policy through it; this
 /// shorthand serves the unit tests).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(test), expect(dead_code))]
 pub async fn merge_sandbox(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -1784,6 +1784,7 @@ mod tests {
             diff_summary: None,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             display_status: None,
             waiting: false,
             checkout_mode: None,

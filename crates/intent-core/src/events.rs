@@ -24,6 +24,13 @@ pub(crate) const FILE_RENAMED: &str = "file:renamed";
 // Agent lifecycle events.
 pub const AGENT_STARTED: &str = "agent:started";
 pub const AGENT_COMPLETED: &str = "agent:completed";
+// Terminal turn failure. Payload: `{ agentId, error, turnId? }`, plus — when
+// the failure classifies as a provider usage/quota rejection
+// (`intent_acp::is_quota_exceeded`) — the additive pair `errorCode:
+// "quota-exceeded"` and `providerId` (the provider whose allowance ran out,
+// omitted when it cannot be resolved). Both are ABSENT on every other
+// failure, never `false`/`null`: they exist so clients can offer "retry on
+// another provider" without pattern-matching the rendered `error` prose.
 pub const AGENT_FAILED: &str = "agent:failed";
 pub const AGENT_TOOL_CALL: &str = "agent:tool:call";
 pub const AGENT_MESSAGE: &str = "agent:message";
@@ -487,6 +494,21 @@ pub const SKILLS_CHANGED: &str = "skills:changed";
 // `{ workspaceId }`.
 pub const SPECIALISTS_CHANGED: &str = "specialists:changed";
 
+// Daemon-owned browser tab registry events (REV-2, intent-hq/intent#461).
+// Workspace-scoped; the self-sufficient payload is `{ tab }` for
+// `browser:tab-opened` / `browser:tab-closed` and `{ tab, changes }` for
+// `browser:tab-updated`, where `changes` is the field-wise diff of the
+// host-reported wire fields (url / requestedUrl / title / owner / visibility /
+// emulatedSize). Emitted from the host-reporting RPCs (`browser.upsertTab`,
+// `browser.removeTab`, `browser.syncTabs`); a report that changes nothing
+// emits nothing. A `tabId` is bound to the workspace that created it: a
+// report naming another `workspaceId` is rejected (-32602) rather than moving
+// the row, since a move would strand the old workspace's subscribers with a
+// ghost tab.
+pub const BROWSER_TAB_OPENED: &str = "browser:tab-opened";
+pub const BROWSER_TAB_UPDATED: &str = "browser:tab-updated";
+pub const BROWSER_TAB_CLOSED: &str = "browser:tab-closed";
+
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
 pub const ALL_EVENT_TYPES: &[&str] = &[
@@ -633,6 +655,9 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     SANDBOX_VM_ERROR,
     SKILLS_CHANGED,
     SPECIALISTS_CHANGED,
+    BROWSER_TAB_OPENED,
+    BROWSER_TAB_UPDATED,
+    BROWSER_TAB_CLOSED,
 ];
 
 /// True iff `event_type` is part of the canonical taxonomy.

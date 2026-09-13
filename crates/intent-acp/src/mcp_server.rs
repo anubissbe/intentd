@@ -55,7 +55,7 @@ pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// The agent→BE MCP server: a fixed workspace context, the shared service
 /// surface, and the set of tool names denied for this agent's type.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct WorkspaceMcpServer {
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
@@ -450,7 +450,7 @@ impl WorkspaceMcpServer {
 }
 
 // By-value: callers hand over freshly built payloads.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 fn ok(id: &Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }

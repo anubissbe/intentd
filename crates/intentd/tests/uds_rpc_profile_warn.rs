@@ -20,18 +20,17 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
-use uuid::Uuid;
 
 struct Daemon {
     child: Child,
-    data_dir: PathBuf,
+    /// Swept after `Drop` reaps the child (fields drop after `drop()` runs).
+    _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
@@ -39,9 +38,8 @@ impl Drop for Daemon {
 /// `data_dir/daemon.log`, plus the given extra env vars.
 fn spawn_daemon(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, PathBuf, PathBuf) {
     // Keep the data dir short so `data_dir/intentd.sock` fits within SUN_LEN.
-    let id = Uuid::new_v4().simple().to_string();
-    let data_dir = PathBuf::from("/tmp").join(format!("{prefix}-{}", &id[..8]));
-    std::fs::create_dir_all(&data_dir).expect("mkdir data dir");
+    let data_dir_guard = common::test_tempdir_in("/tmp", &format!("{prefix}-"));
+    let data_dir = data_dir_guard.path().to_path_buf();
     let socket = data_dir.join("intentd.sock");
     let log_path = data_dir.join("daemon.log");
     let log = std::fs::File::create(&log_path).expect("create daemon log");
@@ -61,7 +59,7 @@ fn spawn_daemon(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, PathBuf, PathBu
     (
         Daemon {
             child,
-            data_dir: data_dir.clone(),
+            _data_dir: data_dir_guard,
         },
         socket,
         log_path,
@@ -192,19 +190,13 @@ async fn default_thresholds_stay_quiet_for_normal_traffic() {
     );
 }
 
-struct TempRepo(PathBuf);
-
-impl Drop for TempRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+struct TempRepo(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 /// Create a temporary git repo (initial commit on `main`) carrying the given
 /// `.intent/config.json` contents.
 fn create_repo_with_config(config: &str) -> TempRepo {
-    let repo_path = std::env::temp_dir().join(format!("itdp-repo-{}", Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&repo_path).expect("mkdir repo");
+    let repo_dir = common::test_tempdir("itdp-repo-");
+    let repo_path = repo_dir.path().to_path_buf();
     let git = |args: &[&str]| {
         let out = Command::new("git")
             .args(args)
@@ -222,7 +214,7 @@ fn create_repo_with_config(config: &str) -> TempRepo {
     std::fs::write(repo_path.join("README.md"), "test").expect("write README");
     git(&["add", "."]);
     git(&["commit", "-m", "Initial commit"]);
-    TempRepo(repo_path)
+    TempRepo(repo_path, repo_dir)
 }
 
 /// Regression test for intent-hq/monorepo#1778: the first `script.list` for a
@@ -388,12 +380,15 @@ async fn get_subscriptions_stays_within_statement_budget() {
 /// now a chunked bulk statement, keeping every queue mutation at a flat
 /// statement count regardless of queue depth.
 ///
-/// Hermetic shape: the workspace is archived, whose drain gate parks
-/// automatic-origin entries (no provider turn ever spawns). 40
-/// `agent.queueMessage` calls then grow the queue to 40 entries; pre-fix the
+/// Hermetic shape: the workspace is archived, whose send/drain gates park
+/// AUTOMATIC-origin entries (no provider turn ever spawns). 40
+/// `agent.sendToTask` calls — the same default-origin path as A2A sends and
+/// system wakes — then grow the queue to 40 parked entries; pre-fix the
 /// later dispatches ran 40+ statements each (DELETE + one INSERT per entry),
 /// tripping the default budget of 25 — the batched shape stays at a handful
-/// per call.
+/// per call. `agent.queueMessage` cannot serve here: its entries are
+/// user-origin (PROTOCOL §5.5), which the archived gate exempts, so each
+/// call would revive the workspace and drive a (non-hermetic) provider turn.
 #[tokio::test]
 async fn queue_mutations_stay_within_statement_budget_at_depth() {
     let (_daemon, socket, log_path) = spawn_daemon("itdp-queue", &[]);
@@ -422,8 +417,35 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
         .expect("agent id")
         .to_string();
 
-    // Archive the workspace so queued entries park instead of draining into
-    // a (non-hermetic) provider turn.
+    // A task note assigned to the agent so `agent.sendToTask` resolves it
+    // as the assignee.
+    let resp = rpc_with_params(
+        &socket,
+        "note.create",
+        json!({ "workspaceId": workspace_id, "title": "Queue Task", "content": "Queue depth" }),
+    )
+    .await;
+    let task_note_id = resp["result"]["note"]["id"]
+        .as_str()
+        .expect("note id")
+        .to_string();
+    let resp = rpc_with_params(
+        &socket,
+        "task.markAsTask",
+        json!({ "workspaceId": workspace_id, "noteId": task_note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert!(resp["error"].is_null(), "markAsTask failed: {resp}");
+    let resp = rpc_with_params(
+        &socket,
+        "task.assignAgent",
+        json!({ "workspaceId": workspace_id, "noteId": task_note_id, "agentId": agent_id }),
+    )
+    .await;
+    assert!(resp["error"].is_null(), "assignAgent failed: {resp}");
+
+    // Archive the workspace so automatic sends park instead of draining
+    // into a (non-hermetic) provider turn.
     let resp = rpc_with_params(
         &socket,
         "workspace.archive",
@@ -435,15 +457,20 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
     for i in 0..40 {
         let resp = rpc_with_params(
             &socket,
-            "agent.queueMessage",
+            "agent.sendToTask",
             json!({
                 "workspaceId": workspace_id,
-                "agentId": agent_id,
-                "content": format!("queued message {i}"),
+                "taskNoteId": task_note_id,
+                "message": format!("queued message {i}"),
             }),
         )
         .await;
-        assert!(resp["error"].is_null(), "queueMessage {i} failed: {resp}");
+        assert!(resp["error"].is_null(), "sendToTask {i} failed: {resp}");
+        assert_eq!(
+            resp["result"]["result"]["archivedParked"],
+            json!(true),
+            "sendToTask {i} parked behind the archived gate: {resp}"
+        );
     }
 
     // All 40 entries are parked (the workspace stays archived).
@@ -465,10 +492,10 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
     assert_eq!(
         count_lines(
             &log,
-            &["exceeded SQL statement budget", "method=agent.queueMessage"]
+            &["exceeded SQL statement budget", "method=agent.sendToTask"]
         ),
         0,
-        "agent.queueMessage exceeded the statement budget at queue depth, log:\n{log}"
+        "agent.sendToTask exceeded the statement budget at queue depth, log:\n{log}"
     );
 }
 

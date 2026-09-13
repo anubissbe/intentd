@@ -73,6 +73,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("control.rs", "system."),
         ("pairing.rs", "pairing."),
         ("server.rs", "server."),
+        ("provider_setup.rs", "providers.setup."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
@@ -121,15 +122,24 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// removed methods without updating the catalog. The catalog freeze is
 /// intentional: any surface change requires a protocol version bump and a
 /// docs/protocol/ update.
-const EXPECTED_TOTAL_METHODS: usize = 345;
+///
+/// REV-2 browser tab registry (intent-hq/intent#461): +4 fast-path methods
+/// (`browser.listTabs` / `browser.upsertTab` / `browser.removeTab` /
+/// `browser.syncTabs`), protocol 9.10. REV-2 routing: +2 fast-path methods
+/// (`browser.navigateTab` / `browser.closeTab`), protocol 9.11.
+///
+/// Execution environments (protocol 9.14): +4 router methods
+/// (`sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
+/// `sandbox.image.check`).
+const EXPECTED_TOTAL_METHODS: usize = 358;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 304;
+const EXPECTED_ROUTER_METHODS: usize = 307;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 39;
+const EXPECTED_FASTPATH_METHODS: usize = 49;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 2;
@@ -138,7 +148,7 @@ const EXPECTED_ALIASES: usize = 2;
 const EXPECTED_NOTIFICATIONS: usize = 1;
 
 /// Golden count: client-served reverse RPCs.
-const EXPECTED_REVERSE_METHODS: usize = 4;
+const EXPECTED_REVERSE_METHODS: usize = 5;
 
 #[test]
 fn router_methods_match_actual_source() {

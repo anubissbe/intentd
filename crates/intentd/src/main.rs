@@ -1466,6 +1466,11 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         protocol = intent_transport::PROTOCOL_VERSION,
         "intentd starting"
     );
+    // Raise the soft descriptor limit before anything opens fds in earnest
+    // (store pool, listeners, agent subprocesses): the macOS default soft limit
+    // is 256, which the daemon exhausts under load (intent-hq/intent#4390).
+    // Never fatal — a failed raise leaves the limit untouched and is logged.
+    fd_limit::raise_at_startup();
     // Insecure dev mode: `--insecure` OR `INTENTD_INSECURE=1` disables TLS and
     // bearer-token enforcement on the TCP path (plain `ws://`), and skips cert
     // provisioning entirely. Dev-only; loudly warned at startup.
@@ -1742,6 +1747,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         Some(query) => services.with_suspend_tracker(query),
         None => services,
     };
+    // Seed the service-owned capability cache off the RPC path. The earlier
+    // process-wide probe warms intent-git's low-level result; this detached
+    // handoff makes workspace/list capability reads cache-only.
+    services.prewarm_cow_supported();
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming
@@ -1972,6 +1981,14 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     tokio::spawn(async move {
         services_export_sweep.sweep_stale_export_staging().await;
     });
+    // Sweep expired attachment idempotency-key bindings (7-day retention,
+    // intent-hq/intent#4691); also swept lazily by keyed placements/begins.
+    let services_idempotency_sweep = services.clone();
+    tokio::spawn(async move {
+        services_idempotency_sweep
+            .sweep_expired_attachment_idempotency_keys()
+            .await;
+    });
     // Background PR refresh (§7.6): periodically re-fetch linked PRs (and
     // discover/link PRs for workspaces without one), persist any change, and
     // emit `pr:*` events so clients update without polling.
@@ -1982,7 +1999,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // clean shutdown.
     let pr_refresh = services.spawn_pr_refresh_loop(std::time::Duration::from_secs(180));
     // Centralized PR-monitor loop (`ws.pr.monitor`): every `[prMonitor]
-    // pollSeconds` (read live, floor 10s), poll each active monitor, diff it
+    // pollSeconds` (read live, floor 10s), poll the due active monitors —
+    // each PR on an effective interval stretched to fit the `[prMonitor]
+    // hourlyRequestBudget` cost model (a cadence planner, not a request
+    // limiter), a capped oldest-first subset per tick — diff each
     // against its persisted baseline, and deliver one consolidated wake once
     // the PR has been quiet for the debounce window. Safe when source control
     // is unconfigured (the tick logs and returns). Aborted on clean shutdown.
@@ -2007,11 +2027,6 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
     // without an event bus. Aborted on clean shutdown.
     let agent_locks_loop = services.spawn_agent_locks_loop();
-    // CRDT session sweeper (A5, §5.2 CRDT): every hour, drop cached yrs docs
-    // for `(workspace, note)` pairs whose last access is older than 24h so
-    // long-lived daemons do not accumulate per-note session state. Aborted on
-    // clean shutdown.
-    let crdt_session_sweep = services.spawn_crdt_session_sweep_loop();
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
     // aggregate memory budget is installed (monorepo#2063), drain idle agents
@@ -2022,10 +2037,15 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
     // `host:exec:*`, `script:output`, plus the high-churn state-notification
     // families — see `Store::delete_ephemeral_events_before`) older than the
-    // configured TTL, preserving lifecycle/tool/note/task events. Disabled
-    // when `events.streamRetentionHours == 0`.
-    let retention_task =
-        spawn_stream_retention_loop(retention_store, config.stream_retention_hours);
+    // configured TTL, preserving lifecycle/tool/note/task events. The event
+    // sweep is disabled when `events.streamRetentionHours == 0`, but the loop
+    // still ticks so the tool-payload retention sweep (read live from
+    // `agents.toolPayloadRetentionDays`) can run.
+    let retention_task = spawn_stream_retention_loop(
+        retention_store,
+        config.stream_retention_hours,
+        settings_registry.clone(),
+    );
     // Idempotency-key reaper (§5.4): hourly sweep deleting dedupe rows older than
     // 24h so the `idempotency_key` table stays bounded. The same cadence prunes
     // per-agent stderr capture files older than 7 days (STAB-53); the first tick
@@ -2477,7 +2497,20 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // relies on (status/stop/doctor, FE sidecar, pairing RPCs).
     tracing::info!(socket = %config.socket_path.display(), "starting intentd");
     let system_control: Arc<dyn SystemControl> = control.clone();
-    serve_uds_with_reverse(
+    // Wait for the local listener to accept connections before launching the
+    // best-effort repository metadata prewarm. Its candidate read and bounded
+    // blocking probes never gate readiness or the first workspace.list call.
+    let repository_metadata_prewarm = {
+        let services = services.clone();
+        let socket_path = config.socket_path.clone();
+        tokio::spawn(async move {
+            while !uds_is_live(&socket_path).await {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            services.prewarm_repository_metadata().await;
+        })
+    };
+    let serve_result = serve_uds_with_reverse(
         api,
         bus,
         &config.socket_path,
@@ -2487,7 +2520,9 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
         rpc_limiter,
         shutdown,
     )
-    .await?;
+    .await;
+    repository_metadata_prewarm.abort();
+    serve_result?;
 
     // Clean shutdown: stop the tailcat tunnel sidecar (kill the child), stop
     // the WSS listener (graceful close + port release), stop the PR refresh
@@ -2503,13 +2538,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     completion_delivery.abort();
     auto_commit_loop.abort();
     agent_locks_loop.abort();
-    crdt_session_sweep.abort();
     if let Some(reap_task) = reap_task {
         reap_task.abort();
     }
-    if let Some(retention_task) = retention_task {
-        retention_task.abort();
-    }
+    retention_task.abort();
     idempotency_reap_task.abort();
     merge_retry_task.abort();
     // Drop the watcher registry (and every filesystem/skills/specialists watch
@@ -2625,12 +2657,15 @@ struct DaemonControl {
 /// Latest own-process resource sample for `system.status`, written by the
 /// background sampler task (~1s tick) and read lock-free from `status()`.
 /// `cpu_percent` follows the raw `sysinfo` convention (100 = one full core,
-/// may exceed 100 on multi-core hosts); `memory_bytes` is resident memory.
+/// may exceed 100 on multi-core hosts); `memory_bytes` is resident memory;
+/// `fd_count` is the open-descriptor count (intent-hq/intent#4390), `0` while
+/// unsampled/unavailable — a live process always holds at least its stdio.
 #[derive(Default)]
 struct ProcUsage {
     /// `f32` CPU percent stored as raw bits (`f32::to_bits`).
     cpu_bits: std::sync::atomic::AtomicU32,
     memory_bytes: std::sync::atomic::AtomicU64,
+    fd_count: std::sync::atomic::AtomicU64,
 }
 
 impl ProcUsage {
@@ -2647,6 +2682,121 @@ impl ProcUsage {
             f32::from_bits(self.cpu_bits.load(Ordering::Relaxed)),
             self.memory_bytes.load(Ordering::Relaxed),
         )
+    }
+
+    fn store_fd_count(&self, count: u64) {
+        self.fd_count
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `None` until the first descriptor sample lands or where counting is
+    /// unsupported, so the wire field stays presence-detected.
+    fn fd_count(&self) -> Option<u64> {
+        let n = self.fd_count.load(std::sync::atomic::Ordering::Relaxed);
+        (n > 0).then_some(n)
+    }
+}
+
+/// Count the daemon's own open file descriptors: entries of the per-process
+/// fd table (`/proc/self/fd` on Linux, `/dev/fd` on macOS), minus the handle
+/// the read itself holds. `Unsupported` where no such table exists; note the
+/// read needs a descriptor of its own, so at exhaustion it fails with EMFILE.
+fn count_open_fds() -> std::io::Result<u64> {
+    let table = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else if cfg!(target_os = "macos") {
+        "/dev/fd"
+    } else {
+        return Err(std::io::ErrorKind::Unsupported.into());
+    };
+    let entries = std::fs::read_dir(table)?.count() as u64;
+    Ok(entries.saturating_sub(1))
+}
+
+/// Whether a failed fd-table read means the table itself is full.
+#[cfg(unix)]
+fn is_fd_exhaustion(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+#[cfg(not(unix))]
+fn is_fd_exhaustion(_err: &std::io::Error) -> bool {
+    false
+}
+
+/// Resolve one fd-table read into the count to publish and feed to the
+/// pressure gate. The gauge must not go blind exactly at exhaustion: when the
+/// read itself fails with EMFILE/ENFILE the table is saturated, so the count
+/// is the soft `limit` itself (the WARN fires). Any other failure yields
+/// `None` — logged at debug, except the expected `Unsupported` off Linux/macOS.
+fn resolve_fd_count(read: std::io::Result<u64>, limit: Option<u64>) -> Option<u64> {
+    match read {
+        Ok(count) => Some(count),
+        Err(e) if is_fd_exhaustion(&e) => limit,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::Unsupported {
+                tracing::debug!(error = %e, "cannot read the open fd table");
+            }
+            None
+        }
+    }
+}
+
+/// Descriptor-pressure log gate (intent-hq/intent#4390): WARN once the open
+/// count reaches 80 % of the soft limit, re-warn at most once a minute while
+/// it stays there, and INFO once when it recovers below 60 %. The band in
+/// between is hysteresis — no log either way — so a count hovering around the
+/// threshold cannot flap. Pure state machine; the sampler feeds it.
+struct FdPressure {
+    high: bool,
+    last_warn: Option<std::time::Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FdPressureEvent {
+    Warn,
+    Recovered,
+}
+
+impl FdPressure {
+    const ENTER_PERCENT: u64 = 80;
+    const EXIT_PERCENT: u64 = 60;
+    const WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+    const fn new() -> Self {
+        Self {
+            high: false,
+            last_warn: None,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        count: u64,
+        limit: u64,
+        now: std::time::Instant,
+    ) -> Option<FdPressureEvent> {
+        // No usable limit: never warn (`above` would be trivially true).
+        if limit == 0 {
+            return None;
+        }
+        // Integer arithmetic: `count * 100 >= limit * 80` ⇔ count ≥ 80 % of limit.
+        let above = |percent: u64| count.saturating_mul(100) >= limit.saturating_mul(percent);
+        if above(Self::ENTER_PERCENT) {
+            let due = self
+                .last_warn
+                .is_none_or(|t| now.duration_since(t) >= Self::WARN_INTERVAL);
+            self.high = true;
+            if due {
+                self.last_warn = Some(now);
+                return Some(FdPressureEvent::Warn);
+            }
+        } else if self.high && !above(Self::EXIT_PERCENT) {
+            self.high = false;
+            self.last_warn = None;
+            return Some(FdPressureEvent::Recovered);
+        }
+        None
     }
 }
 
@@ -2699,28 +2849,67 @@ fn spawn_route_info_sampler() -> Arc<RouteInfo> {
     info
 }
 
-/// Spawn the own-process CPU/memory sampler backing `system.status` (§5.7).
-/// Takes one synchronous sample first so `memoryBytes` is populated before the
-/// listeners come up (the first CPU reading may legitimately be 0 — sysinfo
-/// needs two refreshes to compute a delta), then refreshes on a ~1s tick.
-/// Refreshes are scoped to the daemon's own PID — never a full-system scan.
+/// Spawn the own-process CPU/memory/descriptor sampler backing `system.status`
+/// (§5.7). Takes one synchronous sample first so `memoryBytes` is populated
+/// before the listeners come up (the first CPU reading may legitimately be 0 —
+/// sysinfo needs two refreshes to compute a delta), then refreshes on a ~1s
+/// tick. Refreshes are scoped to the daemon's own PID — never a full-system
+/// scan. Each tick also counts the daemon's open descriptors and feeds the
+/// [`FdPressure`] gate against the startup-sampled soft limit.
 fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     let usage = Arc::new(ProcUsage::default());
-    let Ok(pid) = sysinfo::get_current_pid() else {
-        tracing::warn!("cannot resolve own pid; cpu/memory sampling disabled");
-        return usage;
-    };
-    let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
-    let mut sys = System::new();
-    let sample = move |sys: &mut System, usage: &ProcUsage| {
-        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh_kind);
-        if let Some(proc) = sys.process(pid) {
-            usage.store(proc.cpu_usage(), proc.memory());
+    let mut pressure = FdPressure::new();
+    let mut sample_fds = move |usage: &ProcUsage| {
+        let limit = fd_limit::soft_limit();
+        let Some(count) = resolve_fd_count(count_open_fds(), limit) else {
+            return;
+        };
+        usage.store_fd_count(count);
+        let Some(limit) = limit else {
+            return;
+        };
+        match pressure.observe(count, limit, std::time::Instant::now()) {
+            Some(FdPressureEvent::Warn) => tracing::warn!(
+                fd_count = count,
+                fd_limit = limit,
+                "open file descriptors near the soft limit"
+            ),
+            Some(FdPressureEvent::Recovered) => tracing::info!(
+                fd_count = count,
+                fd_limit = limit,
+                "open file descriptors back below the pressure threshold"
+            ),
+            None => {}
         }
     };
-    sample(&mut sys, &usage);
+    sample_fds(&usage);
+
+    // Descriptor sampling does not need the pid, so a pid lookup failure only
+    // disables the cpu/memory half of the tick.
+    let mut cpu_mem = match sysinfo::get_current_pid() {
+        Ok(pid) => {
+            let refresh_kind = ProcessRefreshKind::nothing().with_cpu().with_memory();
+            let mut sys = System::new();
+            let sample = move |sys: &mut System, usage: &ProcUsage| {
+                sys.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    refresh_kind,
+                );
+                if let Some(proc) = sys.process(pid) {
+                    usage.store(proc.cpu_usage(), proc.memory());
+                }
+            };
+            sample(&mut sys, &usage);
+            Some((sys, sample))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot resolve own pid; cpu/memory sampling disabled");
+            None
+        }
+    };
 
     let task_usage = usage.clone();
     tokio::spawn(async move {
@@ -2732,10 +2921,146 @@ fn spawn_proc_usage_sampler() -> Arc<ProcUsage> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            sample(&mut sys, &task_usage);
+            if let Some((sys, sample)) = cpu_mem.as_mut() {
+                sample(sys, &task_usage);
+            }
+            sample_fds(&task_usage);
         }
     });
     usage
+}
+
+/// Process descriptor limit (`RLIMIT_NOFILE`) policy for `serve`
+/// (intent-hq/intent#4390): raise the soft limit as far as the OS allows at
+/// startup, log the result, and keep the sampled soft limit readable for
+/// `system.status`. Unix only; every entry point is a no-op elsewhere.
+mod fd_limit {
+    use std::sync::OnceLock;
+
+    /// macOS `setrlimit` rejects a soft `RLIMIT_NOFILE` above
+    /// `kern.maxfilesperproc` even when the hard limit is `RLIM_INFINITY`;
+    /// `OPEN_MAX` (10240) is the portable ceiling that always succeeds there.
+    /// Linux enforces the finite hard limit itself, so no extra cap applies.
+    #[cfg(target_os = "macos")]
+    pub(crate) const PLATFORM_CAP: Option<u64> = Some(10240);
+    #[cfg(not(target_os = "macos"))]
+    #[cfg_attr(not(unix), expect(dead_code))]
+    pub(crate) const PLATFORM_CAP: Option<u64> = None;
+
+    /// Soft limit in effect after the startup raise (or the untouched value
+    /// when no raise was needed/possible). Set once by `raise_at_startup`.
+    static SOFT_LIMIT: OnceLock<u64> = OnceLock::new();
+
+    /// The soft `RLIMIT_NOFILE` sampled at startup, for `system.status`
+    /// reporting. `None` before `raise_at_startup` ran or when the limit
+    /// could not be read (non-Unix, `getrlimit` failure).
+    pub(crate) fn soft_limit() -> Option<u64> {
+        SOFT_LIMIT.get().copied()
+    }
+
+    /// Pure raise decision: given the current `soft` limit, the `hard` limit
+    /// (`None` = `RLIM_INFINITY`) and the platform cap, return the soft value
+    /// to set, or `None` to leave the limit untouched. The target is the hard
+    /// limit bounded by the cap; an unlimited hard limit with no cap has no
+    /// finite target. The soft limit is never lowered.
+    ///
+    /// `(hard = None, cap = None)` is effectively unreachable on Linux: the
+    /// kernel refuses `RLIM_INFINITY` for `RLIMIT_NOFILE` (EPERM above
+    /// `fs.nr_open`), so the hard limit is always finite there. That branch
+    /// is macOS-without-cap territory only, and macOS always has a cap.
+    #[cfg_attr(all(not(unix), not(test)), expect(dead_code))]
+    pub(crate) fn target_soft(soft: u64, hard: Option<u64>, cap: Option<u64>) -> Option<u64> {
+        let target = match (hard, cap) {
+            (Some(hard), Some(cap)) => hard.min(cap),
+            (Some(hard), None) => hard,
+            (None, Some(cap)) => cap,
+            (None, None) => return None,
+        };
+        (target > soft).then_some(target)
+    }
+
+    /// Current `(soft, hard)` `RLIMIT_NOFILE`; `hard == None` means unlimited.
+    #[cfg(unix)]
+    pub(crate) fn read() -> std::io::Result<(u64, Option<u64>)> {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `lim` is a valid, writable `rlimit` for the call's duration.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((to_u64(lim.rlim_cur), finite(lim.rlim_max)))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn read() -> std::io::Result<(u64, Option<u64>)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "RLIMIT_NOFILE is not available on this platform",
+        ))
+    }
+
+    /// Render a hard limit for logs/doctor output.
+    pub(crate) fn fmt_hard(hard: Option<u64>) -> String {
+        hard.map_or_else(|| "unlimited".to_string(), |h| h.to_string())
+    }
+
+    /// Raise the soft limit per `target_soft` and log one INFO line with the
+    /// resulting limits. Failures are WARN-only; the limit is left untouched.
+    #[cfg(unix)]
+    pub(crate) fn raise_at_startup() {
+        let (soft, hard) = match read() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read fd limit (getrlimit)");
+                return;
+            }
+        };
+        let mut raised_from = None;
+        if let Some(target) = target_soft(soft, hard, PLATFORM_CAP) {
+            let lim = libc::rlimit {
+                rlim_cur: target as libc::rlim_t,
+                rlim_max: hard.map_or(libc::RLIM_INFINITY, |h| h as libc::rlim_t),
+            };
+            // SAFETY: `lim` is a valid, initialized `rlimit` for the call's duration.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim) } == 0 {
+                raised_from = Some(soft);
+            } else {
+                tracing::warn!(
+                    error = %std::io::Error::last_os_error(),
+                    soft,
+                    target,
+                    hard = %fmt_hard(hard),
+                    "cannot raise fd limit (setrlimit); leaving it unchanged"
+                );
+            }
+        }
+        // Re-read so the logged/stored value is what the kernel actually applied.
+        let (soft, hard) = read().unwrap_or((soft, hard));
+        let _ = SOFT_LIMIT.set(soft);
+        tracing::info!(
+            soft,
+            hard = %fmt_hard(hard),
+            raised_from = %raised_from.map_or_else(|| "none".to_string(), |s| s.to_string()),
+            "fd limit"
+        );
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn raise_at_startup() {}
+
+    #[cfg(unix)]
+    fn finite(v: libc::rlim_t) -> Option<u64> {
+        (v != libc::RLIM_INFINITY).then(|| to_u64(v))
+    }
+
+    /// `rlim_t` is `u64` on the tier-1 Unix targets but not universally.
+    #[cfg(unix)]
+    #[expect(clippy::unnecessary_cast)]
+    fn to_u64(v: libc::rlim_t) -> u64 {
+        v as u64
+    }
 }
 
 /// Latest workspaces-root disk sample (`available`, `total` bytes of the
@@ -3136,7 +3461,7 @@ fn spawn_child_tree_sampler(manager: Arc<AgentManager>, usage: &Arc<ChildTreeUsa
             0 => CHILD_TREE_WARN_FALLBACK_BYTES,
             // RAM sizes are far below 2^53 (loss-free in f64); the fraction
             // is in (0, 1) and the float→int cast saturates anyway.
-            #[allow(
+            #[expect(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss
@@ -3395,6 +3720,11 @@ impl SystemControl for DaemonControl {
                     total_roots: s.total_roots,
                     failed_roots: s.failed_roots,
                 }),
+            // Descriptor gauge (intent-hq/intent#4390): count from the ~1s
+            // own-process sampler, limit sampled once at startup — both
+            // atomic/OnceLock reads, nothing touches the OS here.
+            fd_count: self.proc_usage.fd_count(),
+            fd_limit: fd_limit::soft_limit(),
             // Signal-free supervision probe (intent-hq/intent#3875): one
             // pidfile read + one single-process sysinfo refresh, never a
             // signal, so status stays cheap and side-effect free.
@@ -3534,7 +3864,7 @@ impl intent_core::ServerControl for DaemonControl {
                 // Settings schema bounds the port to u16 range; the
                 // float→int cast saturates anyway.
                 .map(|p| {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let p = p as u16;
                     p
                 });
@@ -4128,6 +4458,7 @@ async fn uds_is_live(socket_path: &Path) -> bool {
 }
 
 #[cfg(windows)]
+#[expect(clippy::unused_async)] // signature parity with the unix UDS probe; pipe open is sync
 async fn uds_is_live(socket_path: &Path) -> bool {
     use tokio::net::windows::named_pipe::ClientOptions;
     const ERROR_PIPE_BUSY: i32 = 231;
@@ -4270,6 +4601,7 @@ fn lock_holder_detail(pid_path: &Path, errno: nix::errno::Errno) -> String {
 /// Non-unix has no `flock`; the lock is a no-op success (the socket/pidfile
 /// guards remain the single-instance enforcement on those platforms).
 #[cfg(not(unix))]
+#[expect(clippy::unnecessary_wraps)] // signature parity with the unix flock impl
 fn acquire_data_dir_lock(_config: &Config) -> anyhow::Result<DataDirLock> {
     Ok(DataDirLock)
 }
@@ -4364,15 +4696,6 @@ fn reap_timings(idle_reap_minutes: u32) -> Option<(Duration, Duration)> {
     Some((ttl, interval))
 }
 
-/// Fixed TTL for persisted `agent:tool:call` events, swept on the same tick as
-/// the ephemeral families. Tool calls are the dominant share of the event
-/// table (87% of live data on the dev seat) and no consumer reads them beyond
-/// bounded recent windows — replay uses `agent_message`, live streaming uses
-/// the in-memory bus — so 6h comfortably covers every durable reader
-/// (`event.agentActivity` / `event.workspaceSummary` default to ≤60-minute
-/// windows) while capping steady-state storage at a quarter of the old 24h.
-const TOOL_CALL_RETENTION_HOURS: u32 = 6;
-
 /// Upper bound on pages released per `PRAGMA incremental_vacuum(N)` call in
 /// the retention loop. 2000 pages ≈ 8 MiB at the 4 KiB default page size —
 /// enough to keep up with sweep-driven churn while keeping each call short on
@@ -4380,68 +4703,68 @@ const TOOL_CALL_RETENTION_HOURS: u32 = 6;
 /// ~54k free pages) drains over successive ticks instead of one long stall.
 const INCREMENTAL_VACUUM_MAX_PAGES: u32 = 2000;
 
-/// Spawn the periodic event-retention/compaction sweep (§10.2 / finding F4),
-/// or `None` when disabled (`stream_retention_hours == 0`). Each tick deletes
-/// high-volume ephemeral events (`agent:stream:*`, `file:*`, `terminal:data`,
-/// `host:exec:*`, `script:output`, plus the high-churn state-notification
-/// families — see `Store::delete_ephemeral_events_before`) older than the
-/// TTL, plus `agent:tool:call` events older than
-/// [`TOOL_CALL_RETENTION_HOURS`], while preserving lifecycle/note/task
-/// events. After the sweeps each tick runs a
-/// bounded `PRAGMA incremental_vacuum` ([`INCREMENTAL_VACUUM_MAX_PAGES`]) to
-/// release freelist pages back to the filesystem (effective on
-/// incremental-auto-vacuum databases; a no-op otherwise — see
-/// `intent_store::connect_write` for the activation story) and
-/// `PRAGMA optimize` to keep planner statistics current. The sweep interval
-/// is derived from the TTL (≈4×/TTL), clamped so long TTLs still sweep
-/// periodically and short ones do not busy-loop. A failed sweep is logged and
+/// Spawn the periodic retention/compaction sweep (§10.2 / finding F4). When
+/// `stream_retention_hours > 0` each tick deletes high-volume ephemeral
+/// events (`agent:stream:*`, `file:*`, `terminal:data`, `host:exec:*`,
+/// `script:output`, plus the high-churn state-notification families — see
+/// `Store::delete_ephemeral_events_before`) older than the TTL, plus
+/// `agent:tool:call` events older than
+/// [`intent_services::retention::TOOL_CALL_RETENTION_HOURS`], while
+/// preserving lifecycle/note/task events; `0` disables the event sweeps but
+/// NOT the loop. Every tick also reads `agents.toolPayloadRetentionDays`
+/// LIVE from the settings registry and, when it is `> 0`, compacts full
+/// tool bodies older than that window into replay previews
+/// (`Store::compact_tool_payloads_before`, at the live
+/// `agents.historyReplayToolContentChars` cap) — so a value set later from
+/// the Settings UI takes effect on the next tick without a restart. The
+/// sweeps themselves are [`intent_services::retention::run_retention_tick`]
+/// (testable in isolation with a fixed `now`); this loop owns only the timer
+/// and the pool maintenance. After
+/// the sweeps each tick runs a bounded `PRAGMA incremental_vacuum`
+/// ([`INCREMENTAL_VACUUM_MAX_PAGES`]) to release freelist pages back to the
+/// filesystem (effective on incremental-auto-vacuum databases; a no-op
+/// otherwise — see `intent_store::connect_write` for the activation story)
+/// and `PRAGMA optimize` to keep planner statistics current. The sweep
+/// interval is derived from the event TTL (≈4×/TTL), clamped so long TTLs
+/// still sweep periodically and short ones do not busy-loop; with the event
+/// sweep disabled it is the hourly ceiling. A failed sweep is logged and
 /// retried on the next tick (never aborts the loop).
 fn spawn_stream_retention_loop(
     store: Store,
     stream_retention_hours: u32,
-) -> Option<tokio::task::JoinHandle<()>> {
-    if stream_retention_hours == 0 {
-        tracing::info!("event retention sweep disabled (events.streamRetentionHours = 0)");
-        return None;
-    }
-    let ttl = Duration::from_secs(u64::from(stream_retention_hours) * 3600);
-    let interval = (ttl / 4).clamp(Duration::from_secs(300), Duration::from_secs(3600));
-    tracing::info!(
-        ttl_hours = stream_retention_hours,
-        tool_call_ttl_hours = TOOL_CALL_RETENTION_HOURS,
-        interval_secs = interval.as_secs(),
-        "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*, script:output, state-notification churn families, agent:tool:call)"
-    );
-    Some(tokio::spawn(async move {
+    settings_registry: Arc<intent_services::SettingsRegistry>,
+) -> tokio::task::JoinHandle<()> {
+    let max_interval = Duration::from_secs(3600);
+    let interval = if stream_retention_hours == 0 {
+        tracing::info!(
+            interval_secs = max_interval.as_secs(),
+            "event retention sweep disabled (events.streamRetentionHours = 0); retention loop still ticks for the tool-payload sweep"
+        );
+        max_interval
+    } else {
+        let ttl = Duration::from_secs(u64::from(stream_retention_hours) * 3600);
+        let interval = (ttl / 4).clamp(Duration::from_secs(300), max_interval);
+        tracing::info!(
+            ttl_hours = stream_retention_hours,
+            tool_call_ttl_hours = intent_services::retention::TOOL_CALL_RETENTION_HOURS,
+            interval_secs = interval.as_secs(),
+            "event retention sweep enabled (agent:stream:*, file:*, terminal:data, host:exec:*, script:output, state-notification churn families, agent:tool:call)"
+        );
+        interval
+    };
+    tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let cutoff = intent_core::iso_minutes_ago(i64::from(stream_retention_hours) * 60);
-            match store.delete_ephemeral_events_before(&cutoff).await {
-                Ok(removed) if removed > 0 => {
-                    tracing::info!(
-                        removed,
-                        cutoff,
-                        "event retention sweep trimmed ephemeral events"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "event retention sweep failed"),
-            }
-            let tool_cutoff =
-                intent_core::iso_minutes_ago(i64::from(TOOL_CALL_RETENTION_HOURS) * 60);
-            match store.delete_tool_call_events_before(&tool_cutoff).await {
-                Ok(removed) if removed > 0 => {
-                    tracing::info!(
-                        removed,
-                        cutoff = tool_cutoff,
-                        "event retention sweep trimmed agent:tool:call events"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "tool-call retention sweep failed"),
-            }
+            // Both tool-payload knobs are read live from the registry per tick.
+            let settings = settings_registry.snapshot();
+            intent_services::retention::run_retention_tick(
+                &store,
+                stream_retention_hours,
+                &settings.effective,
+            )
+            .await;
             match store.incremental_vacuum(INCREMENTAL_VACUUM_MAX_PAGES).await {
                 Ok(freed) if freed > 0 => {
                     tracing::info!(
@@ -4456,7 +4779,7 @@ fn spawn_stream_retention_loop(
                 tracing::warn!(error = %e, "PRAGMA optimize failed");
             }
         }
-    }))
+    })
 }
 
 /// Spawn the periodic idempotency-key reaper (design note TB-0 §5.4). Runs
@@ -5026,7 +5349,7 @@ async fn cmd_settings_list(config: &Config) -> anyhow::Result<()> {
 
 /// Print one setting (`settings.get` output shape) from the already-fetched
 /// `settings.get` result: value, type, default, origin, description.
-#[allow(clippy::unnecessary_wraps)] // keeps the uniform Result shape of the print_setting_* family
+#[expect(clippy::unnecessary_wraps)] // keeps the uniform Result shape of the print_setting_* family
 fn print_setting_get(name: &str, result: &Value) -> anyhow::Result<()> {
     let value = display_setting_value(result.get("value").unwrap_or(&Value::Null));
     println!("{name} = {value}");
@@ -5256,6 +5579,12 @@ fn print_status(config: &Config, r: &Value) {
         r["cpuPercent"].as_f64().unwrap_or(0.0)
     );
     println!("  memoryBytes: {}", r["memoryBytes"].as_u64().unwrap_or(0));
+    if let Some(count) = r["fdCount"].as_u64() {
+        match r["fdLimit"].as_u64() {
+            Some(limit) => println!("  fds: {count} / {limit}"),
+            None => println!("  fds: {count}"),
+        }
+    }
     println!(
         "  updateSupported: {}",
         r["updateSupported"].as_bool().unwrap_or(false)
@@ -5308,44 +5637,47 @@ async fn cmd_stop() -> ExitCode {
     };
 
     // (2)-(4) Wait, then escalate SIGTERM → SIGKILL with timeouts.
-    let outcome = run_stop_escalation(pid, graceful).await;
-    match outcome {
-        StopOutcome::AlreadyDown => println!("intentd: stopped"),
-        StopOutcome::Graceful => println!("intentd: stopped gracefully"),
-        StopOutcome::Terminated => println!("intentd: stopped (SIGTERM)"),
-        StopOutcome::Killed => println!("intentd: stopped (SIGKILL)"),
-        StopOutcome::Failed => {
-            eprintln!("error: could not confirm intentd shutdown (pid {pid})");
-            return ExitCode::FAILURE;
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-/// Run the escalation with production timeouts, using the real OS signaller on
-/// unix. On non-unix there is no UDS daemon to signal, so report failure.
-async fn run_stop_escalation(pid: u32, graceful: bool) -> StopOutcome {
     #[cfg(unix)]
     {
-        escalate_stop(
-            &NixSignaller,
-            pid,
-            graceful,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(3),
-            Duration::from_millis(100),
-        )
-        .await
+        match run_stop_escalation(pid, graceful).await {
+            StopOutcome::AlreadyDown => println!("intentd: stopped"),
+            StopOutcome::Graceful => println!("intentd: stopped gracefully"),
+            StopOutcome::Terminated => println!("intentd: stopped (SIGTERM)"),
+            StopOutcome::Killed => println!("intentd: stopped (SIGKILL)"),
+            StopOutcome::Failed => {
+                eprintln!("error: could not confirm intentd shutdown (pid {pid})");
+                return ExitCode::FAILURE;
+            }
+        }
+        ExitCode::SUCCESS
     }
+    // On non-unix there is no process signalling to escalate through, so
+    // shutdown cannot be confirmed.
     #[cfg(not(unix))]
     {
-        let _ = (pid, graceful);
-        StopOutcome::Failed
+        let _ = graceful;
+        eprintln!("error: could not confirm intentd shutdown (pid {pid})");
+        ExitCode::FAILURE
     }
+}
+
+/// Run the escalation with production timeouts, using the real OS signaller.
+#[cfg(unix)]
+async fn run_stop_escalation(pid: u32, graceful: bool) -> StopOutcome {
+    escalate_stop(
+        &NixSignaller,
+        pid,
+        graceful,
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+        Duration::from_millis(100),
+    )
+    .await
 }
 
 /// The terminal result of a stop escalation (§5.7).
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum StopOutcome {
     /// The process was already gone before any escalation.
@@ -5362,6 +5694,7 @@ enum StopOutcome {
 
 /// Process-signalling seam so the escalation logic is unit-testable with a fake
 /// (§5.7 verification). The real impl uses `nix` signal-0/SIGTERM/SIGKILL.
+#[cfg(unix)]
 trait Signaller {
     fn is_alive(&self, pid: u32) -> bool;
     fn term(&self, pid: u32);
@@ -5371,6 +5704,7 @@ trait Signaller {
 /// SIGTERM → SIGKILL escalation. The caller has already issued the graceful
 /// control RPC; `graceful_requested` says whether to first wait for a polite
 /// exit. Each phase polls liveness up to its timeout before escalating.
+#[cfg(unix)]
 async fn escalate_stop<S: Signaller>(
     sig: &S,
     pid: u32,
@@ -5398,6 +5732,7 @@ async fn escalate_stop<S: Signaller>(
 }
 
 /// Poll `is_alive` until the process exits or `timeout` elapses; `true` on exit.
+#[cfg(unix)]
 async fn wait_for_exit<S: Signaller>(sig: &S, pid: u32, timeout: Duration, poll: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -5506,12 +5841,26 @@ async fn cmd_doctor() -> ExitCode {
     report_github_token();
     report_context_engine().await;
     report_host_capabilities();
+    report_fd_limit();
     report_cow_support(&config);
 
     if ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Process descriptor limit (`RLIMIT_NOFILE`), informational only: `serve`
+/// raises the soft limit at startup (intent-hq/intent#4390), so this reports
+/// the limit `doctor` itself inherited, never a failure.
+fn report_fd_limit() {
+    match fd_limit::read() {
+        Ok((soft, hard)) => println!(
+            "[ok] fd limit: soft={soft} hard={}",
+            fd_limit::fmt_hard(hard)
+        ),
+        Err(e) => println!("[--] fd limit: unavailable ({e})"),
     }
 }
 
@@ -6139,6 +6488,171 @@ mod tests {
     #[test]
     fn banner_build_commit_falls_back_to_unknown() {
         assert_eq!(banner_build_commit(None), "unknown");
+    }
+
+    #[test]
+    fn fd_limit_target_raises_soft_to_finite_hard() {
+        assert_eq!(fd_limit::target_soft(256, Some(65536), None), Some(65536));
+    }
+
+    #[test]
+    fn fd_limit_target_uses_platform_cap_when_hard_unlimited() {
+        assert_eq!(fd_limit::target_soft(256, None, Some(10240)), Some(10240));
+    }
+
+    #[test]
+    fn fd_limit_target_is_none_when_hard_unlimited_and_uncapped() {
+        assert_eq!(fd_limit::target_soft(256, None, None), None);
+    }
+
+    #[test]
+    fn fd_limit_target_never_lowers_soft() {
+        // Already at the target.
+        assert_eq!(fd_limit::target_soft(65536, Some(65536), None), None);
+        // Above the target (soft can legitimately exceed the cap).
+        assert_eq!(fd_limit::target_soft(20000, None, Some(10240)), None);
+        assert_eq!(fd_limit::target_soft(20000, Some(65536), Some(10240)), None);
+    }
+
+    #[test]
+    fn fd_limit_target_cap_never_exceeds_hard() {
+        assert_eq!(
+            fd_limit::target_soft(256, Some(4096), Some(10240)),
+            Some(4096)
+        );
+        assert_eq!(
+            fd_limit::target_soft(256, Some(65536), Some(10240)),
+            Some(10240)
+        );
+    }
+
+    /// Raising the real limit is idempotent and never lowers it: a second
+    /// call finds nothing to raise and the recorded soft value is stable.
+    #[cfg(unix)]
+    #[test]
+    fn fd_limit_raise_at_startup_never_lowers_and_records_soft() {
+        let (before_soft, _) = fd_limit::read().unwrap();
+        fd_limit::raise_at_startup();
+        let (after_soft, after_hard) = fd_limit::read().unwrap();
+        assert!(after_soft >= before_soft);
+        if let Some(hard) = after_hard {
+            assert!(after_soft <= hard);
+        }
+        assert_eq!(fd_limit::soft_limit(), Some(after_soft));
+        fd_limit::raise_at_startup();
+        assert_eq!(fd_limit::read().unwrap().0, after_soft);
+    }
+
+    /// The sampler's own directory handle is excluded, and a live test
+    /// process always holds at least stdio plus the file it opens here.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn count_open_fds_counts_the_live_table() {
+        let before = count_open_fds().expect("fd table readable");
+        assert!(before >= 3, "at least stdio: {before}");
+        let held = std::fs::File::open(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let during = count_open_fds().unwrap();
+        assert!(during > before, "{during} > {before}");
+        drop(held);
+        assert!(count_open_fds().unwrap() < during);
+    }
+
+    /// At exhaustion the table read itself fails with EMFILE/ENFILE; that must
+    /// read as "saturated" (count = limit) so the pressure WARN still fires,
+    /// while any other failure leaves the gauge alone.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_fd_count_saturates_to_the_limit_on_exhaustion() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(resolve_fd_count(Ok(42), Some(1024)), Some(42));
+        assert_eq!(resolve_fd_count(Ok(42), None), Some(42));
+        for code in [libc::EMFILE, libc::ENFILE] {
+            assert_eq!(
+                resolve_fd_count(Err(Error::from_raw_os_error(code)), Some(1024)),
+                Some(1024),
+                "errno {code} saturates"
+            );
+            assert_eq!(
+                resolve_fd_count(Err(Error::from_raw_os_error(code)), None),
+                None,
+                "errno {code} without a known limit has no count to report"
+            );
+        }
+        assert_eq!(
+            resolve_fd_count(Err(Error::from_raw_os_error(libc::EACCES)), Some(1024)),
+            None
+        );
+        assert_eq!(
+            resolve_fd_count(Err(ErrorKind::Unsupported.into()), Some(1024)),
+            None
+        );
+    }
+
+    #[test]
+    fn fd_pressure_never_warns_without_a_usable_limit() {
+        use std::time::Instant;
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        assert_eq!(p.observe(0, 0, t0), None);
+        assert_eq!(p.observe(500, 0, t0), None);
+    }
+
+    #[test]
+    fn fd_pressure_warns_at_80_percent_and_recovers_below_60() {
+        use std::time::{Duration, Instant};
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        assert_eq!(p.observe(700, 1000, t0), None);
+        assert_eq!(p.observe(800, 1000, t0), Some(FdPressureEvent::Warn));
+        // Hysteresis band: no log either way while it drains.
+        assert_eq!(p.observe(700, 1000, t0 + Duration::from_secs(1)), None);
+        assert_eq!(p.observe(600, 1000, t0 + Duration::from_secs(2)), None);
+        assert_eq!(
+            p.observe(599, 1000, t0 + Duration::from_secs(3)),
+            Some(FdPressureEvent::Recovered)
+        );
+        // Recovery is logged once; staying low is silent.
+        assert_eq!(p.observe(100, 1000, t0 + Duration::from_secs(4)), None);
+        // Re-entry warns immediately: the rate limit reset on recovery.
+        assert_eq!(
+            p.observe(950, 1000, t0 + Duration::from_secs(5)),
+            Some(FdPressureEvent::Warn)
+        );
+    }
+
+    #[test]
+    fn fd_pressure_rate_limits_repeat_warnings_to_once_a_minute() {
+        use std::time::{Duration, Instant};
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        assert_eq!(p.observe(900, 1000, t0), Some(FdPressureEvent::Warn));
+        assert_eq!(p.observe(950, 1000, t0 + Duration::from_secs(1)), None);
+        assert_eq!(p.observe(999, 1000, t0 + Duration::from_secs(59)), None);
+        assert_eq!(
+            p.observe(999, 1000, t0 + Duration::from_secs(60)),
+            Some(FdPressureEvent::Warn)
+        );
+        assert_eq!(p.observe(999, 1000, t0 + Duration::from_secs(61)), None);
+        // A dip into the hysteresis band does not restart the clock.
+        assert_eq!(p.observe(700, 1000, t0 + Duration::from_secs(90)), None);
+        assert_eq!(p.observe(900, 1000, t0 + Duration::from_secs(91)), None);
+        assert_eq!(
+            p.observe(900, 1000, t0 + Duration::from_secs(120)),
+            Some(FdPressureEvent::Warn)
+        );
+    }
+
+    /// Thresholds compare exactly in integer arithmetic — no float rounding
+    /// at the boundaries, no division by the limit.
+    #[test]
+    fn fd_pressure_uses_exact_integer_thresholds() {
+        use std::time::Instant;
+        let mut p = FdPressure::new();
+        let t0 = Instant::now();
+        // 4/5 = 80 % exactly ⇒ warn; 3/5 = 60 % is not below 60 % ⇒ no recovery.
+        assert_eq!(p.observe(4, 5, t0), Some(FdPressureEvent::Warn));
+        assert_eq!(p.observe(3, 5, t0), None);
+        assert_eq!(p.observe(2, 5, t0), Some(FdPressureEvent::Recovered));
     }
 
     /// Overwrite regression guard: `write_private` uses `create_new`, so
@@ -7251,6 +7765,7 @@ mod tests {
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn refuses_when_uds_is_live() {
         let config = temp_config();
@@ -7449,11 +7964,13 @@ mod tests {
         std::fs::remove_dir_all(&config.data_dir).ok();
     }
 
+    #[cfg(unix)]
     use std::sync::Mutex;
 
     /// A scriptable [`Signaller`] for the stop-escalation unit tests: it models
     /// process death either after N liveness polls (a "graceful" exit) or in
     /// response to SIGTERM / SIGKILL, and records which signals were sent.
+    #[cfg(unix)]
     #[derive(Default)]
     struct FakeState {
         term_called: bool,
@@ -7461,6 +7978,7 @@ mod tests {
         polls: u32,
     }
 
+    #[cfg(unix)]
     struct FakeSignaller {
         inner: Mutex<FakeState>,
         die_after_polls: Option<u32>,
@@ -7468,6 +7986,7 @@ mod tests {
         die_on_kill: bool,
     }
 
+    #[cfg(unix)]
     impl FakeSignaller {
         fn new(die_after_polls: Option<u32>, die_on_term: bool, die_on_kill: bool) -> Self {
             Self {
@@ -7479,6 +7998,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Signaller for FakeSignaller {
         fn is_alive(&self, _pid: u32) -> bool {
             let mut s = self.inner.lock().unwrap();
@@ -7505,11 +8025,16 @@ mod tests {
     }
 
     // Tiny timeouts keep the escalation tests fast while exercising real waits.
+    #[cfg(unix)]
     const GRACE: Duration = Duration::from_millis(200);
+    #[cfg(unix)]
     const TERM_T: Duration = Duration::from_millis(60);
+    #[cfg(unix)]
     const KILL_T: Duration = Duration::from_millis(60);
+    #[cfg(unix)]
     const POLL: Duration = Duration::from_millis(2);
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_already_down_when_not_alive() {
         // Dead on the very first liveness probe.
@@ -7520,6 +8045,7 @@ mod tests {
         assert!(!sig.inner.lock().unwrap().kill_called);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_graceful_when_exits_before_signal() {
         // Alive for the first couple of polls, then exits during the grace wait.
@@ -7529,6 +8055,7 @@ mod tests {
         assert!(!sig.inner.lock().unwrap().term_called, "no signal needed");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_escalates_to_sigterm() {
         // Never exits on its own; dies on SIGTERM. No graceful wait requested.
@@ -7539,6 +8066,7 @@ mod tests {
         assert!(!sig.inner.lock().unwrap().kill_called);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_escalates_to_sigkill() {
         // Survives SIGTERM, dies on SIGKILL.
@@ -7549,6 +8077,7 @@ mod tests {
         assert!(sig.inner.lock().unwrap().kill_called);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_fails_when_process_never_dies() {
         let sig = FakeSignaller::new(None, false, false);

@@ -9,6 +9,8 @@
 //! and asserted to equal a fresh `agent.getConversation` snapshot (the
 //! reconciliation invariant).
 
+#![cfg(unix)]
+
 mod common;
 
 use std::path::PathBuf;
@@ -29,13 +31,14 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 struct TempDb {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", self.path.display())));
-        }
+impl TempDb {
+    fn new() -> Self {
+        let dir = common::test_tempdir("intentd-uds-");
+        let path = dir.path().join("intentd.db");
+        Self { _dir: dir, path }
     }
 }
 
@@ -129,9 +132,7 @@ async fn setup() -> (
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
-    let tmp = TempDb {
-        path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-    };
+    let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
     let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus);
@@ -158,9 +159,7 @@ async fn setup_with_bus() -> (
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
-    let tmp = TempDb {
-        path: std::env::temp_dir().join(format!("intentd-uds-{}.db", Uuid::new_v4())),
-    };
+    let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store);
     let (socket, server, shutdown_tx, services, ws_root, sock_dir) = boot(&bus);
@@ -234,6 +233,12 @@ fn apply_entity(messages: &mut Vec<Value>, entity: &Value) {
     }
     if let Some(v) = entity.get("timestamp") {
         msg["timestamp"] = v.clone();
+    }
+    // Re-read entities (`agent:message` rows and the terminal reconcile) lift
+    // the persisted row's `metadata`; a client applies it to the message
+    // envelope so interrupted / finish-reason state renders without a refetch.
+    if let Some(v) = entity.get("metadata") {
+        msg["metadata"] = v.clone();
     }
     // The terminal reconcile (`streamingComplete: true`) flips an in-flight
     // message to its durable form: a client drops the transient `isStreaming`
@@ -582,7 +587,14 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
     .await;
 
     // Persist the assistant message BEFORE stream:end (as run_prompt_turn does),
-    // so the terminal reconcile re-reads the now-durable transcript.
+    // so the terminal reconcile re-reads the now-durable transcript. The row
+    // carries interrupted-turn metadata (intent#4409): the terminal frame must
+    // lift it so the reduced state matches `agent.getConversation` exactly.
+    let row_metadata = json!({
+        "interrupted": true,
+        "stopReason": "interrupted",
+        "interruptReason": "user_stop",
+    });
     store
         .append_agent_message_with_id(
             &AgentId::from(agent_id.as_str()),
@@ -597,7 +609,7 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
                   "output": "12 passed", "is_error": false },
                 { "type": "text", "id": format!("{mid}:3"), "text": "Done." },
             ]),
-            None,
+            Some(&row_metadata),
             &now_iso(),
         )
         .await
@@ -643,7 +655,25 @@ async fn chat_delta_stream_reconciles_with_fresh_snapshot() {
         }
         apply_delta(&mut reconstructed, &delta);
         if is_terminal_delta(&delta) {
+            for e in ["added", "updated"]
+                .iter()
+                .flat_map(|k| delta[*k].as_array().into_iter().flatten())
+            {
+                assert_eq!(
+                    e["metadata"], row_metadata,
+                    "every terminal entity carries the persisted row metadata: {delta}"
+                );
+            }
             break;
+        }
+        for e in ["added", "updated"]
+            .iter()
+            .flat_map(|k| delta[*k].as_array().into_iter().flatten())
+        {
+            assert!(
+                e.get("metadata").is_none(),
+                "mid-turn live entities carry no row metadata: {delta}"
+            );
         }
     }
     assert!(saw_text_growth, "a text block grew via an updated delta");
@@ -894,7 +924,7 @@ async fn chat_mid_turn_resume_snapshot_includes_in_flight_then_reconciles() {
     let _ = server.await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// monorepo#2104 — the end-to-end shape of the orphan-slot rule, deliberately
 /// superseding the Iter#1c heal-gate assertion this test used to make (that a
 /// live-turn slot with no busy claim is not merged AT ALL). The objection Iter#1c
@@ -1035,7 +1065,7 @@ async fn chat_snapshot_serves_an_orphan_live_turn_as_a_non_streaming_message() {
     let _ = server.await;
 }
 
-#[allow(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
+#[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// CS-4 cross-agent isolation: a `chat.subscribe` for agent A must NOT receive
 /// agent B's `agent:stream:*` events — the forwarder filters on
 /// `sessionId == agentId`. B's chunk is published first (and dropped); the next

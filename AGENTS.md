@@ -54,6 +54,7 @@ only on `intent-services`, never on `intent-store`.
 | domain logic / `WorkspaceApi`| `crates/intent-services/`                                    |
 | SQLite schema + migrations   | `crates/intent-store/`                                       |
 | ACP streaming / permissions  | `crates/intent-acp/`                                         |
+| browser tab contract / `ws.browser.docs` text | `crates/intent-acp/src/mcp_server/bindings/browser_docs/*.md` — change together with the cloudlands-fe executor (`src/features/browser/main/browser-action-executor.ts`, `embedded-browser-cdp-service.ts`, the browser-tab-registry saga) and `../../docs/protocol/methods/files-terminal-browser.md`; monorepo `make docs-check` cross-checks the shared `errorCode` / `displayed` tokens |
 | binary CLI + composition     | `crates/intentd/src/`                                        |
 | integration / e2e tests      | `crates/intentd/tests/`                                      |
 | deterministic ACP fixture    | `crates/intentd/tests/fixtures/mock-acp-agent.mjs`           |
@@ -158,6 +159,17 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   the UDS suites are a useful reference for shaping new tests, but they do **not** replace
   the WSS e2e requirement; the WSS path has its own concerns (TLS upgrade, bearer auth,
   origin allow-list, fingerprint pinning, heartbeat) that only the WSS harness covers.
+- **Scratch dirs** — create them with `common::test_tempdir(prefix)` /
+  `common::test_tempdir_in("/tmp", prefix)` (or `test_support::test_tempdir` inside
+  `intent-services`), declared before any guard that kills a daemon child: the `TempDir`
+  sweeps on drop (including on panic) and `INTENTD_TEST_KEEP_TMP=1` keeps it for
+  debugging. `tmp_hygiene_guard.rs` fails the suite on any raw `PathBuf::from("/tmp")` /
+  `Path::new("/tmp")` / `temp_dir().join(..)` in test code unless the line ends with
+  `// tmp-hygiene: allow — <reason>` (pure path arithmetic only).
+- **Repo-cache paths** — derive them with `intent_git::repo_cache::cache_root_for` /
+  `cache_path_for`, never `join(".repo-cache")`. `repo_cache_path_guard.rs` fails the
+  suite on a literal `".repo-cache"` in test code unless the line ends with
+  `// repo-cache-path: allow — <reason>`.
 
 ### Asserting the protocol contract
 
@@ -173,21 +185,33 @@ that contract:
 
 ## Gates — keep them green
 
-Before opening a submodule PR (and before bumping the monorepo gitlink), all three of the
-following must pass in `packages/intentd`:
+Before opening a submodule PR (and before bumping the monorepo gitlink), the gates must
+pass. Run them from the monorepo root via the top-level `Makefile`:
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test
+make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
+make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
+make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
+make gate     # check, then test
 ```
 
-From the monorepo root the same gates are exposed via the top-level `Makefile`:
+The raw equivalents in `packages/intentd` are `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo nextest run --workspace --show-progress none`. Saved `ws.script` runs are
+PTY-backed, so raw invocations need `CARGO_TERM_PROGRESS_WHEN=never` in the
+environment (all three) and `--show-progress none` on the nextest command (the `make`
+targets already set both) or progress-bar redraws flood the output buffer.
 
-```bash
-make check    # fmt + clippy against packages/intentd
-make test     # cargo test against packages/intentd
-```
+The CI `check` job also runs the repo-slug fold lint,
+`cargo test -p intent-core --test repo_slug_fold_lint`, a deliberately narrow source
+heuristic: it fails naming `file:line` for every statement outside
+`intent_core::RepoRef` where a case-fold call (`to_lowercase`, `to_ascii_lowercase`,
+`eq_ignore_ascii_case`, `make_ascii_lowercase`) co-occurs with an `owner` / `repo` /
+`repository` / `slug` identifier (intent-hq/intentd#1809 → #1815). It does not prove
+every raw slug comparison is caught — route slug identity through `RepoRef` regardless.
+A flagged site that is not slug identity opts out with
+`// repo-slug-fold: allow — <reason>` on the line immediately above the statement, and
+the reason is required.
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.
@@ -209,5 +233,8 @@ single tracker for all components; never track issues in markdown files. Use lab
 `component:intentd` + `agent-filed`. See the [root `AGENTS.md`](../../AGENTS.md) →
 Filing Issues for the full conventions (dedup, cross-referencing,
 `Fixes intent-hq/intent#N` — the release notifier is completeness-gated: it comments
-on the issue only once every linked intentd fix PR is merged and contained in the
-released tag).
+on the issue only once the issue is closed, at least one linked intentd fix PR is
+merged and contained in the released tag, no linked intentd fix PR is still open, and
+every merged one is contained (PRs closed without merging are ignored); a plain
+`intent-hq/intent#N` mention never earns a release comment, only a closing-keyword
+reference on the actual fix PR does).

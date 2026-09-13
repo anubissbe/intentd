@@ -769,16 +769,26 @@ async function handlePrompt(id, params) {
     for (const { toolCall, result } of toolResults) {
       // Emit tool_call notification (creates tool_use block in transcript)
       const toolCallId = `tc_${Math.random().toString(36).slice(2, 11)}`;
+      const rawInput = toolCall.arguments || {};
+      // With auggieToolCallShape, emulate auggie's `tool_call` frame for an
+      // MCP tool: the title is the model-authored `summary` (prose — never the
+      // tool name), there is no `name` field, and `kind` is `other`. Only
+      // `rawInput` ({ code, summary }) identifies the tool
+      // (intent-hq/intent#4491 regression class).
+      const toolCallFrame = active.auggieToolCallShape
+        ? {
+            title: typeof rawInput.summary === 'string' ? rawInput.summary : toolCall.name,
+            kind: 'other',
+          }
+        : { title: toolCall.name, name: toolCall.name, kind: 'mcp' };
       note('session/update', {
         sessionId: SESSION_ID,
         update: {
           sessionUpdate: 'tool_call',
           toolCallId,
-          title: toolCall.name,
-          name: toolCall.name,
-          kind: 'mcp',
+          ...toolCallFrame,
           status: 'in_progress',
-          rawInput: toolCall.arguments || {},
+          rawInput,
         },
       });
 
@@ -922,6 +932,15 @@ async function dispatch(msg) {
           // Stall without responding (timeout will trigger)
           return;
         }
+      }
+      // Deterministic session-setup rejection: fail EVERY session/new with
+      // the configured JSON-RPC error object (e.g. a bridge-wrapped 429 whose
+      // upstream body lives in `data`), modelling a provider whose allowance
+      // is already spent when the daemon opens the session — before any
+      // prompt — so spawn-path failure attribution can be pinned.
+      if (behavior.sessionNewRpcError) {
+        log(`failing session/new with JSON-RPC error ${behavior.sessionNewRpcError.code}`);
+        return send({ jsonrpc: '2.0', id: msg.id, error: behavior.sessionNewRpcError });
       }
       // Stash the session-setup-delivered MCP servers (STAB-156) so
       // `callWorkspaceTool` can reach the bridge without an `--mcp-config`.

@@ -24,21 +24,20 @@ use intent_core::events::{
     WORKSPACE_SETUP_COMPLETED, WORKSPACE_SETUP_STARTED, WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_UPDATED,
 };
-use intent_core::AgentReverseDispatch;
 use intent_core::{
     chief_workspace, iso_minutes_ago, now_epoch_ms, now_iso, parse_iso, ActorType,
-    AgentDelegateInput, AgentId, AgentLite, AgentSession, AuthorType, BoxFuture, ClientId, Comment,
-    CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
+    AgentDelegateInput, AgentId, AgentLite, AgentSession, AuthorType, BoxFuture, ClientHostInfo,
+    ClientId, Comment, CommentAddResult, CommentAnchor, CommentAnchorType, CommentDeleteResult,
     CommentGetThreadResult, CommentListResult, CommentLocation, CommentResolveThreadResult,
     CommentRespondResult, CommentRespondThread, CommentStatus, CommentThreadSummary, CommentType,
     CommentWire, ContentType, ContextItem, CreatedTaskEntry, Draft, Event, EventQueryParams,
-    EventSubscribeResult, EventUnsubscribeResult, FileActivity, LineAttributionAuthor,
-    LineAttributionComputeResult, LineAttributionData, LineAttributionInfo, Note, NoteAddInput,
-    NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult, NoteEditInput,
-    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
+    EventSubscribeResult, EventUnsubscribeResult, FileActivity, GitRemoteUrl,
+    LineAttributionAuthor, LineAttributionComputeResult, LineAttributionData, LineAttributionInfo,
+    Note, NoteAddInput, NoteAddResult, NoteCreate, NoteCreateResult, NoteDeleteResult,
+    NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteRestoreVersionResult, NoteSetContentResult, NoteTaskRow, NoteUpdateInput,
     NoteUpdateMetadataResult, NoteVersion, NoteVersionAuthor, NoteVersionSummary, NoteVisibility,
-    ProjectType, PullRequestInfo, ReadAssetResult, SaveAssetResult, ScriptCreateParams,
+    ProjectType, PullRequestInfo, ReadAssetResult, RepoRef, SaveAssetResult, ScriptCreateParams,
     SessionStats, SetupScript, TaskAgentLink, TaskAssignAgentResult, TaskConvertBlocksResult,
     TaskCreatePrerequisiteResult, TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult,
     TaskMetadata, TaskRemoveAgentFromAllTasksResult, TaskSetRelationsResult, TaskStatus,
@@ -48,6 +47,7 @@ use intent_core::{
     WorkspaceGitRootId, WorkspaceId, WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats,
     WorkspaceUpdate,
 };
+use intent_core::{AgentReverseDispatch, ReverseDispatchError, ReverseLiveClient};
 use intent_store::{EventQuery, NewEvent, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
@@ -59,16 +59,18 @@ mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
 pub mod antigravity;
+pub mod antigravity_install;
+pub mod antigravity_setup;
 mod attachment_upload;
 mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
+mod browser_tabs;
 mod clone_ops;
 mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;
 mod config_watcher;
-mod crdt_notes;
 mod create_progress;
 mod delete_grace;
 mod discovery_cache;
@@ -100,6 +102,7 @@ mod linear_ops;
 pub mod microvm;
 mod model_catalog;
 mod nested_repos;
+mod note_merge;
 pub mod note_ops;
 mod one_shot_acp;
 pub mod pagination;
@@ -113,6 +116,7 @@ pub mod provider_models;
 pub mod provider_test_prompt;
 mod rate_limit;
 pub mod repo_config;
+pub mod retention;
 mod rtk;
 pub mod sandbox_image;
 mod sandbox_ops;
@@ -131,14 +135,18 @@ mod transfer_export;
 pub mod transfer_git;
 mod transfer_import;
 pub(crate) mod transfer_materialize;
+mod transfer_remotes;
 #[cfg(test)]
 mod transfer_roundtrip;
+mod transfer_submodules;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
 mod workspace_status;
 pub mod workspace_vocabulary;
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod test_tracing;
 #[cfg(test)]
@@ -158,10 +166,11 @@ pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
-    agent_memory_budget_bytes, cleanup_retired_settings, import_legacy_settings,
-    max_concurrent_adapters, max_concurrent_agents, migrate_active_provider_setting,
-    migrate_cow_isolation_to_sandbox, migrate_default_vocabulary, migrate_quick_action_settings,
-    report_to_parent_debounce_seconds, InMemorySecretStore, SecretStore,
+    agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
+    import_legacy_settings, max_concurrent_adapters, max_concurrent_agents,
+    migrate_active_provider_setting, migrate_cow_isolation_to_sandbox, migrate_default_vocabulary,
+    migrate_quick_action_settings, report_to_parent_debounce_seconds, tool_payload_retention_days,
+    InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
@@ -316,6 +325,23 @@ pub(crate) struct DeferredAttention {
     pub(crate) attention_data: serde_json::Value,
 }
 
+/// Store-backed aggregates for one complete list-shaped workspace snapshot.
+/// Each component is loaded with one bulk statement and joined to workspace
+/// rows in memory. Batch projection failures fall back to the existing
+/// per-workspace reads; a missing map entry then retains the existing
+/// best-effort omission behavior for only that workspace.
+struct WorkspaceAggregateSnapshot {
+    max_note_updated_at: HashMap<WorkspaceId, String>,
+    task_stats: Option<HashMap<WorkspaceId, WorkspaceTaskStats>>,
+    sessions: Option<HashMap<WorkspaceId, Vec<AgentSession>>>,
+    unread: Option<HashSet<WorkspaceId>>,
+    active_hooks: HashSet<WorkspaceId>,
+    active_pr_monitors: HashSet<WorkspaceId>,
+    monitor_pr_signals: HashMap<WorkspaceId, workspace_status::MonitorPrSignals>,
+    legacy_question_holds: HashSet<AgentId>,
+    cow_supported: Option<bool>,
+}
+
 /// Aggregate service handle wired by the binary composition root. It implements
 /// `WorkspaceApi` so it can be handed to `intent-acp` as `Arc<dyn WorkspaceApi>`
 /// (§6.8) and dispatched to by the transport router.
@@ -341,11 +367,38 @@ pub struct Services {
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
     /// with the end-to-end orchestration flow; the queue surface itself is here.
     agent_queues: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Entries a drain arm has popped from `agent_queues` but whose user rows
+    /// are not yet persisted (PROTOCOL §6.5 drain ordering). Client-visible
+    /// snapshots ([`agent_ops::Services::queue_snapshot`]) keep listing them
+    /// ahead of the live queue until the owning [`agent_ops::DrainingGuard`]
+    /// is dropped, so an unrelated concurrent mutation's `agent:queue:updated`
+    /// never shows the entry gone before its row exists. Never persisted.
+    /// Lock order: this mutex is taken BEFORE `agent_queues`, never after.
+    draining_queue_entries: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
     /// Serializes [`agent_ops`] queue write-through persists. Each persist
     /// snapshots the live queue *inside* this async lock, so the last write to
     /// the `agent_queue` table always reflects the newest in-memory state — an
     /// older snapshot can never overwrite a newer one out of mutation order.
     agent_queue_persist_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes every `agent:queue:updated` publish
+    /// ([`agent_ops::Services::publish_queue_event`]): the snapshot is read
+    /// *inside* this async lock, immediately before the bus write, so a
+    /// publisher that paused (on the persist gate, on a store await) can
+    /// never emit a snapshot older than a mutation that completed before it
+    /// published — no pre-enqueue snapshot omitting a newer draining entry,
+    /// no old overlay copy arriving after the settled shrink.
+    agent_queue_publish_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes `workspace.setBrowserClient` write + `workspace:updated`
+    /// publish so concurrent setters never emit deltas out of order relative
+    /// to the durable pin; the delta is read back from the committed row.
+    browser_client_pin_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes each browser tab registry mutation (`browser.upsertTab` /
+    /// `removeTab` / `syncTabs`) together with the publication of its
+    /// `browser:tab-*` events. The store transaction alone orders the rows;
+    /// without this gate a `removeTab` could commit and publish `tab-closed`
+    /// between a `syncTabs` commit and that sync's per-row `tab-opened`,
+    /// leaving subscribers with a ghost tab the database no longer has.
+    browser_tab_gate: Arc<tokio::sync::Mutex<()>>,
     /// Per-entry debounce-hold release timers, keyed by queue-entry id: each
     /// held [`agent_ops::QueuedMessage`] gets a spawned sleeper that flushes
     /// the hold marker at `holdUntil` and kicks delivery. Release/retract
@@ -390,7 +443,7 @@ pub struct Services {
     /// `intent_providers::find_npx`; `Some(inner)` pins the result — including
     /// `Some(None)` to simulate a host without npx, which cannot be arranged
     /// hermetically through the real discovery.
-    #[allow(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
+    #[expect(clippy::option_option)] // the nesting IS the no-override vs pinned distinction
     one_shot_npx: Option<Option<PathBuf>>,
     /// Test-only override (milliseconds) for the auto-commit message
     /// generation timeout. Production composition leaves this `None` and the
@@ -406,6 +459,13 @@ pub struct Services {
     /// the `after_all` group fan-in (AS-4) consume it later. Shared across
     /// clones like the other in-memory registries.
     agent_subscriptions: Arc<Mutex<agent_subscriptions::SubscriptionRegistry>>,
+    /// Sender side of the delegation-group persistence lane: every write to
+    /// the `delegation_group` table is enqueued here (under the registry
+    /// lock) and executed by ONE worker task in enqueue order, so a
+    /// best-effort upsert spawned at group create/enroll can never land after
+    /// a later sweep/settlement delete and resurrect the row
+    /// (intent-hq/intent#4460). Lazily spawned on first use.
+    group_persist_lane: Arc<OnceLock<agent_subscriptions::GroupPersistSender>>,
     /// Serializes strict completion-only ask registration so a watch is
     /// durably persisted before it becomes visible to completion delivery.
     completion_watch_registration_gate: Arc<tokio::sync::Mutex<()>>,
@@ -616,11 +676,9 @@ pub struct Services {
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
-    /// Test park seams (monorepo#1180, monorepo#1194) for the `script.*` race
-    /// windows (supervisor pre-registration, `start()` spawn-to-registration).
-    /// All `None` in production wiring; tests inject via the
-    /// `#[cfg(test)]`-only `with_script_supervise_park` /
-    /// `with_script_start_registration_park`.
+    /// Test park seam (monorepo#1180) for the `script.*` supervisor
+    /// pre-registration race window. `None` in production wiring; tests
+    /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
     script_parks: script_ops::ScriptParks,
     /// Test park seam (issue intent-hq/monorepo#1468 follow-up) for the
     /// completion-delivery classify→mark window: parks
@@ -766,17 +824,6 @@ pub struct Services {
     /// service handle observes the same in-flight timers.
     line_attribution_debouncers:
         Arc<Mutex<HashMap<(WorkspaceId, NoteId), tokio::task::AbortHandle>>>,
-    /// Session-only CRDT merge engine for note full-content writes (PROTOCOL
-    /// `note.setContent` / `note.update` with content, §5.2). Ported from the
-    /// reference `CRDTDocumentManager` / `CRDTNotesService` — a yrs `Doc` is
-    /// seeded from the note's stored content on first touch and subsequent
-    /// full-content writes apply a char-level diff inside a yrs transaction;
-    /// the merged text is what the daemon persists, so concurrent writes
-    /// converge instead of last-write-wins. Surgical `note.*` / `task.*`
-    /// mutations invalidate the cached session so the next full-content write
-    /// reseeds from disk. Shared across clones like the other in-memory
-    /// registries.
-    crdt_notes: Arc<crdt_notes::CrdtNoteManager>,
     /// Per-workspace debouncers for `workspace:updated { lastActivity }` event
     /// emission (§10.1). Each write that can move derived `lastActivity`
     /// schedules a trailing-edge debounced emit; rapid bumps coalesce into one
@@ -801,6 +848,10 @@ pub struct Services {
     /// To prevent race conditions where an old task removes a newer handle, each
     /// entry stores a generation counter alongside the abort handle. Tasks only
     /// remove their own entry if the generation still matches.
+    ///
+    /// Lock order when nested with `agent_activity`: `agent_activity` →
+    /// `idle_debouncers` (`workspace_activity`, `agent_activity_end`). Never
+    /// take `agent_activity` while holding this lock.
     idle_debouncers: Arc<Mutex<HashMap<WorkspaceId, (u64, tokio::task::AbortHandle)>>>,
     /// Generation counter for idle debounce tasks (incremented on each schedule).
     idle_debounce_gen: Arc<Mutex<u64>>,
@@ -960,6 +1011,16 @@ pub struct Services {
     /// `prMonitor.pollSeconds` live from the settings registry; values below
     /// the floor are clamped at read time.
     pr_monitor_poll_seconds: Option<u64>,
+    /// Explicit override for the PR-monitor loop's hourly forge request
+    /// budget (the cadence cost model, not an enforced ceiling). `None` —
+    /// the production wiring — reads `prMonitor.hourlyRequestBudget` live
+    /// from the settings registry; values outside [floor, ceiling] are
+    /// clamped at read time.
+    pr_monitor_hourly_request_budget: Option<u64>,
+    /// The last effective per-PR poll interval (seconds) the monitor loop
+    /// logged, so a cadence change is logged once — never per tick. Shared
+    /// across clones.
+    pr_monitor_logged_interval: Arc<Mutex<Option<u64>>>,
     /// Explicit override for the debounce quiet window (seconds) before a
     /// changed PR's consolidated wake is delivered. `None` — the production
     /// wiring — reads `prMonitor.debounceSeconds` live from the settings
@@ -981,8 +1042,9 @@ pub struct Services {
     pr_refresh_fetch_timeout: std::time::Duration,
     /// Global forge rate-limit pause gate for the background sweeps
     /// (monorepo#2961): after a sweep forge call fails with
-    /// [`Error::RateLimited`], every forge-touching sweep — PR refresh and
-    /// git-root refresh alike, across all workspaces — is skipped until the
+    /// [`Error::RateLimited`], every forge-touching sweep — PR refresh,
+    /// git-root refresh and PR-monitor polling alike, across all
+    /// workspaces — is skipped until the
     /// quota window resets (honoring the forge-reported reset timestamp,
     /// else a fixed fallback), and the condition is logged once per pause
     /// window instead of once per root/workspace per tick. Shared across
@@ -1019,6 +1081,12 @@ pub struct Services {
     /// lazily by the next `begin`), and the client simply restarts the
     /// upload.
     attachment_uploads: Arc<Mutex<HashMap<String, attachment_upload::AttachmentUploadSession>>>,
+    /// Per-`(workspace, idempotencyKey)` in-flight guard for keyed attachment
+    /// placements (intent-hq/intent#4691): a same-key caller racing the
+    /// first placement waits on the key's lock and then replays the binding
+    /// instead of racing it to the store (whose primary key is the last line
+    /// of defence). Entries are dropped once no caller holds them.
+    attachment_idempotency_inflight: Arc<Mutex<attachment_upload::IdempotencyInflight>>,
     /// In-flight source-side exports (`workspace.export.*`, keyed by
     /// `exportId`): build state + sealed archive + WIP bookkeeping between
     /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
@@ -1077,13 +1145,18 @@ impl Services {
     /// Wire the services surface over a persistence handle.
     #[must_use]
     pub fn new(store: Store) -> Self {
+        let mcp_hub = Arc::new(McpHub::with_oauth_store(store.clone()));
         Self {
             store,
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
+            draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
+            browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
+            browser_tab_gate: Arc::new(tokio::sync::Mutex::new(())),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
             pending_question_mutation_locks: agent_ops::PendingQuestionMutationLocks::default(),
             pending_marker_mutation_park: None,
@@ -1096,6 +1169,7 @@ impl Services {
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
             )),
+            group_persist_lane: Arc::new(OnceLock::new()),
             completion_watch_registration_gate: Arc::new(tokio::sync::Mutex::new(())),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
@@ -1138,7 +1212,7 @@ impl Services {
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
-            mcp_hub: Arc::new(McpHub::new()),
+            mcp_hub,
             context_engine: Arc::new(intent_context::AuggieContextEngine::new()),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
             context_usages: Arc::new(Mutex::new(HashMap::new())),
@@ -1150,7 +1224,6 @@ impl Services {
             test_sweep_delays: Arc::new(Mutex::new(HashMap::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
             line_attribution_debouncers: Arc::new(Mutex::new(HashMap::new())),
-            crdt_notes: Arc::new(crdt_notes::CrdtNoteManager::new()),
             last_activity_debouncers: Arc::new(Mutex::new(HashMap::new())),
             last_activity_debounce_gen: Arc::new(Mutex::new(0)),
             idle_debouncers: Arc::new(Mutex::new(HashMap::new())),
@@ -1178,8 +1251,10 @@ impl Services {
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
             suspend_tracker: None,
-            pr_monitor_catch_up: Arc::new(Mutex::new(HashSet::new())),
+            pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_monitor_poll_seconds: None,
+            pr_monitor_hourly_request_budget: None,
+            pr_monitor_logged_interval: Arc::new(Mutex::new(None)),
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: pr_monitor::DEFAULT_PR_MONITORS_MAX_PER_AGENT,
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
@@ -1189,6 +1264,7 @@ impl Services {
             pending_agent_deletes: delete_grace::PendingDeletes::default(),
             transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
+            attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
             transfer_exports: Arc::new(Mutex::new(HashMap::new())),
             export_build_failpoint: None,
         }
@@ -1200,6 +1276,15 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_pr_monitor_poll_seconds(mut self, seconds: u64) -> Self {
         self.pr_monitor_poll_seconds = Some(seconds);
+        self
+    }
+
+    /// Pin the PR-monitor hourly forge request budget, bypassing the live
+    /// `prMonitor.hourlyRequestBudget` setting (test wiring). Values outside
+    /// [floor, ceiling] are clamped when read.
+    #[cfg(test)]
+    pub(crate) fn with_pr_monitor_hourly_request_budget(mut self, budget: u64) -> Self {
+        self.pr_monitor_hourly_request_budget = Some(budget);
         self
     }
 
@@ -1775,19 +1860,6 @@ impl Services {
         self
     }
 
-    /// Test seam (monorepo#1194): park `script.start` between spawning the
-    /// supervisor task and taking the registration lock so remove+recreate
-    /// races inside that window are deterministic. Production wiring keeps
-    /// `None` (no parking).
-    #[cfg(test)]
-    pub(crate) fn with_script_start_registration_park(
-        mut self,
-        park: Arc<script_ops::SupervisePark>,
-    ) -> Self {
-        self.script_parks.start_registration = Some(park);
-        self
-    }
-
     /// Test seam (issue intent-hq/monorepo#1468 follow-up): park
     /// `deliver_completion_to_watches` in its classify→mark window (after the
     /// `agent_waiting` probe, before `mark_interim_skipped_idle`) so a
@@ -1940,8 +2012,8 @@ impl Services {
         self.ac_status_inflight.waiters(workspace_id)
     }
 
-    /// Test-only: rebuild the status cache with a compressed fallback TTL so
-    /// expiry coverage completes in milliseconds.
+    /// Test-only: rebuild the status cache with an explicit fallback TTL
+    /// (expiry coverage advances the paused runtime clock past it).
     #[cfg(test)]
     pub(crate) fn with_git_status_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.git_status_cache = Arc::new(git_status_cache::GitStatusCache::with_ttl(ttl));
@@ -2372,6 +2444,7 @@ impl Services {
         ws: &mut Workspace,
         unread: Option<bool>,
     ) {
+        let cow_supported = self.compute_cow_supported().await;
         let mut activity_max = latest_activity_candidate(&[
             ws.last_activity.as_deref(),
             Some(ws.updated_at.as_str()),
@@ -2413,7 +2486,7 @@ impl Services {
         }
         // Compute cow_supported: CoW probe of the workspaces root. Reports
         // machine/filesystem capability regardless of checkout mode.
-        ws.cow_supported = self.compute_cow_supported().await;
+        ws.cow_supported = cow_supported;
         // diskUsage is deliberately NOT populated here: list/get/subscription
         // re-reads never touch the DiskUsageCache or arm walks (rung 3 of the
         // derived-field ladder). Clients fetch it on demand via the dedicated
@@ -2423,6 +2496,225 @@ impl Services {
         // [`Services::enrich_display_status`] (workspace_status module).
         self.enrich_display_status(ws, sessions.as_deref(), unread)
             .await;
+    }
+
+    /// Load every store-backed list aggregate in a constant number of
+    /// statements, then pre-fold the PR and legacy-question projections.
+    async fn workspace_aggregate_snapshot(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> WorkspaceAggregateSnapshot {
+        let (max_note_updated_at, task_stats, sessions, unread, cow_supported) = tokio::join!(
+            self.store.max_note_updated_at_by_workspace(workspace_ids),
+            self.store.count_task_stats_by_workspace(workspace_ids),
+            self.store
+                .list_agent_session_summaries_by_workspace(workspace_ids),
+            self.store
+                .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
+            self.compute_cow_supported(),
+        );
+        let (active_hooks, monitors, legacy_question_tails) = tokio::join!(
+            self.store.workspaces_with_active_hooks(workspace_ids),
+            self.store
+                .list_display_status_pr_monitors_by_workspaces(workspace_ids),
+            self.store
+                .list_legacy_question_tail_candidates_by_workspace(workspace_ids),
+        );
+
+        let task_stats = match task_stats {
+            Ok(stats) => Some(stats),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch task stats projection failed; falling back to per-workspace reads"
+                );
+                let mut stats = HashMap::new();
+                for workspace_id in workspace_ids {
+                    match self.cheap_task_stats(workspace_id).await {
+                        Ok(workspace_stats) => {
+                            stats.insert(workspace_id.clone(), workspace_stats);
+                        }
+                        Err(error) => tracing::debug!(
+                            %error,
+                            %workspace_id,
+                            "per-workspace task stats projection failed"
+                        ),
+                    }
+                }
+                Some(stats)
+            }
+        };
+        let sessions = match sessions {
+            Ok(mut sessions) => {
+                for workspace_id in workspace_ids {
+                    sessions.entry(workspace_id.clone()).or_default();
+                }
+                Some(sessions)
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch session projection failed; falling back to per-workspace reads"
+                );
+                let mut sessions = HashMap::new();
+                for workspace_id in workspace_ids {
+                    match self.store.list_agent_session_summaries(workspace_id).await {
+                        Ok(workspace_sessions) => {
+                            sessions.insert(workspace_id.clone(), workspace_sessions);
+                        }
+                        Err(error) => tracing::debug!(
+                            %error,
+                            %workspace_id,
+                            "per-workspace session projection failed"
+                        ),
+                    }
+                }
+                Some(sessions)
+            }
+        };
+        let mut active_pr_monitors = HashSet::new();
+        let mut monitor_rows: HashMap<WorkspaceId, Vec<intent_core::PrMonitor>> = HashMap::new();
+        if let Ok(monitors) = monitors {
+            for monitor in monitors {
+                if monitor.state == intent_core::PrMonitorState::Active {
+                    active_pr_monitors.insert(monitor.workspace_id.clone());
+                }
+                monitor_rows
+                    .entry(monitor.workspace_id.clone())
+                    .or_default()
+                    .push(monitor);
+            }
+        }
+        let monitor_pr_signals = monitor_rows
+            .into_iter()
+            .map(|(id, monitors)| (id, pr_monitor::fold_monitor_pr_signals(&monitors)))
+            .collect();
+
+        let sessions_by_agent: HashMap<&AgentId, &AgentSession> = sessions
+            .iter()
+            .flat_map(|by_workspace| by_workspace.values().flatten())
+            .map(|session| (&session.id, session))
+            .collect();
+        let legacy_question_holds = match legacy_question_tails {
+            Ok(tails) => tails
+                .into_iter()
+                .filter_map(|(agent_id, message_id, role, content)| {
+                    let session = sessions_by_agent.get(&agent_id)?;
+                    (role == "assistant"
+                        && agent_ops::has_question_blocks(&content)
+                        && session.dismissed_questions_message_id() != Some(message_id.as_str()))
+                    .then_some(agent_id)
+                })
+                .collect(),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "batch legacy question tail read failed; falling back to per-session probes"
+                );
+                let legacy_agent_ids: Vec<_> = sessions_by_agent
+                    .values()
+                    .filter(|session| {
+                        session.parent_agent_id.is_none()
+                            && !session.is_background
+                            && session.status != intent_core::AgentStatus::Deleted
+                            && !session.pending_questions_marker_written()
+                    })
+                    .map(|session| session.id.clone())
+                    .collect();
+                let mut holds = HashSet::new();
+                for agent_id in legacy_agent_ids {
+                    if self.questions_pending(&agent_id).await {
+                        holds.insert(agent_id);
+                    }
+                }
+                holds
+            }
+        };
+
+        WorkspaceAggregateSnapshot {
+            max_note_updated_at: max_note_updated_at.unwrap_or_default(),
+            task_stats,
+            sessions,
+            unread: unread.ok(),
+            active_hooks: active_hooks.unwrap_or_default(),
+            active_pr_monitors,
+            monitor_pr_signals,
+            legacy_question_holds,
+            cow_supported,
+        }
+    }
+
+    /// Join one workspace row with a pre-fetched aggregate snapshot. The full
+    /// list retains agent summaries and session-derived activity; the lite
+    /// subscription snapshot intentionally omits the summary payload.
+    async fn enrich_workspace_from_snapshot(
+        &self,
+        ws: &mut Workspace,
+        snapshot: &WorkspaceAggregateSnapshot,
+        include_agent_summary: bool,
+    ) {
+        ws.activity = self.workspace_activity(&ws.id);
+        ws.pending_delete_at = self.pending_workspace_deletes.deadline(ws.id.as_str());
+        let mut activity_max = if include_agent_summary {
+            latest_activity_candidate(&[
+                ws.last_activity.as_deref(),
+                Some(ws.updated_at.as_str()),
+                Some(ws.created_at.as_str()),
+                snapshot.max_note_updated_at.get(&ws.id).map(String::as_str),
+            ])
+        } else {
+            None
+        };
+        ws.task_stats = snapshot
+            .task_stats
+            .as_ref()
+            .and_then(|stats| stats.get(&ws.id).cloned());
+        let sessions = snapshot
+            .sessions
+            .as_ref()
+            .and_then(|by_workspace| by_workspace.get(&ws.id).map(Vec::as_slice));
+        if let Some(sessions) = sessions {
+            for session in sessions {
+                if include_agent_summary {
+                    activity_max = latest_activity_candidate(&[
+                        activity_max.as_deref(),
+                        Some(session.updated_at.as_str()),
+                    ]);
+                }
+            }
+            if include_agent_summary {
+                ws.agent_summary = Some(build_agent_summary(sessions));
+            }
+        }
+        if !include_agent_summary {
+            ws.agent_summary = None;
+        }
+        ws.diff_summary = None;
+        if let Some(activity_max) = activity_max {
+            ws.last_activity = Some(activity_max);
+        }
+        ws.cow_supported = snapshot.cow_supported;
+        let unread = snapshot.unread.as_ref().map(|ids| ids.contains(&ws.id));
+        let waiting = snapshot.active_hooks.contains(&ws.id)
+            || snapshot.active_pr_monitors.contains(&ws.id)
+            || sessions.is_some_and(|sessions| {
+                self.workspace_has_waiting_agent_subscriptions_in_sessions(&ws.id, sessions)
+            });
+        self.enrich_display_status_with_snapshot(
+            ws,
+            sessions,
+            unread,
+            Some(workspace_status::WorkspaceStatusSnapshot {
+                waiting,
+                monitor_pr_signals: snapshot
+                    .monitor_pr_signals
+                    .get(&ws.id)
+                    .copied()
+                    .unwrap_or_default(),
+                legacy_question_holds: &snapshot.legacy_question_holds,
+            }),
+        )
+        .await;
     }
 
     /// Cheap per-workspace `taskStats` read for lite/list paths: delegates to
@@ -2554,60 +2846,18 @@ impl Services {
         }
     }
 
-    /// Parse a GitHub URL and return `(owner, repo)` only if the host is exactly
-    /// `github.com`. Rejects URLs with hosts like `github.com.evil.com`.
-    fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
-        let trimmed = url.trim();
-
-        // HTTPS: extract host from scheme://host/... form.
-        if let Some(rest) = trimmed
-            .strip_prefix("https://")
-            .or_else(|| trimmed.strip_prefix("http://"))
-        {
-            let host_end = rest.find('/').unwrap_or(rest.len());
-            let host = &rest[..host_end];
-            if host != "github.com" {
-                return None;
-            }
-            let path = &rest[host_end..];
-            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
+    /// Start the one-time repository owner/name backfill after daemon listeners
+    /// are live. The daemon invokes this from a detached readiness task, so the
+    /// candidate read and every git/filesystem probe stay off startup and RPC
+    /// critical paths.
+    pub async fn prewarm_repository_metadata(&self) {
+        match self.store.list_workspaces(false).await {
+            Ok(workspaces) => self.spawn_repository_owner_backfill(&workspaces),
+            Err(error) => tracing::warn!(
+                %error,
+                "repository metadata startup prewarm skipped; workspace read failed"
+            ),
         }
-
-        // SSH URL: ssh://[user@]host[:port]/owner/repo(.git) form.
-        if let Some(rest) = trimmed.strip_prefix("ssh://") {
-            let rest = rest.split_once('@').map_or(rest, |(_, r)| r);
-            let host_end = rest.find('/').unwrap_or(rest.len());
-            let host = &rest[..host_end];
-            // Strip a numeric port; a non-numeric suffix stays part of the
-            // host and fails the strict check below.
-            let host = host.split_once(':').map_or(host, |(h, port)| {
-                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
-                    h
-                } else {
-                    host
-                }
-            });
-            if host != "github.com" {
-                return None;
-            }
-            let path = &rest[host_end..];
-            return clone_ops::parse_owner_repo(&format!("https://github.com{path}"));
-        }
-
-        // SSH scp-like: git@host:path form. Extract host before the colon.
-        if let Some(at_idx) = trimmed.find('@') {
-            let after_at = &trimmed[at_idx + 1..];
-            if let Some(colon_idx) = after_at.find(':') {
-                let host = &after_at[..colon_idx];
-                if host != "github.com" {
-                    return None;
-                }
-                let path = &after_at[colon_idx + 1..];
-                return clone_ops::parse_owner_repo(&format!("git@github.com:{path}"));
-            }
-        }
-
-        None
     }
 
     /// Spawn a background task to backfill `repository_owner` / `repository_name`
@@ -2627,21 +2877,24 @@ impl Services {
 
             let mut candidates = Vec::new();
             for ws in workspaces {
-                if ws.archived || backfilled.contains(ws.id.as_str()) {
+                let Some(repository_path) = ws.repository_path.as_deref().filter(|p| !p.is_empty())
+                else {
+                    continue;
+                };
+                let dedupe_key = format!("{}\0{repository_path}", ws.id.as_str());
+                if ws.archived || backfilled.contains(&dedupe_key) {
                     continue;
                 }
                 let missing_owner = ws.repository_owner.is_none()
                     || ws.repository_owner.as_deref().is_some_and(str::is_empty);
                 let missing_name = ws.repository_name.is_none()
                     || ws.repository_name.as_deref().is_some_and(str::is_empty);
-                if (missing_owner || missing_name)
-                    && ws.repository_path.as_deref().is_some_and(|p| !p.is_empty())
-                {
+                if missing_owner || missing_name {
                     candidates.push(BackfillCandidate {
                         workspace_id: ws.id.clone(),
-                        repository_path: ws.repository_path.clone().unwrap(),
+                        repository_path: repository_path.to_string(),
                     });
-                    backfilled.insert(ws.id.0.clone());
+                    backfilled.insert(dedupe_key);
                 }
             }
             candidates
@@ -2669,24 +2922,42 @@ impl Services {
     /// and emit `workspace:updated` with the changed fields. Non-github remotes
     /// are skipped silently.
     async fn backfill_one_workspace(&self, candidate: BackfillCandidate) -> Result<()> {
-        let repo_path = std::path::PathBuf::from(&candidate.repository_path);
-        if !repo_path.join(".git").exists() {
-            return Ok(());
-        }
-
-        let origin_url = intent_git::remote::origin_url(&repo_path).ok().flatten();
-
-        let Some(origin_url) = origin_url else {
-            return Ok(());
-        };
-
-        let Some((owner, name)) = Self::parse_github_owner_repo(&origin_url) else {
+        let repository_path = candidate.repository_path.clone();
+        let metadata = tokio::task::spawn_blocking(move || {
+            let repo_path = std::path::PathBuf::from(&repository_path);
+            #[cfg(test)]
+            record_repository_backfill_probe(&repo_path);
+            if !repo_path.join(".git").exists() {
+                return None;
+            }
+            intent_git::remote::origin_url(&repo_path)
+                .ok()
+                .flatten()
+                .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("repository metadata probe failed: {error}")))?;
+        let Some(RepoRef { owner, name }) = metadata else {
             return Ok(());
         };
 
         // Re-read the workspace to avoid overwriting fields populated after the
         // candidate was built (backfill race guard).
         let mut ws = self.store.get_workspace(&candidate.workspace_id).await?;
+        let current_repository_path = ws
+            .repository_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        if current_repository_path != Some(candidate.repository_path.as_str()) {
+            tracing::debug!(
+                workspace_id = %ws.id.as_str(),
+                candidate_repository_path = %candidate.repository_path,
+                current_repository_path = current_repository_path.unwrap_or(""),
+                "repository owner backfill skipped; workspace repository path changed"
+            );
+            return Ok(());
+        }
         let mut changes = serde_json::Map::new();
 
         // Only fill fields that are still missing in the currently persisted state.
@@ -2727,23 +2998,21 @@ impl Services {
         Ok(())
     }
 
-    /// Compute whether `CoW` isolation is supported on this machine. Probes the
-    /// workspaces root's filesystem (root→root) — a machine capability,
-    /// independent of any workspace or checkout mode (the FE uses it to gate
-    /// the `CoW` opt-in toggle, which affects newly created workspaces).
+    /// Read whether `CoW` isolation is supported on this machine from the
+    /// lifetime cache, awaiting the budgeted single-flight probe on a miss.
     /// Resolves the root like every other consumer — the injected
     /// `workspaces_root`, else [`default_workspaces_root`]
     /// (`$INTENTD_WORKSPACES_DIR`, else `~/intent/workspaces`) — so
     /// production daemons, which never inject a root, still report the
-    /// capability. Returns Some(true) if the `CoW` probe reports Supported;
-    /// Some(false) on an unsupported filesystem; None if the probe cannot
-    /// run. The live probe is offloaded to the blocking pool and cached per
-    /// workspaces root by the shared aggregate cache.
+    /// capability. Returns Some(true) if the `CoW` probe reports Supported,
+    /// Some(false) on an unsupported filesystem, and None when it cannot run or
+    /// exceeds the request budget. Over-budget probes continue in the
+    /// background and populate the cache for the next request.
     async fn compute_cow_supported(&self) -> Option<bool> {
         let workspaces_root = self
             .workspaces_root
             .clone()
-            .unwrap_or_else(default_workspaces_root);
+            .or_else(try_default_workspaces_root)?;
         self.workspace_aggregates
             .cow_supported(workspaces_root)
             .await
@@ -2783,6 +3052,20 @@ impl Services {
             None => default_workspaces_root(),
         };
         self.workspace_aggregates.cow_supported(root).await == Some(true)
+    }
+
+    /// Prewarm the machine-level `CoW` capability off the RPC read path.
+    /// Idempotent and single-flight per resolved workspaces root.
+    pub fn prewarm_cow_supported(&self) {
+        let Some(workspaces_root) = self
+            .workspaces_root
+            .clone()
+            .or_else(try_default_workspaces_root)
+        else {
+            return;
+        };
+        self.workspace_aggregates
+            .prewarm_cow_supported(workspaces_root);
     }
 
     /// The daemon-managed directory whose footprint `workspace.diskUsage`
@@ -2985,21 +3268,28 @@ impl Services {
     /// window (~3s default, env-overridable for tests). A new `agent_activity_begin`
     /// within the window cancels the idle flip. A decrement with no tracked session
     /// is a no-op.
+    ///
+    /// The `agent_activity` lock is held across the debouncer registration
+    /// (intent#4283): [`Self::workspace_activity`] reads the count and then
+    /// the `idle_debouncers` map, so releasing the count before the debouncer
+    /// is inserted opened a window where a reader saw count `0` with no
+    /// pending debouncer and derived a transient `Idle` inside the grace
+    /// window — `workspace.get` serving `idle` while the immediately following
+    /// `workspace.list` served `agent_running` / `in_progress`. Lock order
+    /// `agent_activity → idle_debouncers` matches `workspace_activity`.
     pub(crate) fn agent_activity_end(&self, workspace_id: &WorkspaceId) {
-        let transitioned = {
-            let mut map = self.agent_activity.lock().unwrap();
-            match map.get_mut(workspace_id) {
-                Some(count) if *count > 0 => {
-                    *count -= 1;
-                    if *count == 0 {
-                        map.remove(workspace_id);
-                        true
-                    } else {
-                        false
-                    }
+        let mut map = self.agent_activity.lock().unwrap();
+        let transitioned = match map.get_mut(workspace_id) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                if *count == 0 {
+                    map.remove(workspace_id);
+                    true
+                } else {
+                    false
                 }
-                _ => false,
             }
+            _ => false,
         };
         if transitioned {
             self.schedule_idle_debounce(workspace_id.clone());
@@ -3010,6 +3300,11 @@ impl Services {
     /// for the workspace. The event is emitted only after the workspace stays idle
     /// for the full debounce window (~3s default, env-overridable for tests). A new
     /// `agent_activity_begin` within the window cancels the pending flip.
+    ///
+    /// Called with the `agent_activity` guard held (intent#4283): must stay
+    /// synchronous, must not lock `agent_activity` (non-reentrant `std::sync::Mutex`),
+    /// and may only take `idle_debounce_gen` / `idle_debouncers` (lock order
+    /// `agent_activity → idle_debouncers`).
     fn schedule_idle_debounce(&self, workspace_id: WorkspaceId) {
         // Increment generation counter and cancel any existing debouncer.
         let gen = if let Ok(mut gen_lock) = self.idle_debounce_gen.lock() {
@@ -3623,8 +3918,9 @@ impl Services {
 
     /// Override the auto-commit message generation timeout (defaults to the
     /// ~30s `GENERATION_TIMEOUT_MS` in `auto_commit`). Tests compress it so
-    /// the timeout-fallback path completes in milliseconds.
-    #[cfg(test)]
+    /// the timeout-fallback path completes in milliseconds. Its only callers
+    /// spawn a fake CLI via a shell script, so they (and it) are unix-only.
+    #[cfg(all(test, unix))]
     pub(crate) fn with_auto_commit_timeout_ms(mut self, ms: u64) -> Self {
         self.auto_commit_timeout_ms = Some(ms);
         self
@@ -3651,6 +3947,41 @@ impl Services {
     pub fn with_reverse_dispatch(mut self, dispatch: Arc<dyn AgentReverseDispatch>) -> Self {
         self.reverse_dispatch = Some(dispatch);
         self
+    }
+
+    /// The `workspace.getBrowserClient` payload for `id`: the persisted pin
+    /// (`clientId` + `source: "workspace"`, else `source: "default"`) and
+    /// `resolved` — the driving client an agent `browser.exec` would reach
+    /// right now ([`Self::driving_client_target`]: pin → host of the
+    /// workspace's claimed tabs → first-connected eligible client), `null`
+    /// when that client is offline or no eligible client is connected. Chief
+    /// has no row and always reports the default.
+    async fn browser_client_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
+        let pinned = if id.is_chief() {
+            None
+        } else {
+            self.store.workspace_browser_client(id).await?
+        };
+        let target = self.driving_client_target(id).await?;
+        let resolved = self
+            .reverse_dispatch
+            .as_ref()
+            .and_then(|d| d.resolve(&target).ok())
+            .map_or(serde_json::Value::Null, |r| {
+                serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
+            });
+        let mut out = serde_json::Map::new();
+        match pinned {
+            Some(client_id) => {
+                out.insert("clientId".into(), client_id.as_str().into());
+                out.insert("source".into(), "workspace".into());
+            }
+            None => {
+                out.insert("source".into(), "default".into());
+            }
+        }
+        out.insert("resolved".into(), resolved);
+        Ok(serde_json::Value::Object(out))
     }
 
     /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
@@ -3839,8 +4170,8 @@ impl Services {
                 .ok()
                 .and_then(std::result::Result::ok)
                 .flatten()
-                .and_then(|url| Self::parse_github_owner_repo(&url))
-                .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
                 // Stamp the root's HEAD at registration time (fail-soft:
                 // unreadable HEAD ⇒ NULL, backfilled by a later sweep pass).
                 let registered_commit_sha = Self::read_git_root_head_sha(&canonical).await;
@@ -4016,7 +4347,7 @@ impl Services {
                 pause_secs = pause.as_secs(),
                 reset_unix,
                 detail,
-                "forge rate limit hit: pausing pr refresh + git root sweeps globally"
+                "forge rate limit hit: pausing pr refresh, git root + pr monitor sweeps globally"
             );
         }
     }
@@ -4049,10 +4380,9 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
-        let (Some(owner), Some(name)) = (root.repo_owner.clone(), root.repo_name.clone()) else {
+        let Some(repo_ref) = root.repo() else {
             return Ok(PrRefreshOutcome::Skipped);
         };
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, name);
         // The live HEAD read is git I/O (roots may live on network/FUSE
         // mounts), so it runs on the blocking pool — never inline on the
         // runtime.
@@ -4296,10 +4626,9 @@ impl Services {
         if ws.is_remote || ws.archived {
             return Ok(PrRefreshOutcome::Skipped);
         }
-        let Ok((owner, repo)) = pr_ops::repo_of(&ws) else {
+        let Ok(repo_ref) = pr_ops::repo_of(&ws) else {
             return Ok(PrRefreshOutcome::Skipped);
         };
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         if let Some(number) = ws.pr_number {
             let pr = sc
@@ -4578,31 +4907,6 @@ impl Services {
                 ticker.tick().await;
                 services.refresh_all_workspace_prs(tick).await;
                 tick = tick.wrapping_add(1);
-            }
-        })
-    }
-
-    /// Spawn the CRDT session-sweeper loop (A5, reference parity with the
-    /// `CRDTNotesService` idle sweep): every [`crdt_notes::SESSION_SWEEP_INTERVAL`]
-    /// tick, drop cached `yrs` docs whose last access is older than
-    /// [`crdt_notes::SESSION_IDLE_TIMEOUT`] so long-lived daemons do not hold
-    /// per-note session state indefinitely. The first sweep runs after one
-    /// interval; missed ticks are skipped (no pile-up). Returns the task handle
-    /// so the composition root can hold/abort it.
-    #[must_use]
-    pub fn spawn_crdt_session_sweep_loop(&self) -> tokio::task::JoinHandle<()> {
-        let crdt_notes = self.crdt_notes.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(crdt_notes::SESSION_SWEEP_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Consume the immediate first tick so the loop waits one interval.
-            ticker.tick().await;
-            loop {
-                ticker.tick().await;
-                let removed = crdt_notes.sweep_stale(crdt_notes::SESSION_IDLE_TIMEOUT);
-                if removed > 0 {
-                    tracing::info!(removed, "crdt session sweep evicted stale sessions");
-                }
             }
         })
     }
@@ -7162,7 +7466,7 @@ impl Services {
     /// indefinitely; the retry replays the advisory-allowed delivery pass
     /// and the stable message id keeps every attempt idempotent. `grouped`
     /// (STAB-160 shape when `true`) only picks the wake's trailer wording.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn deliver_monitoring_idle_advisory(
         &self,
         child_id: &AgentId,
@@ -7439,8 +7743,7 @@ impl Services {
             return;
         }
         if let Err(e) = self
-            .store
-            .settle_delegation_group_after_delivery(group_id, &failed_children)
+            .settle_delegation_group_persisted(group_id, &failed_children)
             .await
         {
             tracing::warn!(
@@ -9054,7 +9357,8 @@ async fn fetch_note(store: &Store, workspace_id: &WorkspaceId, note_id: &NoteId)
 }
 
 /// Author stamp for daemon-internal note-version writes (the workspace-seed
-/// spec note snapshot). All user- and agent-originated writes resolve the
+/// spec note snapshot, `workspace.duplicate` note copies, linked-checkbox
+/// materialization). All user- and agent-originated writes resolve the
 /// author from the caller instead (see [`resolve_note_version_author`]).
 fn system_version_author() -> NoteVersionAuthor {
     NoteVersionAuthor {
@@ -9105,17 +9409,309 @@ async fn resolve_note_version_author(
     }
 }
 
-/// Append a full-snapshot version of `note`'s *current* (post-mutation) state,
-/// stamped with `author` and the note's `updated_at` (PROTOCOL §5.2
-/// version-history extensions). The store prunes to the newest 50 on append.
-async fn capture_note_version(
+/// Insert a new note row and its initial version snapshot (at `note.rev`,
+/// stamped with `author` and the note's `updated_at`) in one store transaction
+/// ([`Store::insert_note_with_version`]): the fresh row is never visible while
+/// its rev has no recoverable base, so a writer that reads the new note and
+/// later sends that rev as a stale base merges from the initial content
+/// instead of degrading to last-writer-wins (PROTOCOL §5.2 version-history
+/// extensions). Every note insert goes through here. Returns the version
+/// number.
+async fn persist_new_note(store: &Store, note: &Note, author: &NoteVersionAuthor) -> Result<i64> {
+    store
+        .insert_note_with_version(note, author, &note.updated_at)
+        .await
+}
+
+/// Persist a note content write and its version snapshot in one store
+/// transaction ([`Store::update_note_with_version`]): the row's new `rev` and
+/// the snapshot that makes it a recoverable merge base become visible
+/// together, so no concurrent writer can read the new rev and resolve it to
+/// the previous content, and a snapshot can never land out of rev order.
+/// Every persisted content *update* goes through here; inserts commit row and
+/// snapshot together via [`persist_new_note`]. Gated on `expected_version`
+/// when `Some` (`Conflict` on a mismatch, like
+/// [`Store::update_note_versioned`]). Returns the post-write `rev`.
+async fn persist_note_content(
     store: &Store,
     note: &Note,
+    expected_version: Option<i64>,
     author: &NoteVersionAuthor,
 ) -> Result<i64> {
     store
-        .append_note_version(note, author, &note.updated_at)
+        .update_note_with_version(note, expected_version, author, &note.updated_at)
         .await
+        .map(|(rev, _)| rev)
+}
+
+/// [`persist_new_note`] with the daemon-internal system author, for
+/// noninteractive note inserts that live outside this crate (the `intentd`
+/// importers). Imported notes are loaded by clients like any other, so their
+/// initial `rev` must be a recoverable base too — the row and its snapshot
+/// commit together.
+///
+/// # Errors
+///
+/// Returns `Error::Internal` if the insert or the version append fails.
+pub async fn persist_system_new_note(store: &Store, note: &Note) -> Result<i64> {
+    persist_new_note(store, note, &system_version_author()).await
+}
+
+/// [`persist_note_content`] with the daemon-internal system author and no
+/// `expectedVersion` gate, for noninteractive full-note *updates* outside this
+/// crate (the `intentd` importers re-writing an existing note). The row and
+/// its snapshot commit together, so an imported rev is never visible while
+/// its base still resolves to the previous content. Returns the post-write
+/// `rev`.
+///
+/// # Errors
+///
+/// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the write fails.
+pub async fn persist_system_note_content(store: &Store, note: &Note) -> Result<i64> {
+    persist_note_content(store, note, None, &system_version_author()).await
+}
+
+/// Bounded read-merge-persist attempts for `note.setContent`: on a store
+/// `Conflict` (another versioned write landed between the fetch and the
+/// persist) the loop re-fetches and re-merges against the new current; the
+/// last attempt's `Conflict` propagates unchanged.
+const SET_CONTENT_MAX_ATTEMPTS: usize = 5;
+
+/// Text `note.setContent` persists for one attempt, plus the baseline the
+/// reduction guard is measured against.
+struct SetContentMerge {
+    /// Content to clean and persist.
+    text: String,
+    /// The writer's base when `expected_version` was stale and its snapshot
+    /// was recoverable; `None` on the exact / LWW paths (guard measures
+    /// current → incoming).
+    base: Option<String>,
+    outcome: &'static str,
+    conflicting_spans: usize,
+}
+
+/// Resolve what a `note.setContent` write persists on top of the stored
+/// `current` row. An absent or matching `expected_version` is the exact path
+/// (`incoming` replaces the current text). A stale `expected_version` (below
+/// `current.rev`) recovers the writer's base via
+/// [`Store::get_note_version_content_by_rev`] and applies the writer's intent
+/// onto the current text with [`note_merge::three_way_merge`]; when no
+/// snapshot survives for that rev the write degrades to honest
+/// last-writer-wins. Only revs that could have been read merge: an
+/// `expected_version` above `current.rev` was never served by this note, so
+/// it is the plain optimistic-concurrency mismatch (`Error::Conflict`,
+/// `-32005`) rather than a base to merge from.
+async fn merge_set_content(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    current: &Note,
+    incoming: &str,
+    expected_version: Option<i64>,
+) -> Result<SetContentMerge> {
+    let stale = match expected_version {
+        Some(v) if v > current.rev => {
+            let current = serde_json::to_value(current)
+                .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
+            return Err(Error::Conflict { current });
+        }
+        Some(v) if v < current.rev => v,
+        _ => {
+            return Ok(SetContentMerge {
+                text: incoming.to_string(),
+                base: None,
+                outcome: "exact",
+                conflicting_spans: 0,
+            })
+        }
+    };
+    let current = current.content.as_str();
+    match store
+        .get_note_version_content_by_rev(workspace_id, note_id, stale)
+        .await?
+    {
+        Some(base) => {
+            let merged = note_merge::three_way_merge(&base, current, incoming);
+            Ok(SetContentMerge {
+                text: merged.text,
+                base: Some(base),
+                outcome: "merged",
+                conflicting_spans: merged.conflicting_spans,
+            })
+        }
+        None => Ok(SetContentMerge {
+            text: incoming.to_string(),
+            base: None,
+            outcome: "lww-no-base",
+            conflicting_spans: 0,
+        }),
+    }
+}
+
+/// `note.setContent` reduction guard: reject an unconfirmed write whose
+/// `incoming` text is more than 50 % shorter than `baseline` (the writer's
+/// base when known, else the stored current).
+fn check_set_content_reduction(
+    baseline: &str,
+    incoming: &str,
+    confirm_replacement: bool,
+) -> Result<()> {
+    if baseline.is_empty() || confirm_replacement {
+        return Ok(());
+    }
+    // Note sizes are far below 2^53 (loss-free in f64); the rounded
+    // percentage is in [0, 100] so the float→int cast is exact.
+    #[expect(clippy::cast_precision_loss)]
+    let old_len = baseline.chars().count() as f64;
+    #[expect(clippy::cast_precision_loss)]
+    let new_len = incoming.chars().count() as f64;
+    let reduction = (old_len - new_len) / old_len * 100.0;
+    if reduction > 50.0 {
+        // The rounded percentage is in (50, 100]: exact in i64.
+        #[expect(clippy::cast_possible_truncation)]
+        let reduction_pct = reduction.round() as i64;
+        return Err(Error::Internal(format!(
+            "⚠️ CONTENT REDUCTION DETECTED: Your new content ({} chars) is {}% shorter than the existing content ({} chars).\n\nThis will REPLACE the entire note. If you intended to:\n- ADD content: Use note.add instead\n- EDIT a section: Use note.edit instead\n- PROCEED with replacement: Call note.setContent again with confirmReplacement=true",
+            incoming.chars().count(),
+            reduction_pct,
+            baseline.chars().count()
+        )));
+    }
+    Ok(())
+}
+
+/// How [`persist_merged_content`] turns one attempt's merged text into the
+/// text it persists.
+#[derive(Clone, Copy)]
+enum ContentWritePolicy {
+    /// `note.setContent`: the reduction guard (measured against the writer's
+    /// base when known, else the stored current) then the set-content cleaner.
+    SetContent { confirm_replacement: bool },
+    /// `note.add` / `note.edit` / `note.editLines`: the surgical transform
+    /// already ran against the content the caller read; the merged text
+    /// persists verbatim.
+    Surgical,
+}
+
+/// One persisted content write from [`persist_merged_content`].
+struct MergedContentWrite {
+    /// The note as persisted (`content` / `updated_at` are the written
+    /// values; `rev` is the pre-write rev the last attempt read — use `rev`).
+    note: Note,
+    /// The stored content the final attempt replaced.
+    old_content: String,
+    /// The persisted content (post-clean, post-reanchor).
+    content: String,
+    /// `updated_at` stamped on the write.
+    now: String,
+    /// Post-write rev.
+    rev: i64,
+}
+
+/// One client content write for [`persist_merged_content`].
+struct ContentWrite<'a> {
+    /// A row the caller already fetched: attempt 1 reuses it instead of
+    /// re-reading.
+    seed: Option<Note>,
+    /// The text the writer wants persisted (for surgical ops, the transform's
+    /// result against the `seed` content).
+    incoming: &'a str,
+    /// The rev the writer's `incoming` is based on (`None`: unconditional);
+    /// surgical callers pass the rev of their `seed` read.
+    expected_version: Option<i64>,
+    policy: ContentWritePolicy,
+    author: &'a NoteVersionAuthor,
+    /// Method label for the merge trace.
+    op: &'static str,
+}
+
+/// Read-merge-persist loop every client content write runs through
+/// (`note.setContent` and the surgical `note.add` / `note.edit` /
+/// `note.editLines`): each attempt fetches the current row, resolves what to
+/// persist with [`merge_set_content`] (`incoming` verbatim when
+/// `expected_version` is absent or matches the current rev; when it is below
+/// the current rev, the writer's intent three-way-merged onto the current text
+/// from the snapshot at `expected_version`, degrading to last-writer-wins when
+/// no snapshot survives; when it is above the current rev, `Conflict` without
+/// a write), applies `policy`, runs comment-anchor recovery, and persists
+/// gated on the rev it read via [`persist_note_content`] — so a write that
+/// lands in between is merged into on the next attempt rather than
+/// overwritten. The last attempt's `Conflict` propagates unchanged.
+async fn persist_merged_content(
+    store: &Store,
+    workspace_id: &WorkspaceId,
+    note_id: &NoteId,
+    write: ContentWrite<'_>,
+) -> Result<MergedContentWrite> {
+    let ContentWrite {
+        mut seed,
+        incoming,
+        expected_version,
+        policy,
+        author,
+        op,
+    } = write;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let mut note = match seed.take() {
+            Some(note) => note,
+            None => fetch_note_peer(store, workspace_id, note_id).await?,
+        };
+        let old_content = note.content.clone();
+        let current_rev = note.rev;
+        let merge = merge_set_content(
+            store,
+            workspace_id,
+            note_id,
+            &note,
+            incoming,
+            expected_version,
+        )
+        .await?;
+        let text = match policy {
+            ContentWritePolicy::SetContent {
+                confirm_replacement,
+            } => {
+                check_set_content_reduction(
+                    merge.base.as_deref().unwrap_or(&old_content),
+                    incoming,
+                    confirm_replacement,
+                )?;
+                note_ops::clean_set_content(&merge.text)?
+            }
+            ContentWritePolicy::Surgical => merge.text,
+        };
+        tracing::debug!(
+            note = %note_id.0,
+            op,
+            attempt,
+            current_rev,
+            expected_version,
+            outcome = merge.outcome,
+            conflicting_spans = merge.conflicting_spans,
+            "note content merge"
+        );
+        let mut plan = reanchor_note_comments(store, workspace_id, note_id, text).await?;
+        let content = std::mem::take(&mut plan.content);
+        note.content = content.clone();
+        let now = now_iso();
+        note.updated_at = now.clone();
+        match persist_note_content(store, &note, Some(current_rev), author).await {
+            Ok(rev) => {
+                plan.apply_orphaned(store, workspace_id).await?;
+                return Ok(MergedContentWrite {
+                    note,
+                    old_content,
+                    content,
+                    now,
+                    rev,
+                });
+            }
+            Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Comment anchor recovery pass, called by every note-content mutation before
@@ -9128,8 +9724,9 @@ async fn capture_note_version(
 /// Returns a [`ReanchorPlan`]: the possibly-rewritten markdown plus the set
 /// of comments whose `is_orphaned` flag needs to be flipped to `true`.
 /// Already-orphaned comments are left as-is. The plan does **no** store
-/// writes — callers apply the note-content change first via `update_note`
-/// and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
+/// writes — callers first persist the note-content change via an atomic
+/// versioned write (`persist_note_content` / the `*_with_version` store
+/// helpers) and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
 /// cannot leave comment rows flagged orphaned while the persisted markdown
 /// still contains the original anchors.
 ///
@@ -9459,7 +10056,9 @@ impl Services {
         apply_status_transition(&mut task, new_status, &now);
         note.metadata.task = Some(task);
         note.updated_at = now.clone();
-        store.update_note_versioned(&note, expected_version).await?;
+        store
+            .update_note_metadata_versioned(&note, expected_version)
+            .await?;
         // Mirror `notes.service.ts`: emit only when the status actually changed.
         let all = if previous_status == new_status {
             None
@@ -9549,16 +10148,6 @@ impl Services {
             note,
         })
     }
-
-    /// Drop any cached CRDT session for `(workspace, note)` after a surgical
-    /// content mutation (`note.add` / `note.edit` / `note.editLines`,
-    /// `task.updateStatus` / `task.update`, `note.restoreVersion`,
-    /// `note.convertBlocks`, `comment.add`) writes directly to storage. The
-    /// next full-content write (`note.setContent`) will reseed the yrs doc
-    /// from the fresh persisted content so the merge baseline stays coherent.
-    pub(crate) fn invalidate_crdt_note(&self, workspace_id: &WorkspaceId, note_id: &NoteId) {
-        self.crdt_notes.invalidate(workspace_id, note_id);
-    }
 }
 
 /// Seed the well-known `spec` note for a workspace (reference parity with
@@ -9577,10 +10166,8 @@ async fn ensure_spec_note(
     workspace_id: &WorkspaceId,
 ) -> Result<()> {
     let spec_id = NoteId::from("spec");
-    match fetch_note(store, workspace_id, &spec_id).await {
-        Ok(_) => return Ok(()),
-        Err(Error::NotFound(_)) => {}
-        Err(e) => return Err(e),
+    if store.note_exists(workspace_id, &spec_id).await? {
+        return Ok(());
     }
     // The reseed writes target `note.workspace_id → workspace(id)` (migration
     // 0030), so a deleted/nonexistent workspace has no FK target: verify the
@@ -9640,9 +10227,8 @@ async fn ensure_spec_note(
         rev: 0,
         updated_at: now,
     };
-    store.insert_note(&note).await?;
     // Workspace-seed spec is daemon-internal; no caller agent applies.
-    capture_note_version(store, &note, &system_version_author()).await?;
+    persist_new_note(store, &note, &system_version_author()).await?;
     publish_event(
         bus,
         note_change_event(
@@ -9672,9 +10258,9 @@ async fn fetch_note_peer(
 }
 
 /// Resolve a sibling workspace for the `crossWorkspace.*` reads, enforcing that
-/// the caller and target share the same `repositoryPath`. Mirrors the TS
-/// `getSiblingWorkspaceOrThrow` messages; all failures surface as
-/// [`Error::Internal`] (→ `-32603`) to match the TS handler.
+/// the caller and target share a repository per [`workspaces_share_repository`].
+/// Mirrors the TS `getSiblingWorkspaceOrThrow` messages; all failures surface
+/// as [`Error::Internal`] (→ `-32603`) to match the TS handler.
 async fn sibling_workspace_or_throw(
     store: &Store,
     current_workspace_id: &WorkspaceId,
@@ -9687,14 +10273,11 @@ async fn sibling_workspace_or_throw(
         }
         Err(e) => return Err(e),
     };
-    let repo_path = match current.repository_path.as_deref() {
-        Some(p) if !p.is_empty() => p.to_string(),
-        _ => {
-            return Err(Error::Internal(
-                "Current workspace is not associated with a repository".to_string(),
-            ));
-        }
-    };
+    if !has_repository_identity(&current) {
+        return Err(Error::Internal(
+            "Current workspace is not associated with a repository".to_string(),
+        ));
+    }
     let target = match store.get_workspace(target_workspace_id).await {
         Ok(w) => w,
         Err(Error::NotFound(_)) => {
@@ -9704,12 +10287,59 @@ async fn sibling_workspace_or_throw(
         }
         Err(e) => return Err(e),
     };
-    if target.repository_path.as_deref() != Some(repo_path.as_str()) {
+    if !workspaces_share_repository(&current, &target) {
         return Err(Error::Internal(
             "Access denied: Can only access workspaces in the same repository".to_string(),
         ));
     }
     Ok(target)
+}
+
+/// Normalized GitHub `(owner, name)` for sibling matching: both parts
+/// non-empty, case-folded through the [`intent_sourcecontrol::RepoRef`]
+/// identity (GitHub owner/repo names are case-insensitive), with a trailing
+/// `.git` stripped from the folded name so `INTENT.GIT` matches `intent`.
+/// `None` when the workspace has no complete GitHub identity (local-only
+/// repo, or not yet backfilled).
+fn github_repository_identity(ws: &Workspace) -> Option<(String, String)> {
+    let (owner, name) = ws.repo()?.identity_parts();
+    let owner = owner.trim();
+    let name = name.trim();
+    let name = name.strip_suffix(".git").unwrap_or(name);
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), name.to_string()))
+}
+
+fn nonempty_repository_path(ws: &Workspace) -> Option<&str> {
+    ws.repository_path.as_deref().filter(|p| !p.is_empty())
+}
+
+/// Caller precondition for `crossWorkspace.*`: the workspace can be placed in
+/// a repository by either its GitHub owner/name or its local source path.
+fn has_repository_identity(ws: &Workspace) -> bool {
+    github_repository_identity(ws).is_some() || nonempty_repository_path(ws).is_some()
+}
+
+/// The single sibling predicate shared by `crossWorkspace.listSiblings` and
+/// the `readNote` / `listNotes` access gate, so the two cannot drift. Two
+/// workspaces share a repository when either their GitHub owner/name match
+/// (case-insensitive, `.git` tolerated) — which links checkouts of the same
+/// repo at different local paths — or their non-empty source
+/// `repository_path`s are equal (local-only repos, and rows the owner/name
+/// backfill has not reached yet). Identity of the two rows is not checked;
+/// callers filter self out.
+fn workspaces_share_repository(a: &Workspace, b: &Workspace) -> bool {
+    if let (Some(ia), Some(ib)) = (github_repository_identity(a), github_repository_identity(b)) {
+        if ia == ib {
+            return true;
+        }
+    }
+    matches!(
+        (nonempty_repository_path(a), nonempty_repository_path(b)),
+        (Some(pa), Some(pb)) if pa == pb
+    )
 }
 
 /// Prefix each line with a right-aligned 1-based line number (`"   1 | text"`),
@@ -9726,6 +10356,34 @@ fn number_lines(content: &str) -> String {
 /// Fresh v4 uuid string for an agent-authored primitive id (TS `uuidv4()`).
 fn new_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// `file.getAttachmentInfo` result for one registry row (PROTOCOL §5.9):
+/// `{ attachmentId, fileName, mimeType?, size, uploadedAt, path, exists }`.
+/// `exists` reflects the file on disk NOW (the user may have deleted it
+/// out-of-band); resolved against the canonical workspace root, never a
+/// sandbox, with the same within-root containment guard as the copy path —
+/// a tampered `stored_path` must not probe file existence outside the store.
+async fn attachment_info_result(
+    store: &Store,
+    record: &intent_store::AttachmentRecord,
+) -> serde_json::Value {
+    let root = file_ops::resolve_root(store, &record.workspace_id, None).await;
+    let exists = !root.is_empty()
+        && file_ops::resolve_attachment_source(&root, &record.stored_path)
+            .is_ok_and(|p| p.is_file());
+    let mut result = serde_json::json!({
+        "attachmentId": record.id,
+        "fileName": record.file_name,
+        "size": record.size,
+        "uploadedAt": record.uploaded_at,
+        "path": record.stored_path,
+        "exists": exists,
+    });
+    if let Some(mime) = &record.mime_type {
+        result["mimeType"] = serde_json::json!(mime);
+    }
+    result
 }
 
 /// Whitespace-only strings collapse to `None` (TS truthy-string parity for
@@ -9849,11 +10507,28 @@ async fn append_primitive(
     block_type: &str,
     primitive_id: &str,
 ) -> Result<serde_json::Value> {
-    let mut note = fetch_note_peer(store, workspace_id, note_id).await?;
-    let new_content = primitive_ops::append_block(&note.content, primitive, block_type);
-    note.content = new_content.clone();
-    note.updated_at = now_iso();
-    store.update_note(&note).await?;
+    let note = fetch_note_peer(store, workspace_id, note_id).await?;
+    let incoming = primitive_ops::append_block(&note.content, primitive, block_type);
+    let read_rev = note.rev;
+    let author = user_version_author();
+    let MergedContentWrite {
+        note,
+        content: new_content,
+        ..
+    } = persist_merged_content(
+        store,
+        workspace_id,
+        note_id,
+        ContentWrite {
+            seed: Some(note),
+            incoming: &incoming,
+            expected_version: Some(read_rev),
+            policy: ContentWritePolicy::Surgical,
+            author: &author,
+            op: "primitive.append",
+        },
+    )
+    .await?;
     publish_event(
         bus,
         note_change_event(
@@ -10213,9 +10888,12 @@ fn note_to_workspace_task(
 /// liveness). `agentIds` lists the same agents (forward-compat TS parity).
 /// `parentAgentId` (v2.9) carries the session's delegation parent (the value
 /// surfaced as `metadata.createdByAgentId` on full agent loads), omitted for
-/// root agents. Soft-deleted sessions (`AgentStatus::Deleted`) are excluded
-/// from `count`/`agents`/`agentIds` so clients never render deleted rows
-/// (mirrors the `workspace_attention_signals` filter).
+/// root agents. `isBackground` (monorepo#3789) carries the session's persisted
+/// `is_background` flag (the value surfaced as `metadata.isBackground` on
+/// full agent loads), omitted for foreground agents. Soft-deleted sessions
+/// (`AgentStatus::Deleted`) are excluded from `count`/`agents`/`agentIds` so
+/// clients never render deleted rows (mirrors the
+/// `workspace_attention_signals` filter).
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     let live: Vec<&AgentSession> = sessions
         .iter()
@@ -10232,6 +10910,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             is_streaming: false,
             is_responding: false,
             parent_agent_id: s.parent_agent_id.clone(),
+            is_background: s.is_background,
         })
         .collect();
     let agent_ids: Vec<_> = live.iter().map(|s| s.id.clone()).collect();
@@ -10785,6 +11464,7 @@ fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
 /// `"repo"` fallback.
 pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
     let mut slug = String::new();
+    // repo-slug-fold: allow — folder-name slugifier, not repo identity
     for c in repo_name.chars().flat_map(char::to_lowercase) {
         if slug.len() >= 50 {
             break;
@@ -10814,6 +11494,28 @@ pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
 struct BackfillCandidate {
     workspace_id: WorkspaceId,
     repository_path: String,
+}
+
+#[cfg(test)]
+fn repository_backfill_probe_counts() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static COUNTS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_repository_backfill_probe(path: &Path) {
+    let mut counts = repository_backfill_probe_counts().lock().unwrap();
+    *counts.entry(path.to_path_buf()).or_default() += 1;
+}
+
+#[cfg(test)]
+fn repository_backfill_probe_count(path: &Path) -> u64 {
+    repository_backfill_probe_counts()
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or_default()
 }
 
 /// Recursively scan `dir` for git repositories (a directory that contains a
@@ -11616,7 +12318,7 @@ impl Services {
     /// `in_progress` → `[/]`, else `[ ]`. Notes whose linked lines already
     /// carry the marker are left untouched (no write, no event); each
     /// rewritten note takes a `note:updated` and — like every other surgical
-    /// content mutation — drops its cached CRDT session and schedules its
+    /// content mutation — schedules its
     /// line-attribution recompute. Every parent write is versioned against a
     /// fresh read (retried on conflict), so a concurrent status write on a
     /// sibling task or an editor save landing in the window is never reverted.
@@ -11700,19 +12402,16 @@ impl Services {
             };
             note.content = content;
             note.updated_at = now_iso();
-            match self
-                .store
-                .update_note_versioned(&note, Some(note.rev))
+            match persist_note_content(&self.store, &note, Some(note.rev), &system_version_author())
                 .await
             {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(Error::Conflict { .. }) if attempt < MAX_ATTEMPTS => continue,
                 Err(e) => {
                     tracing::warn!(note = %note.id.0, task = %task_id.0, attempt, error = %e, "materialize linked checkboxes: update failed");
                     return;
                 }
             }
-            self.invalidate_crdt_note(workspace_id, &note.id);
             self.schedule_line_attribution_recompute(workspace_id, &note.id);
             publish_event(
                 self.event_bus.as_ref(),
@@ -11759,6 +12458,44 @@ fn redirected_task_status(word: &str, current: TaskStatus) -> Option<TaskStatus>
         }
     };
     (next != current).then_some(next)
+}
+
+/// Build (without persisting) a child task note nested under `parent_id`,
+/// marked a task with `status` (and optional `peer_order` /
+/// `estimated_effort`) at `rev` 0. Shared by `createPrerequisite` (which
+/// persists it on its own) and `convertBlocks` (which commits it in the same
+/// transaction as the parent rewrite that links to it).
+fn build_child_task_note(
+    workspace_id: &WorkspaceId,
+    parent_id: &NoteId,
+    title_raw: &str,
+    content: String,
+    status: TaskStatus,
+    peer_order: Option<i64>,
+    estimated_effort: Option<String>,
+) -> Note {
+    let now = now_iso();
+    let mut task_meta = fresh_task_metadata(status, &now, peer_order);
+    task_meta.estimated_effort = estimated_effort;
+    Note {
+        id: NoteId::new(),
+        workspace_id: workspace_id.clone(),
+        title: note_ops::strip_markdown_formatting(title_raw),
+        content,
+        content_type: ContentType::Markdown,
+        tags: Vec::new(),
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: Some(parent_id.clone()),
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata {
+            task: Some(task_meta),
+        },
+        created_at: now.clone(),
+        rev: 0,
+        updated_at: now,
+    }
 }
 
 /// Build a `task:created` event with the payload
@@ -13326,7 +14063,7 @@ pub(crate) fn event_completion_report(data: &serde_json::Value) -> Option<&str> 
 /// `agent:failed` / `agent:deleted`). Returned so the seal callers share the
 /// delivery pass's probes instead of re-probing (monorepo#1281).
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 pub(crate) struct CompletionIdleClassification {
     /// Queue/busy interim (monorepo#1281/#1297): ready-to-send entries remain
     /// or a worker turn is in flight — the agent's delegating turn is not
@@ -13415,6 +14152,38 @@ pub(crate) fn is_deterministic_prompt_rejection(stop_reason: &str) -> bool {
     lower.contains("session/prompt failed")
         && lower.contains("400 bad request")
         && lower.contains("\"apistatus\":\"invalidargument\"")
+}
+
+/// Classify a terminal-failure text as a context-size rejection: the
+/// provider refused the request because the prompt (or the accumulated
+/// context) exceeded what the model accepts — the HTTP 413 shape
+/// (`HTTP error: 413 Request Entity Too Large: … "Conversation context too
+/// large for model"`). Substring-anchored like its neighbours and
+/// deliberately narrow: it requires the `413` status in an HTTP-status form
+/// (`HTTP error: 413`, `HTTP 413`, `status 413`, `"httpStatus":413`, or
+/// `413 Request Entity Too Large` / `413 Payload Too Large`) together with
+/// one of the load-bearing phrases (`request entity too large`, `too large
+/// for model`, `context too large`). A bare `413` inside a request id or
+/// other number never anchors, so a 400/500 whose payload happens to carry
+/// `413` and a size phrase does not classify — misclassifying would swap a
+/// queued payload for the marker destructively. This is a MESSAGE problem,
+/// not a session problem — it is intentionally NOT part of
+/// [`is_session_fatal_error`] and never poisons a session on its own;
+/// `publish_error_status_and_requeue` uses it to swap an oversized queued
+/// payload for a short recovery marker.
+pub(crate) fn is_context_size_error(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    let status_413 = lower.contains("http error: 413")
+        || lower.contains("http 413")
+        || lower.contains("status 413")
+        || lower.contains("status: 413")
+        || lower.contains("\"httpstatus\":413")
+        || lower.contains("413 request entity too large")
+        || lower.contains("413 payload too large");
+    status_413
+        && (lower.contains("request entity too large")
+            || lower.contains("too large for model")
+            || lower.contains("context too large"))
 }
 
 /// Classify a terminal-failure text as session-fatal on its own (independent
@@ -14043,6 +14812,17 @@ impl Services {
     /// `None`) and the note-write auto-conversion (which forwards the outer
     /// mutation's caller) attribute the resulting "Converted task blocks"
     /// version snapshot to the acting agent when applicable.
+    ///
+    /// The conversion is derived from one read of the parent and committed
+    /// in one store transaction gated on exactly that rev
+    /// ([`Store::update_note_with_version_and_children`]): the new child
+    /// task notes exist only if the parent rewrite (fence → link) lands. A
+    /// save that landed in between — including one that already converted
+    /// the same fence (`note.setContent` auto-converts) — makes the gate
+    /// miss, and the loop re-derives from the fresh content instead of
+    /// merging: a block already converted is no longer a fence, so no work
+    /// remains for it, and generated ids never pass through the three-way
+    /// merge (which would char-interleave two different ids for one block).
     async fn convert_task_blocks_op(
         &self,
         workspace_id: WorkspaceId,
@@ -14050,64 +14830,68 @@ impl Services {
         caller_agent_id: Option<&AgentId>,
     ) -> Result<TaskConvertBlocksResult> {
         let store = &self.store;
-        let mut note = fetch_note_peer(store, &workspace_id, &note_id).await?;
-        if note.content.is_empty() {
-            return Ok(TaskConvertBlocksResult {
-                ok: true,
-                converted_count: 0,
-                created_note_ids: Vec::new(),
-                created_tasks: Vec::new(),
-                warnings: Vec::new(),
-            });
-        }
-        // Mirror the TS guard: only parse when a `@@@task` fence exists.
-        let parsed = if note_ops::has_task_blocks(&note.content) {
-            note_ops::extract_task_blocks(&note.content)
-        } else {
-            note_ops::TaskBlocksResult {
-                tasks: Vec::new(),
-                content_without_blocks: note.content.clone(),
+        let author = resolve_note_version_author(store, caller_agent_id).await;
+        let mut attempt = 0;
+        let (note, parsed, mut warnings, created, block_note_ids) = loop {
+            attempt += 1;
+            let mut note = fetch_note_peer(store, &workspace_id, &note_id).await?;
+            if note.content.is_empty() {
+                return Ok(TaskConvertBlocksResult {
+                    ok: true,
+                    converted_count: 0,
+                    created_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings: Vec::new(),
+                });
             }
-        };
-        // Idempotency: map existing child note titles (normalized) → id.
-        let all = store.list_notes(&workspace_id).await?;
-        let mut existing_by_title: std::collections::HashMap<String, NoteId> = all
-            .iter()
-            .filter(|n| n.parent_id.as_ref() == Some(&note.id))
-            .map(|n| (n.title.trim().to_lowercase(), n.id.clone()))
-            .collect();
-
-        // Start from the placeholder-substituted content; each valid block
-        // is `<!-- task-block-placeholder-{i} -->` to be replaced below.
-        let mut working = parsed.content_without_blocks.clone();
-        let mut warnings: Vec<String> = Vec::new();
-        let mut created_note_ids: Vec<String> = Vec::new();
-        let mut created_tasks: Vec<CreatedTaskEntry> = Vec::new();
-        let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
-        let mut peer_order = 100i64;
-        for (i, task) in parsed.tasks.iter().enumerate() {
-            let body = if task.content.is_empty() {
-                format!("# {}\n\nCreated as a prerequisite task.", task.title)
+            // Mirror the TS guard: only parse when a `@@@task` fence exists.
+            let parsed = if note_ops::has_task_blocks(&note.content) {
+                note_ops::extract_task_blocks(&note.content)
             } else {
-                format!("# {}\n\n{}", task.title, task.content)
-            };
-            let normalized = task.title.trim().to_lowercase();
-            let task_note_id = if let Some(existing_id) = existing_by_title.get(&normalized) {
-                // Reused child: `effort=` only applies at creation — it
-                // never overwrites a possibly user-edited estimate on the
-                // existing note — so an explicit attribute is surfaced as
-                // dropped rather than silently ignored.
-                if task.effort.is_some() {
-                    warnings.push(format!(
-                        "task block {}: effort= ignored — a task note with this \
-                         title already exists and its estimate is preserved",
-                        task_block_label(task)
-                    ));
+                note_ops::TaskBlocksResult {
+                    tasks: Vec::new(),
+                    content_without_blocks: note.content.clone(),
                 }
-                existing_id.clone()
-            } else {
-                let child = self
-                    .create_child_task_note(
+            };
+            // Idempotency: map existing child note titles (normalized) → id.
+            let all = store.list_notes(&workspace_id).await?;
+            let mut existing_by_title: std::collections::HashMap<String, NoteId> = all
+                .iter()
+                .filter(|n| n.parent_id.as_ref() == Some(&note.id))
+                .map(|n| (n.title.trim().to_lowercase(), n.id.clone()))
+                .collect();
+
+            // Start from the placeholder-substituted content; each valid
+            // block is `<!-- task-block-placeholder-{i} -->` to be replaced
+            // below. New children are built here and persisted with the
+            // parent rewrite.
+            let mut working = parsed.content_without_blocks.clone();
+            let mut warnings: Vec<String> = Vec::new();
+            let mut created: Vec<(Note, CreatedTaskEntry)> = Vec::new();
+            let mut block_note_ids: Vec<NoteId> = Vec::with_capacity(parsed.tasks.len());
+            let mut peer_order = 100i64;
+            for (i, task) in parsed.tasks.iter().enumerate() {
+                let body = if task.content.is_empty() {
+                    format!("# {}\n\nCreated as a prerequisite task.", task.title)
+                } else {
+                    format!("# {}\n\n{}", task.title, task.content)
+                };
+                let normalized = task.title.trim().to_lowercase();
+                let task_note_id = if let Some(existing_id) = existing_by_title.get(&normalized) {
+                    // Reused child: `effort=` only applies at creation — it
+                    // never overwrites a possibly user-edited estimate on the
+                    // existing note — so an explicit attribute is surfaced
+                    // as dropped rather than silently ignored.
+                    if task.effort.is_some() {
+                        warnings.push(format!(
+                            "task block {}: effort= ignored — a task note with this \
+                             title already exists and its estimate is preserved",
+                            task_block_label(task)
+                        ));
+                    }
+                    existing_id.clone()
+                } else {
+                    let child = build_child_task_note(
                         &workspace_id,
                         &note.id,
                         &task.title,
@@ -14115,26 +14899,87 @@ impl Services {
                         TaskStatus::NotStarted,
                         Some(peer_order),
                         task.effort.clone(),
-                        caller_agent_id,
-                    )
-                    .await?;
-                existing_by_title.insert(normalized, child.id.clone());
-                created_note_ids.push(child.id.0.clone());
-                created_tasks.push(CreatedTaskEntry {
-                    key: task.key.clone(),
-                    title: task.title.clone(),
-                    note_id: child.id.0.clone(),
+                    );
+                    existing_by_title.insert(normalized, child.id.clone());
+                    let id = child.id.clone();
+                    created.push((
+                        child,
+                        CreatedTaskEntry {
+                            key: task.key.clone(),
+                            title: task.title.clone(),
+                            note_id: id.0.clone(),
+                        },
+                    ));
+                    id
+                };
+                let placeholder = format!("<!-- task-block-placeholder-{i} -->");
+                let linked = format!(
+                    "- [ ] [{}](intent://local/task/{})",
+                    task.title, task_note_id.0
+                );
+                working = working.replace(&placeholder, &linked);
+                block_note_ids.push(task_note_id);
+                peer_order += 100;
+            }
+
+            if working == note.content && created.is_empty() {
+                // Nothing to convert: surface header issues only.
+                for task in &parsed.tasks {
+                    for issue in &task.issues {
+                        warnings.push(format!("task block {}: {issue}", task_block_label(task)));
+                    }
+                }
+                return Ok(TaskConvertBlocksResult {
+                    ok: true,
+                    converted_count: 0,
+                    created_note_ids: Vec::new(),
+                    created_tasks: Vec::new(),
+                    warnings,
                 });
-                child.id
-            };
-            let placeholder = format!("<!-- task-block-placeholder-{i} -->");
-            let linked = format!(
-                "- [ ] [{}](intent://local/task/{})",
-                task.title, task_note_id.0
-            );
-            working = working.replace(&placeholder, &linked);
-            block_note_ids.push(task_note_id);
-            peer_order += 100;
+            }
+            // TS parity: the reference pushes a version snapshot ("Converted
+            // task blocks to linked Task Notes") as part of the conversion
+            // save, so the newest stored version matches the fence-free
+            // content that line-attribution/history consumers diff against.
+            let read_rev = note.rev;
+            let mut plan = reanchor_note_comments(store, &workspace_id, &note_id, working).await?;
+            note.content = std::mem::take(&mut plan.content);
+            note.updated_at = now_iso();
+            let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
+            match store
+                .update_note_with_version_and_children(
+                    &note,
+                    Some(read_rev),
+                    &children,
+                    &author,
+                    &note.updated_at,
+                )
+                .await
+            {
+                Ok((rev, _)) => {
+                    tracing::debug!(
+                        note = %note_id.0,
+                        op = "task.convertBlocks",
+                        attempt,
+                        read_rev,
+                        rev,
+                        created = created.len(),
+                        "task blocks converted"
+                    );
+                    plan.apply_orphaned(store, &workspace_id).await?;
+                    break (note, parsed, warnings, created, block_note_ids);
+                }
+                Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
+                Err(e) => return Err(e),
+            }
+        };
+        let mut created_note_ids: Vec<String> = Vec::with_capacity(created.len());
+        let mut created_tasks: Vec<CreatedTaskEntry> = Vec::with_capacity(created.len());
+        for (child, entry) in created {
+            self.emit_child_task_created(&child, TaskStatus::NotStarted, caller_agent_id)
+                .await;
+            created_note_ids.push(entry.note_id.clone());
+            created_tasks.push(entry);
         }
 
         // Convert-with-warnings: bad header attributes or relation references
@@ -14266,27 +15111,7 @@ impl Services {
             }
         }
 
-        let content_changed = working != note.content;
-        if !content_changed && created_note_ids.is_empty() {
-            return Ok(TaskConvertBlocksResult {
-                ok: true,
-                converted_count: 0,
-                created_note_ids: Vec::new(),
-                created_tasks: Vec::new(),
-                warnings,
-            });
-        }
-        note.content = working;
-        note.updated_at = now_iso();
-        store.update_note(&note).await?;
-        // TS parity: the reference pushes a version snapshot ("Converted
-        // task blocks to linked Task Notes") as part of the conversion
-        // save, so the newest stored version matches the fence-free
-        // content that line-attribution/history consumers diff against.
-        let author = resolve_note_version_author(store, caller_agent_id).await;
-        capture_note_version(store, &note, &author).await?;
-        self.invalidate_crdt_note(&note.workspace_id, &note.id);
-        self.schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
+        self.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
         // Emit `note:updated` for the rewritten parent so subscribers
         // refresh the fence-free content live (TS parity: the reference
         // emits `note:updated` after saving the converted note).
@@ -14316,11 +15141,12 @@ impl Services {
     }
 
     /// Create a child task note nested under `parent_id`, marking it a task with
-    /// `status` (and optional `peer_order` / `estimated_effort`). Shared by
-    /// `createPrerequisite` and `convertBlocks`. `caller_agent_id` attributes
-    /// the emitted `task:created` to the acting agent when the creation is
-    /// agent-driven.
-    #[allow(clippy::too_many_arguments)]
+    /// `status` (and optional `peer_order` / `estimated_effort`), for
+    /// `createPrerequisite`. `caller_agent_id` attributes the version snapshot
+    /// and the emitted `task:created` to the acting agent when the creation
+    /// is agent-driven. `convertBlocks` builds its children with
+    /// [`build_child_task_note`] and persists them with the parent rewrite.
+    #[expect(clippy::too_many_arguments)]
     async fn create_child_task_note(
         &self,
         workspace_id: &WorkspaceId,
@@ -14332,32 +15158,34 @@ impl Services {
         estimated_effort: Option<String>,
         caller_agent_id: Option<&AgentId>,
     ) -> Result<Note> {
-        let now = now_iso();
-        let mut task_meta = fresh_task_metadata(status, &now, peer_order);
-        task_meta.estimated_effort = estimated_effort;
-        let note = Note {
-            id: NoteId::new(),
-            workspace_id: workspace_id.clone(),
-            title: note_ops::strip_markdown_formatting(title_raw),
+        let note = build_child_task_note(
+            workspace_id,
+            parent_id,
+            title_raw,
             content,
-            content_type: ContentType::Markdown,
-            tags: Vec::new(),
-            is_pinned: false,
-            is_archived: false,
-            is_default: false,
-            parent_id: Some(parent_id.clone()),
-            visibility: NoteVisibility::Workspace,
-            metadata: NoteMetadata {
-                task: Some(task_meta),
-            },
-            created_at: now.clone(),
-            rev: 0,
-            updated_at: now,
-        };
-        self.store.insert_note(&note).await?;
-        // Emit `note:created` so task-channel subscribers (spec UI) pick up
-        // the new child task note live (TS parity: `createPrerequisiteNote`
-        // routes through `createNote`, which emits `note:created`).
+            status,
+            peer_order,
+            estimated_effort,
+        );
+        let author = resolve_note_version_author(&self.store, caller_agent_id).await;
+        persist_new_note(&self.store, &note, &author).await?;
+        self.emit_child_task_created(&note, status, caller_agent_id)
+            .await;
+        Ok(note)
+    }
+
+    /// Emit the creation events for a persisted child task note:
+    /// `note:created` so task-channel subscribers (spec UI) pick up the new
+    /// child live (TS parity: `createPrerequisiteNote` routes through
+    /// `createNote`, which emits `note:created`), then `task:created` (§6.5)
+    /// since the note is born a task — feed/task subscribers see the new task
+    /// without inferring task-ness from the `note:created` payload.
+    async fn emit_child_task_created(
+        &self,
+        note: &Note,
+        status: TaskStatus,
+        caller_agent_id: Option<&AgentId>,
+    ) {
         publish_event(
             self.event_bus.as_ref(),
             note_change_event(
@@ -14369,9 +15197,6 @@ impl Services {
             ),
         )
         .await;
-        // The note is born a task, so the creation also emits `task:created`
-        // (§6.5) — feed/task subscribers see the new task without inferring
-        // task-ness from the `note:created` payload.
         let agent = resolve_event_agent(&self.store, caller_agent_id).await;
         publish_event(
             self.event_bus.as_ref(),
@@ -14385,7 +15210,6 @@ impl Services {
             ),
         )
         .await;
-        Ok(note)
     }
 
     /// Deliver a store-adapter search result (§5.15 / §6.5). Small sets (or any
@@ -14509,7 +15333,7 @@ impl Services {
                         {
                             // Settings schema bounds the port to u16 range;
                             // the float→int cast saturates anyway.
-                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             let port = new_port as u16;
                             // Check if listener is running
                             if let Some(current_port) = control.ws_listener_port().await {
@@ -16464,7 +17288,16 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
-            file_ops::list(&root, &path)
+            // Containment checks and directory enumeration both touch the
+            // filesystem, so keep the complete synchronous operation off the
+            // async runtime. RPC dispatch tasks are detached from their client
+            // connection, so a disconnect lets this finish and the closed
+            // outbound channel discards its response. If this future is
+            // otherwise dropped, dropping the JoinHandle detaches the already
+            // running blocking task; neither case pins a runtime worker.
+            tokio::task::spawn_blocking(move || file_ops::list(&root, &path))
+                .await
+                .map_err(|e| Error::Internal(format!("file.list task failed: {e}")))?
         })
     }
 
@@ -16596,7 +17429,9 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             let root = file_ops::resolve_root(&store, &workspace_id, None).await;
-            file_ops::tree(&root, &path)
+            tokio::task::spawn_blocking(move || file_ops::tree(&root, &path))
+                .await
+                .map_err(|e| Error::Internal(format!("file.tree task failed: {e}")))?
         })
     }
 
@@ -16631,9 +17466,10 @@ impl WorkspaceApi for Services {
         data: Option<String>,
         source_path: Option<String>,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
         Box::pin(async move {
+            let idempotency_key = attachment_upload::validate_idempotency_key(idempotency_key)?;
             let decoded;
             let source = match (&data, &source_path) {
                 (Some(b64), None) => {
@@ -16665,61 +17501,42 @@ impl WorkspaceApi for Services {
                     ))
                 }
             };
-            let root = file_ops::resolve_root(&store, &workspace_id, None).await;
-            if root.is_empty() {
-                return Err(Error::Internal(
-                    "workspace has no resolved filesystem root".to_string(),
-                ));
-            }
-            // The exclusion contract (monorepo#1948) rides on the default
-            // `.intent/.gitignore` (ignore everything except config.json), so
-            // make sure the directory + gitignore exist before placing.
-            // `place_attachment` additionally drops an ignore-all `.gitignore`
-            // inside `attachments/` to cover repos with a customized
-            // `.intent/.gitignore`.
-            repo_config::ensure_intent_dir(std::path::Path::new(&root)).await?;
-            let mut result =
-                file_ops::place_attachment(&root, &file_name, &source).map_err(|e| {
-                    // Surface placement failures in the daemon log so field
-                    // reports are diagnosable without a client-side trace
-                    // (monorepo#2144).
-                    tracing::warn!(
-                        workspace = %workspace_id.as_str(),
-                        file_name = %file_name,
-                        error = %e,
-                        "file.placeAttachment failed"
-                    );
-                    e
-                })?;
-            // Attachment registry (PROTOCOL §5.9): record the placed file
-            // under a daemon-minted UUID so agents can retrieve it later via
-            // `ws.file.getAttachment`, and return the registry fields
-            // additively (presence-detected; old clients unaffected).
-            let record = intent_store::AttachmentRecord {
-                id: new_uuid(),
+            // Payload identity for the idempotency lookup: the base64 arm
+            // hashes the decoded bytes; the sourcePath arm fingerprints on
+            // `(fileName, size)` only (a possibly huge local file is not
+            // re-read for a hash; b31e decision D). An unreadable source
+            // leaves the lookup fingerprint unset and lets placement
+            // classify it. The BOUND fingerprint takes its size from the
+            // placed bytes (see `KeyedPlacement`).
+            let idempotency = idempotency_key.map(|key| match &source {
+                file_ops::AttachmentSource::Bytes(bytes) => {
+                    let sha = attachment_upload::sha256_hex(bytes);
+                    attachment_upload::KeyedPlacement {
+                        key,
+                        lookup_fingerprint: Some(attachment_upload::attachment_fingerprint(
+                            &file_name,
+                            bytes.len() as u64,
+                            Some(&sha),
+                        )),
+                        sha256: Some(sha),
+                    }
+                }
+                file_ops::AttachmentSource::CopyFrom(src) => attachment_upload::KeyedPlacement {
+                    key,
+                    lookup_fingerprint: std::fs::metadata(src).ok().map(|md| {
+                        attachment_upload::attachment_fingerprint(&file_name, md.len(), None)
+                    }),
+                    sha256: None,
+                },
+            });
+            self.place_attachment_registered(
                 workspace_id,
-                file_name: result["fileName"]
-                    .as_str()
-                    .unwrap_or(&file_name)
-                    .to_string(),
-                mime_type: mime_type.filter(|m| !m.trim().is_empty()),
-                size: result["size"].as_i64().unwrap_or_default(),
-                uploaded_at: now_iso(),
-                stored_path: result["path"].as_str().unwrap_or_default().to_string(),
-            };
-            if let Err(e) = store.insert_attachment(&record).await {
-                // Don't leave a durable-but-unregistered file behind: a
-                // retry would place a collision-suffixed second copy that
-                // no attachmentId can ever retrieve.
-                let _ = std::fs::remove_file(std::path::Path::new(&root).join(&record.stored_path));
-                return Err(e);
-            }
-            result["attachmentId"] = serde_json::json!(record.id);
-            result["uploadedAt"] = serde_json::json!(record.uploaded_at);
-            if let Some(mime) = &record.mime_type {
-                result["mimeType"] = serde_json::json!(mime);
-            }
-            Ok(result)
+                &file_name,
+                &source,
+                mime_type,
+                idempotency,
+            )
+            .await
         })
     }
 
@@ -16730,6 +17547,7 @@ impl WorkspaceApi for Services {
         size_bytes: u64,
         sha256: String,
         mime_type: Option<String>,
+        idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.file_attachment_upload_begin_op(
@@ -16738,6 +17556,7 @@ impl WorkspaceApi for Services {
                 size_bytes,
                 sha256,
                 mime_type,
+                idempotency_key,
             )
             .await
         })
@@ -16784,27 +17603,34 @@ impl WorkspaceApi for Services {
                     }
                     other => other,
                 })?;
-            // `exists` reflects the file on disk NOW (the user may have
-            // deleted it out-of-band); resolved against the canonical
-            // workspace root, never a sandbox, with the same within-root
-            // containment guard as the copy path — a tampered stored_path
-            // must not probe file existence outside the store.
-            let root = file_ops::resolve_root(&store, &record.workspace_id, None).await;
-            let exists = !root.is_empty()
-                && file_ops::resolve_attachment_source(&root, &record.stored_path)
-                    .is_ok_and(|p| p.is_file());
-            let mut result = serde_json::json!({
-                "attachmentId": record.id,
-                "fileName": record.file_name,
-                "size": record.size,
-                "uploadedAt": record.uploaded_at,
-                "path": record.stored_path,
-                "exists": exists,
-            });
-            if let Some(mime) = &record.mime_type {
-                result["mimeType"] = serde_json::json!(mime);
-            }
-            Ok(result)
+            Ok(attachment_info_result(&store, &record).await)
+        })
+    }
+
+    fn file_get_attachment_info_by_key(
+        &self,
+        workspace_id: WorkspaceId,
+        idempotency_key: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            let key = attachment_upload::validate_idempotency_key(Some(idempotency_key))?
+                .unwrap_or_default();
+            let bound = store
+                .get_attachment_by_idempotency_key(
+                    &workspace_id,
+                    &key,
+                    &attachment_upload::idempotency_retention_cutoff(),
+                )
+                .await?;
+            let Some((_, record)) = bound else {
+                // Never committed, another workspace's key, or past
+                // retention — all read as unknown (fail closed).
+                return Err(Error::InvalidParams(format!(
+                    "unknown idempotency key: {key}"
+                )));
+            };
+            Ok(attachment_info_result(&store, &record).await)
         })
     }
 
@@ -16986,20 +17812,15 @@ impl WorkspaceApi for Services {
                 }
                 Err(e) => return Err(e),
             };
-            let repo_path = match current.repository_path.as_deref() {
-                Some(p) if !p.is_empty() => p.to_string(),
-                _ => {
-                    return Err(Error::Internal(
-                        "Current workspace is not associated with a repository".to_string(),
-                    ));
-                }
-            };
+            if !has_repository_identity(&current) {
+                return Err(Error::Internal(
+                    "Current workspace is not associated with a repository".to_string(),
+                ));
+            }
             let all = store.list_workspaces(true).await?;
             let siblings: Vec<serde_json::Value> = all
                 .into_iter()
-                .filter(|w| {
-                    w.id != workspace_id && w.repository_path.as_deref() == Some(repo_path.as_str())
-                })
+                .filter(|w| w.id != workspace_id && workspaces_share_repository(&current, w))
                 .map(|w| {
                     serde_json::json!({
                         "id": w.id,
@@ -17102,7 +17923,7 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
-        Box::pin(async move { mgr.start(&workspace_id, &script_id).await })
+        Box::pin(async move { mgr.start(&workspace_id, &script_id) })
     }
 
     fn script_stop(
@@ -17173,63 +17994,15 @@ impl WorkspaceApi for Services {
             let mut list = store.list_workspaces(include_archived).await?;
             // `activity` is derived from live agent state, never persisted (§9.9);
             // the card aggregates are computed fresh on the emit path (§9.1).
-            // Enrichment fans out per workspace (bounded by a semaphore so a
-            // large workspace count doesn't burst-issue unbounded store reads):
-            // store reads stay on the async pool while the git/FS rollups are
-            // offloaded, bounded, and cached inside `enrich_workspace_aggregates`,
-            // so list latency is bounded by the per-aggregate budget instead of
-            // O(workspaces × workdir diff).
+            // Every store-backed aggregate is fetched once for the requested ids
+            // and joined below in store order; no per-workspace store futures.
             let started = std::time::Instant::now();
             let count = list.len();
-            // Batch unread derivation (§5.1): ONE indexed statement for the
-            // whole list instead of a per-row EXISTS probe, so the hot RPC's
-            // statement count stays independent of the workspace count
-            // (AGENTS.md RPC cost contract). A batch failure degrades to
-            // `None` per row — enrichment falls back to its bounded
-            // per-workspace probe rather than serving the stale stored flag.
-            let unread_set = store
-                .workspaces_with_unread_top_level_sessions()
-                .await
-                .ok()
-                .map(Arc::new);
-            let enrich_gate = Arc::new(tokio::sync::Semaphore::new(
-                workspace_aggregates::MAX_CONCURRENT_ENRICHMENTS,
-            ));
-            let mut join = tokio::task::JoinSet::new();
-            for (idx, ws) in list.iter().enumerate() {
-                let mut ws = ws.clone();
-                let this = this.clone();
-                let enrich_gate = Arc::clone(&enrich_gate);
-                let unread_set = unread_set.clone();
-                join.spawn(async move {
-                    // The semaphore is never closed, so acquisition can only
-                    // fail on a bug; fail loudly rather than dropping the bound.
-                    let _permit = enrich_gate
-                        .acquire_owned()
-                        .await
-                        .expect("enrichment semaphore closed");
-                    ws.activity = this.workspace_activity(&ws.id);
-                    // Delete grace window (§5.1): surface the in-memory
-                    // pending-deletion deadline; O(1) map read, never persisted.
-                    ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
-                    let unread = unread_set.as_ref().map(|set| set.contains(ws.id.as_str()));
-                    this.enrich_workspace_aggregates_with_unread(&mut ws, unread)
-                        .await;
-                    (idx, ws)
-                });
-            }
-            // Merge back into store order (ORDER BY created_at) by index. If an
-            // enrichment task panics, degrade to the un-enriched base row —
-            // aggregates are advisory and optional on the wire, so one bad
-            // worktree must not fail the whole list call.
-            while let Some(res) = join.join_next().await {
-                match res {
-                    Ok((idx, ws)) => list[idx] = ws,
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "workspace.list: enrichment task failed; serving base row"
-                    ),
-                }
+            let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
+            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
+            for ws in &mut list {
+                this.enrich_workspace_from_snapshot(ws, &snapshot, true)
+                    .await;
             }
             // List-frame slimming (monorepo#3041), following the v4.2
             // `diskUsage` precedent — optional fields simply never present on
@@ -17262,10 +18035,6 @@ impl WorkspaceApi for Services {
             // derivation still sees only the persisted workspace PRs).
             this.merge_external_pull_requests(&mut list, include_archived)
                 .await;
-            // Background backfill: active workspaces with repository_path but missing
-            // repository_owner/repository_name get derived from origin remote (STAB-64
-            // backfill). Spawned non-blocking so list latency stays green.
-            this.spawn_repository_owner_backfill(&list);
             Ok(list)
         })
     }
@@ -17287,32 +18056,14 @@ impl WorkspaceApi for Services {
             // `displayStatus` (same derivation as the enriched path), and
             // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(include_archived).await?;
-            let cow_supported = this.compute_cow_supported().await;
-            // Batch unread derivation, same as the full list path: ONE
-            // statement for the whole snapshot; a batch failure degrades to
-            // the per-workspace probe inside `enrich_display_status`.
-            let unread_set = store.workspaces_with_unread_top_level_sessions().await.ok();
+            let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
+            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
             for ws in &mut list {
-                ws.activity = this.workspace_activity(&ws.id);
-                // Delete grace window (§5.1): surface the in-memory
-                // pending-deletion deadline; O(1) map read, never persisted.
-                ws.pending_delete_at = this.pending_workspace_deletes.deadline(ws.id.as_str());
-                ws.agent_summary = None;
-                ws.diff_summary = None;
+                this.enrich_workspace_from_snapshot(ws, &snapshot, false)
+                    .await;
                 // Detail-only on the wire (monorepo#3041): list rows never
                 // carry `tokenUsage` — same rationale as the full list path.
                 ws.token_usage = None;
-                ws.cow_supported = cow_supported;
-                // Keep PR fields if already on the row (cheap, already stored);
-                // do not fetch/refresh them here.
-                // A stats-read failure degrades to absent taskStats +
-                // displayStatus (clients fall back to local derivation on a
-                // missing field), mirroring `enrich_workspace_aggregates`.
-                // Same derivation + baseline seeding as the enriched path
-                // (see [`Services::enrich_display_status`]).
-                ws.task_stats = this.cheap_task_stats(&ws.id).await.ok();
-                let unread = unread_set.as_ref().map(|set| set.contains(ws.id.as_str()));
-                this.enrich_display_status(ws, None, unread).await;
             }
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
@@ -17791,9 +18542,9 @@ impl WorkspaceApi for Services {
                             {
                                 None
                             } else {
-                                clone_ops::parse_owner_repo(url)
+                                GitRemoteUrl::parse(url).and_then(|u| u.repo_slug())
                             };
-                            if let Some((owner, name)) = cache_owner_repo {
+                            if let Some(RepoRef { owner, name }) = cache_owner_repo {
                                 let request_id = uuid::Uuid::new_v4().to_string();
                                 // Stream the same `git:clone:*` frames as a
                                 // network clone so the FE initializer shows
@@ -17838,7 +18589,8 @@ impl WorkspaceApi for Services {
                                     url,
                                 )
                                 .await;
-                                let cache_root = workspaces_root.join(".repo-cache");
+                                let cache_root =
+                                    intent_git::repo_cache::cache_root_for(&workspaces_root);
                                 // Real streaming progress for the ensure: the
                                 // callback forwards raw git output to a pump
                                 // task that parses it (submodule-aware) and
@@ -17955,11 +18707,22 @@ impl WorkspaceApi for Services {
                                     )
                                     .await;
                                 }
-                                if input.repository_owner.is_none() {
-                                    input.repository_owner = Some(owner);
-                                }
-                                if input.repository_name.is_none() {
-                                    input.repository_name = Some(name.clone());
+                                // Persisted owner/name carry GitHub identity
+                                // (the `crossWorkspace.*` sibling predicate
+                                // trusts them), so only a strict `github.com`
+                                // URL seeds them; the host-agnostic pair above
+                                // keys the cache slot only.
+                                if let Some(RepoRef {
+                                    owner: gh_owner,
+                                    name: gh_name,
+                                }) = GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
+                                {
+                                    if input.repository_owner.is_none() {
+                                        input.repository_owner = Some(gh_owner);
+                                    }
+                                    if input.repository_name.is_none() {
+                                        input.repository_name = Some(gh_name);
+                                    }
                                 }
                                 // The workspace checkout IS the repository
                                 // (self-contained; the cache can be deleted
@@ -18045,7 +18808,12 @@ impl WorkspaceApi for Services {
                             })?;
                             input.repository_path =
                                 Some(target.to_string_lossy().to_string());
-                            if let Some((owner, name)) = clone_ops::parse_owner_repo(url) {
+                            // Strict `github.com` host only: persisted owner/name
+                            // are trusted as GitHub identity by the
+                            // `crossWorkspace.*` sibling predicate.
+                            if let Some(RepoRef { owner, name }) =
+                                GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
+                            {
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
                                 }
@@ -18121,7 +18889,7 @@ impl WorkspaceApi for Services {
                         intent_git::remote::origin_url(&repo_path)
                             .ok()
                             .flatten()
-                            .and_then(|url| Self::parse_github_owner_repo(&url))
+                            .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
                     } else {
                         None
                     };
@@ -18130,8 +18898,8 @@ impl WorkspaceApi for Services {
                         .repository_owner
                         .as_deref().is_none_or(str::is_empty)
                     {
-                        if let Some((owner, _)) = origin_derived.as_ref() {
-                            input.repository_owner = Some(owner.clone());
+                        if let Some(derived) = origin_derived.as_ref() {
+                            input.repository_owner = Some(derived.owner.clone());
                         }
                     }
                     // Apply derived name when caller left it blank; fall back to
@@ -18140,8 +18908,8 @@ impl WorkspaceApi for Services {
                         .repository_name
                         .as_deref().is_none_or(str::is_empty)
                     {
-                        if let Some((_, name)) = origin_derived {
-                            input.repository_name = Some(name);
+                        if let Some(derived) = origin_derived {
+                            input.repository_name = Some(derived.name);
                         } else if let Some(name) = input
                             .repository_path
                             .as_deref()
@@ -18177,13 +18945,17 @@ impl WorkspaceApi for Services {
                     // or STAB-64-derived above) is ignored with a warn —
                     // deriving another repository's branch names onto this
                     // checkout would silently check out unrelated content or
-                    // fail the create on an unresolvable `baseRef`.
+                    // fail the create on an unresolvable `baseRef`. Each
+                    // known part is compared under `RepoRef` identity (the
+                    // other part held to the link's own) so a missing part
+                    // never counts as a mismatch.
                     let pr_link = pr_link.filter(|link| {
+                        let link_ref = intent_sourcecontrol::RepoRef::new(&link.owner, &link.repo);
                         let owner_mismatch = input.repository_owner.as_deref().is_some_and(|o| {
-                            !o.is_empty() && !o.eq_ignore_ascii_case(&link.owner)
+                            !o.is_empty() && intent_sourcecontrol::RepoRef::new(o, &link.repo) != link_ref
                         });
                         let name_mismatch = input.repository_name.as_deref().is_some_and(|n| {
-                            !n.is_empty() && !n.eq_ignore_ascii_case(&link.repo)
+                            !n.is_empty() && intent_sourcecontrol::RepoRef::new(&link.owner, n) != link_ref
                         });
                         if owner_mismatch || name_mismatch {
                             tracing::warn!(
@@ -18422,6 +19194,7 @@ impl WorkspaceApi for Services {
                         diff_summary: None,
                         token_usage: None,
                         cow_supported: None,
+                        browser_client_id: None,
                         display_status: None,
                         waiting: false,
                         checkout_mode: None,
@@ -19826,6 +20599,7 @@ impl WorkspaceApi for Services {
                 || update.active_pull_request.is_some()
                 || update.pull_requests.is_some();
             let attention_changed = update.attention.is_some();
+            let repository_path_changed = update.repository_path.is_some();
             let mut ws = if id.is_chief() {
                 chief_workspace()
             } else {
@@ -19955,6 +20729,9 @@ impl WorkspaceApi for Services {
                 // response carries `agent_running` when agents are in-flight,
                 // not the stale default `idle` from the persisted row.
                 ws.activity = this.workspace_activity(&ws.id);
+                if repository_path_changed {
+                    this.spawn_repository_owner_backfill(std::slice::from_ref(&ws));
+                }
             }
             // Self-sufficient `workspace:updated` payload (§6.5) so every
             // client mirrors the delta without a follow-up read.
@@ -20904,6 +21681,7 @@ impl WorkspaceApi for Services {
                 diff_summary: None,
                 token_usage: None,
                 cow_supported: None,
+                browser_client_id: None,
                 display_status: None,
                 waiting: false,
                 checkout_mode: None,
@@ -21373,7 +22151,9 @@ impl WorkspaceApi for Services {
                             rev: 0,
                             updated_at: now.clone(),
                         };
-                        if let Err(e) = store.insert_note(&clone).await {
+                        if let Err(e) =
+                            persist_new_note(&store, &clone, &system_version_author()).await
+                        {
                             tracing::warn!(
                                 workspace = %ws.id.as_str(),
                                 error = %e,
@@ -21742,6 +22522,85 @@ impl WorkspaceApi for Services {
             )
             .await;
             Ok(serde_json::json!({ "enabled": enabled, "source": "workspace" }))
+        })
+    }
+
+    fn client_list(&self) -> BoxFuture<'_, Result<Vec<ReverseLiveClient>>> {
+        let clients = self
+            .reverse_dispatch
+            .as_ref()
+            .map(|d| d.live_clients())
+            .unwrap_or_default();
+        Box::pin(async move { Ok(clients) })
+    }
+
+    fn get_workspace_browser_client(
+        &self,
+        id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.browser_client_state(&id).await })
+    }
+
+    fn set_workspace_browser_client(
+        &self,
+        id: WorkspaceId,
+        client_id: Option<ClientId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let store = self.store.clone();
+        let bus = self.event_bus.clone();
+        Box::pin(async move {
+            // Chief is virtual: no row to pin and no agent browser work runs
+            // there.
+            if id.is_chief() {
+                return Err(Error::InvalidParams(
+                    "cannot set browserClient on chief workspace".to_string(),
+                ));
+            }
+            if let Some(client_id) = &client_id {
+                // Only a client that has completed `client.hello` at least
+                // once can be pinned — an offline-but-known client is fine
+                // (it surfaces as "pinned but not connected"), but a row
+                // minted only to key an anonymous connection's drafts is
+                // not: it can never resolve to a reverse connection.
+                let hello_seen = store
+                    .get_client(client_id)
+                    .await?
+                    .is_some_and(|c| c.last_hello_at.is_some());
+                if !hello_seen {
+                    return Err(Error::InvalidParams(format!(
+                        "unknown clientId {}: the client has never connected",
+                        client_id.as_str()
+                    )));
+                }
+            }
+            // Write, announce and read back under one gate: two racing
+            // setters would otherwise publish deltas in the opposite order of
+            // their commits, or echo the other's pin in their own reply. The
+            // delta carries the read-back committed value, not the requested
+            // one, and the reply is built from the same committed state.
+            let _gate = self.browser_client_pin_gate.lock().await;
+            store
+                .set_workspace_browser_client(&id, client_id.as_ref())
+                .await?;
+            let committed = store.workspace_browser_client(&id).await?;
+            // Self-sufficient `workspace:updated` delta (§6.5); `null`
+            // spells a cleared pin so clients can drop their copy.
+            let change = committed
+                .as_ref()
+                .map_or(serde_json::Value::Null, |c| c.as_str().into());
+            publish_event(
+                bus.as_ref(),
+                workspace_updated_event(&id, &serde_json::json!({ "browserClientId": change })),
+            )
+            .await;
+            // Driving-client switch (REV-2 Model 10): every claimed tab of the
+            // workspace follows the new pin; one `browser:tab-updated` per
+            // moved tab. Clearing the pin moves nothing — the driving client
+            // then falls back to the host of those same claimed tabs.
+            if let Some(new_host) = &committed {
+                self.browser_tabs_migrate_claimed(&id, new_host).await?;
+            }
+            self.browser_client_state(&id).await
         })
     }
 
@@ -22128,10 +22987,9 @@ impl WorkspaceApi for Services {
                         rev: 0,
                         updated_at: now,
                     };
-                    store.insert_note(&note).await?;
                     let author =
                         resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-                    capture_note_version(&store, &note, &author).await?;
+                    persist_new_note(&store, &note, &author).await?;
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
                         &note.id.clone(),
@@ -22191,22 +23049,15 @@ impl WorkspaceApi for Services {
             let content_changed = input.content.is_some();
             let mut reanchor_plan: Option<ReanchorPlan> = None;
             if let Some(content) = input.content {
-                // Route the full-content write through the CRDT merge engine
-                // so concurrent writers converge (§5.2 / A5 parity with
-                // `CRDTNotesService.applyContentUpdate`).
-                let old_content = note.content.clone();
-                let merged = services.crdt_notes.apply_full_content(
-                    &workspace_id,
-                    &note_id,
-                    &old_content,
-                    &content,
-                );
+                // Plain versioned write: a stale `expectedVersion` surfaces
+                // `-32005` from `update_note_versioned` below; only
+                // `note.setContent` merges.
                 // Comment anchor recovery mirrors reference `updateNote`: run
-                // the merged markdown through `recoverAllPartialAnchors` before
+                // the new markdown through `recoverAllPartialAnchors` before
                 // persisting so surviving-partial anchors are repaired and
                 // unrecoverable ones are stripped + flipped to orphaned.
                 let mut plan =
-                    reanchor_note_comments(&store, &workspace_id, &note_id, merged).await?;
+                    reanchor_note_comments(&store, &workspace_id, &note_id, content).await?;
                 note.content = std::mem::take(&mut plan.content);
                 reanchor_plan = Some(plan);
             } else {
@@ -22218,14 +23069,22 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now_iso();
-            store.update_note_versioned(&note, expected_version).await?;
+            if content_changed {
+                // FE-only `note.update`: no caller-agent context on this arm
+                // (transport router path), so the version author is the user.
+                persist_note_content(&store, &note, expected_version, &user_version_author())
+                    .await?;
+            } else {
+                // Metadata-scoped: leaves the stored content untouched even
+                // when a content write committed after the fetch above.
+                store
+                    .update_note_metadata_versioned(&note, expected_version)
+                    .await?;
+            }
             if let Some(plan) = reanchor_plan {
                 plan.apply_orphaned(&store, &workspace_id).await?;
             }
             if content_changed {
-                // FE-only `note.update`: no caller-agent context on this arm
-                // (transport router path), so the version author is the user.
-                capture_note_version(&store, &note, &user_version_author()).await?;
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
                     &note.id.clone(),
@@ -22276,26 +23135,36 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             note_ops::reject_numbered_read_presentation(&input.content)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let (new_content, position) = note_ops::apply_add(
-                &old_content,
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let (incoming, position) = note_ops::apply_add(
+                &note.content,
                 &input.content,
                 input.heading.as_deref(),
                 input.position.as_deref(),
             )?;
-            let mut plan =
-                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = std::mem::take(&mut plan.content);
-            note.content = new_content.clone();
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+            let read_rev = note.rev;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: new_content,
+                ..
+            } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &incoming,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "note.add",
+                },
+            )
+            .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
                     &note.workspace_id,
@@ -22358,22 +23227,32 @@ impl WorkspaceApi for Services {
                 ));
             }
             note_ops::reject_numbered_read_presentation(&input.new)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let (new_content, match_position, was_empty) =
-                note_ops::apply_edit(&old_content, &input.old, &input.new)?;
-            let mut plan =
-                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = std::mem::take(&mut plan.content);
-            note.content = new_content.clone();
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let (incoming, match_position, was_empty) =
+                note_ops::apply_edit(&note.content, &input.old, &input.new)?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+            let read_rev = note.rev;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: new_content,
+                ..
+            } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &incoming,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "note.edit",
+                },
+            )
+            .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
                     &note.workspace_id,
@@ -22434,23 +23313,33 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             note_ops::reject_numbered_read_presentation(&input.content)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let new_content =
-                note_ops::apply_edit_lines(&old_content, input.start, input.end, &input.content)?;
-            let total_lines_before = old_content.split('\n').count();
-            let mut plan =
-                reanchor_note_comments(&store, &workspace_id, &note_id, new_content).await?;
-            let new_content = std::mem::take(&mut plan.content);
-            note.content = new_content.clone();
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let incoming =
+                note_ops::apply_edit_lines(&note.content, input.start, input.end, &input.content)?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+            let read_rev = note.rev;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: new_content,
+                ..
+            } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &incoming,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "note.editLines",
+                },
+            )
+            .await?;
+            let total_lines_before = old_content.split('\n').count();
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             let outcome = services
                 .auto_convert_task_blocks_after_write(
                     &note.workspace_id,
@@ -22510,55 +23399,33 @@ impl WorkspaceApi for Services {
         let bus = self.event_bus.clone();
         let services = self.clone();
         Box::pin(async move {
-            // Guard before the CRDT merge so a rejected write never seeds the
-            // yrs doc with content that is not persisted.
+            // Guard before the merge so a rejected write touches neither the
+            // store nor the merge state.
             note_ops::reject_numbered_read_presentation(&content)?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            let old_content = note.content.clone();
-            let previous_title = note.title.clone();
-            if !old_content.is_empty() {
-                // Note sizes are far below 2^53 (loss-free in f64); the rounded
-                // percentage is in [0, 100] so the float→int cast is exact.
-                #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-                let old_len = old_content.chars().count() as f64;
-                #[allow(clippy::cast_precision_loss)]
-                let new_len = content.chars().count() as f64;
-                let reduction = (old_len - new_len) / old_len * 100.0;
-                if reduction > 50.0 && !confirm_replacement {
-                    // The rounded percentage is in (50, 100]: exact in i64.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let reduction_pct = reduction.round() as i64;
-                    return Err(Error::Internal(format!(
-                        "⚠️ CONTENT REDUCTION DETECTED: Your new content ({} chars) is {}% shorter than the existing content ({} chars).\n\nThis will REPLACE the entire note. If you intended to:\n- ADD content: Use note.add instead\n- EDIT a section: Use note.edit instead\n- PROCEED with replacement: Call note.setContent again with confirmReplacement=true",
-                        content.chars().count(),
-                        reduction_pct,
-                        old_content.chars().count()
-                    )));
-                }
-            }
-            // Route the full-content write through the CRDT merge engine
-            // (`CRDTNotesService.applyContentUpdate`): the yrs `Doc` is seeded
-            // from `old_content` on first touch and subsequent writes diff
-            // against the doc's current text, so concurrent full-content
-            // writes converge instead of last-write-wins. The merged text is
-            // what we then clean + persist through the normal mutation flow,
-            // so the line-attribution recompute still fires downstream.
-            let merged = services.crdt_notes.apply_full_content(
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let MergedContentWrite {
+                note,
+                old_content,
+                content: clean,
+                now,
+                rev,
+            } = persist_merged_content(
+                &store,
                 &workspace_id,
                 &note_id,
-                &old_content,
-                &content,
-            );
-            let clean = note_ops::clean_set_content(&merged)?;
-            let mut plan = reanchor_note_comments(&store, &workspace_id, &note_id, clean).await?;
-            let clean = std::mem::take(&mut plan.content);
-            note.content = clean.clone();
-            let now = now_iso();
-            note.updated_at = now.clone();
-            store.update_note_versioned(&note, expected_version).await?;
-            plan.apply_orphaned(&store, &workspace_id).await?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            capture_note_version(&store, &note, &author).await?;
+                ContentWrite {
+                    seed: None,
+                    incoming: &content,
+                    expected_version,
+                    policy: ContentWritePolicy::SetContent {
+                        confirm_replacement,
+                    },
+                    author: &author,
+                    op: "note.setContent",
+                },
+            )
+            .await?;
+            let previous_title = note.title.clone();
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -22569,9 +23436,9 @@ impl WorkspaceApi for Services {
                     caller_agent_id.as_ref(),
                 )
                 .await;
-            let (final_content, final_updated_at) = match outcome.refetched_note {
-                Some(n) => (n.content, n.updated_at),
-                None => (clean, now),
+            let (final_content, final_updated_at, final_rev) = match outcome.refetched_note {
+                Some(n) => (n.content, n.updated_at, n.rev),
+                None => (clean, now, rev),
             };
             publish_event(
                 bus.as_ref(),
@@ -22601,6 +23468,7 @@ impl WorkspaceApi for Services {
                 created_task_note_ids: outcome.created_note_ids,
                 created_tasks: outcome.created_tasks,
                 warnings: outcome.warnings,
+                rev: final_rev,
             })
         })
     }
@@ -22652,7 +23520,9 @@ impl WorkspaceApi for Services {
             }
             let now = now_iso();
             note.updated_at = now.clone();
-            store.update_note_versioned(&note, expected_version).await?;
+            store
+                .update_note_metadata_versioned(&note, expected_version)
+                .await?;
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -22700,7 +23570,6 @@ impl WorkspaceApi for Services {
             store
                 .delete_note_versioned(&workspace_id, &note_id, expected_version)
                 .await?;
-            services.crdt_notes.remove(&workspace_id, &note_id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(&workspace_id, &note_id, &note.title, NOTE_DELETED, "delete"),
@@ -22827,7 +23696,7 @@ impl WorkspaceApi for Services {
             let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             // Asset sizes are far below 2^53 (loss-free in f64); the rounded
             // KiB count fits i64, and the float→int cast saturates anyway.
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             let size_kb = ((data.len() as f64) / 1024.0).round() as i64;
             let mime_type = note_ops::mime_from_extension(&asset_id);
             Ok(ReadAssetResult {
@@ -22933,12 +23802,12 @@ impl WorkspaceApi for Services {
             note.title = version.title;
             note.content = version.content;
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            let new_v = capture_note_version(&store, &note, &author).await?;
+            let (_, new_v) = store
+                .update_note_with_version(&note, None, &author, &note.updated_at)
+                .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -23017,7 +23886,7 @@ impl WorkspaceApi for Services {
             let checkbox = note_ops::checkbox_for(&status).ok_or_else(|| {
                 Error::Internal("Status must be 'done', 'todo', or 'in-progress'".to_string())
             })?;
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let normalized = task_text.trim().to_string();
             let linked = match note_ops::linked_task_for_text(&note.content, &normalized) {
                 Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
@@ -23029,8 +23898,8 @@ impl WorkspaceApi for Services {
                 // write goes to the task (events, ready-task recompute) and
                 // the char follows via materialization — which also heals a
                 // line that had drifted from the task's status.
-                // Materialization invalidates the CRDT session and schedules
-                // the attribution recompute of every parent it rewrites.
+                // Materialization schedules the attribution recompute of
+                // every parent it rewrites.
                 match redirected_task_status(&status, current) {
                     Some(next) => {
                         services
@@ -23057,10 +23926,22 @@ impl WorkspaceApi for Services {
                 });
             }
             let updated = note_ops::apply_task_status(&note.content, &normalized, checkbox)?;
-            note.content = updated;
-            note.updated_at = now_iso();
-            store.update_note(&note).await?;
-            services.invalidate_crdt_note(&note.workspace_id, &note.id);
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let read_rev = note.rev;
+            let MergedContentWrite { note, .. } = persist_merged_content(
+                &store,
+                &workspace_id,
+                &note_id,
+                ContentWrite {
+                    seed: Some(note),
+                    incoming: &updated,
+                    expected_version: Some(read_rev),
+                    policy: ContentWritePolicy::Surgical,
+                    author: &author,
+                    op: "task.updateStatus",
+                },
+            )
+            .await?;
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
@@ -23104,7 +23985,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn task_update(
         &self,
         workspace_id: WorkspaceId,
@@ -23186,9 +24066,23 @@ impl WorkspaceApi for Services {
                 }
             };
             if write_parent {
-                note.content = update.content;
-                note.updated_at = now_iso();
-                store.update_note(&note).await?;
+                let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+                let read_rev = note.rev;
+                let merged = persist_merged_content(
+                    &store,
+                    &workspace_id,
+                    &note_id,
+                    ContentWrite {
+                        seed: Some(note),
+                        incoming: &update.content,
+                        expected_version: Some(read_rev),
+                        policy: ContentWritePolicy::Surgical,
+                        author: &author,
+                        op: "task.update",
+                    },
+                )
+                .await?;
+                note = merged.note;
                 publish_event(
                     bus.as_ref(),
                     note_change_event(
@@ -23211,10 +24105,9 @@ impl WorkspaceApi for Services {
                     .set_task_note_status(&note.workspace_id, &task_id, next, None, caller_agent_id)
                     .await?;
             }
-            // A parent materialization rewrites already invalidates and
-            // schedules; only the direct write here needs it.
+            // A parent materialization rewrite already schedules; only the
+            // direct write here needs it.
             if write_parent {
-                services.invalidate_crdt_note(&note.workspace_id, &note.id);
                 services.schedule_line_attribution_recompute(&note.workspace_id, &note.id);
             }
             Ok(TaskUpdateResult {
@@ -23228,7 +24121,7 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::similar_names)] // stats/status are both the natural domain names
+    #[expect(clippy::similar_names)] // stats/status are both the natural domain names
     fn task_list(
         &self,
         workspace_id: WorkspaceId,
@@ -23434,7 +24327,7 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now.clone();
-            store.update_note(&note).await?;
+            store.update_note_metadata(&note).await?;
             // A markAsTask that crosses the complete boundary records/removes
             // the caller's flipped-completion pair, exactly like
             // `task.updateNoteStatus` (a same-status re-mark is a no-op here).
@@ -23623,7 +24516,7 @@ impl WorkspaceApi for Services {
             }
             note.metadata.task = Some(task);
             note.updated_at = now_iso();
-            store.update_note(&note).await?;
+            store.update_note_metadata(&note).await?;
             // Metadata changed → subscribers refetch the note (§6.5), same as
             // every other task-metadata write.
             publish_event(
@@ -23814,7 +24707,7 @@ impl WorkspaceApi for Services {
             }
             note.metadata.task = Some(task);
             note.updated_at = now.clone();
-            store.update_note(&note).await?;
+            store.update_note_metadata(&note).await?;
             // TS parity (`assignAgentToTask`): the assignment write routes
             // through `updateNote` (→ `note:updated`) and the not_started →
             // in_progress transition through `updateTaskStatus`
@@ -23899,7 +24792,7 @@ impl WorkspaceApi for Services {
                 task.assigned_agent_ids.retain(|id| id != &agent_id);
                 note.metadata.task = Some(task);
                 note.updated_at = now.clone();
-                store.update_note(&note).await?;
+                store.update_note_metadata(&note).await?;
                 updated_count += 1;
             }
             Ok(TaskRemoveAgentFromAllTasksResult {
@@ -23909,7 +24802,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_add(
         &self,
         workspace_id: WorkspaceId,
@@ -23996,7 +24888,33 @@ impl WorkspaceApi for Services {
                         }
                         None => uuid::Uuid::new_v4().to_string(),
                     };
+                    // The comment's author/type is the only provenance the
+                    // add carries: it stamps the anchor rewrite's snapshot.
+                    let comment_author = author.unwrap_or_else(|| {
+                        match author_type {
+                            AuthorType::User => "User",
+                            AuthorType::Agent => "Agent",
+                        }
+                        .to_string()
+                    });
+                    let version_author = match author_type {
+                        AuthorType::User => user_version_author(),
+                        AuthorType::Agent => NoteVersionAuthor {
+                            id: comment_author.clone(),
+                            name: comment_author.clone(),
+                            author_type: "agent".to_string(),
+                        },
+                    };
+                    // Read-anchor-persist loop: the anchor rewrite is gated
+                    // on the rev it read, so a save that lands in between
+                    // (`Conflict`) is re-read and re-anchored on the next
+                    // attempt instead of overwritten; the last attempt's
+                    // `Conflict` propagates unchanged, like `note.setContent`.
+                    let mut attempt = 0;
+                    let (note, line, anchored_text, note_rev) = loop {
+                    attempt += 1;
                     let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+                    let read_rev = note.rev;
                     // Self-heal phantom debris (Round 15): scrub UUID-format
                     // markers whose id has no live comment row before
                     // matching. The cleaned content persists only as part of
@@ -24049,14 +24967,8 @@ impl WorkspaceApi for Services {
                         thread_id: comment_id.clone(),
                         note_id: Some(note_id.clone()),
                         kind: parse_comment_type(kind.as_deref()),
-                        content: comment,
-                        author: author.unwrap_or_else(|| {
-                            match author_type {
-                                AuthorType::User => "User",
-                                AuthorType::Agent => "Agent",
-                            }
-                            .to_string()
-                        }),
+                        content: comment.clone(),
+                        author: comment_author.clone(),
                         author_type,
                         status: CommentStatus::Open,
                         parent_id: None,
@@ -24084,24 +24996,42 @@ impl WorkspaceApi for Services {
                         created_at: now.clone(),
                         updated_at: now,
                     };
-                    // The anchor-marker note rewrite + comment INSERT commit
+                    // The anchor-marker note rewrite (gated on `read_rev`) +
+                    // its version snapshot + comment INSERT commit
                     // atomically: a failure can never leave markers embedded
-                    // with no comment row (monorepo#638). The returned rev is
-                    // the authoritative post-rewrite value echoed to clients.
+                    // with no comment row (monorepo#638), nor the new rev
+                    // visible without its snapshot. The returned rev is the
+                    // authoritative post-rewrite value echoed to clients.
                     // Duplicate-id detection rides the INSERT's PK constraint
-                    // inside that same transaction (no TOCTOU pre-check), so a
-                    // colliding client-supplied `commentId` is InvalidParams
+                    // inside that same transaction (no TOCTOU pre-check), so
+                    // a colliding client-supplied `commentId` is InvalidParams
                     // even when two adds race.
-                    let note_rev = match store.update_note_with_comment(&note, &new_comment).await {
-                        Ok(rev) => rev,
+                    match store
+                        .update_note_with_comment(
+                            &note,
+                            Some(read_rev),
+                            &new_comment,
+                            &version_author,
+                        )
+                        .await
+                    {
+                        Ok(rev) => break (note, line, anchored_text, rev),
+                        Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {
+                            tracing::debug!(
+                                note = %note_id.0,
+                                attempt,
+                                read_rev,
+                                "comment.add: note changed under the anchor rewrite; re-anchoring"
+                            );
+                        }
                         Err(Error::InvalidInput(_)) if client_supplied_id => {
                             return Err(Error::InvalidParams(format!(
                                 "Invalid 'commentId': {comment_id}. A comment with this id already exists."
                             )))
                         }
                         Err(e) => return Err(e),
+                    }
                     };
-                    services.invalidate_crdt_note(&note.workspace_id, &note.id);
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
                         &note.id.clone(),
@@ -24338,7 +25268,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn comment_respond(
         &self,
         workspace_id: WorkspaceId,
@@ -24938,8 +25867,8 @@ impl WorkspaceApi for Services {
                     .ok()
                     .and_then(std::result::Result::ok)
                     .flatten()
-                    .and_then(|url| Self::parse_github_owner_repo(&url))
-                    .map_or((None, None), |(o, n)| (Some(o), Some(n)));
+                    .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                    .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
             // Stamp the root's HEAD at registration time (fail-soft:
             // unreadable HEAD ⇒ NULL; the store merge never overwrites an
             // existing value on re-registration).
@@ -25818,7 +26747,9 @@ impl WorkspaceApi for Services {
                 }
             }
             let url = github_url.trim().to_string();
-            let Some((owner, repo)) = clone_ops::parse_owner_repo(&url) else {
+            let Some(RepoRef { owner, name: repo }) =
+                GitRemoteUrl::parse(&url).and_then(|u| u.repo_slug())
+            else {
                 return Err(Error::InvalidParams(format!(
                     "githubUrl carries no owner/repo pair: {url}"
                 )));
@@ -25841,12 +26772,11 @@ impl WorkspaceApi for Services {
                     )));
                 }
             }
-            let cache_root = resolve_workspaces_parent(
+            let cache_root = intent_git::repo_cache::cache_root_for(&resolve_workspaces_parent(
                 workspaces_root,
                 workspaces_root_pinned,
                 &worktrees_location,
-            )?
-            .join(".repo-cache");
+            )?);
             // Global single-flight: claim the slot or reject immediately with
             // the busy error naming the warm already in flight (never queue).
             {
@@ -25969,7 +26899,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn git_agent_commit(
         &self,
         workspace_id: WorkspaceId,
@@ -27229,10 +28158,17 @@ impl WorkspaceApi for Services {
         content: String,
         image_blocks: Option<serde_json::Value>,
         file_blocks: Option<serde_json::Value>,
+        message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.agent_queue_message_op(agent_id, content, image_blocks, file_blocks)
-                .await
+            self.agent_queue_message_op(
+                agent_id,
+                content,
+                image_blocks,
+                file_blocks,
+                message_metadata,
+            )
+            .await
         })
     }
 
@@ -27984,10 +28920,9 @@ impl WorkspaceApi for Services {
         let injected = self.source_control.clone();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
-            let (owner, repo) = pr_ops::repo_of(&ws)?;
+            let repo_ref = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
                 .get_pr(&repo_ref, number)
                 .await
@@ -28047,13 +28982,15 @@ impl WorkspaceApi for Services {
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
             // workspace repo; either way the resolved repo is echoed in the
             // result so a wrong-repo read is detectable.
-            let (owner, repo) = match repo {
-                Some(slug) => pr_ops::parse_repo_slug(&slug)?,
+            let repo_ref = match repo {
+                Some(slug) => {
+                    let (owner, repo) = pr_ops::parse_repo_slug(&slug)?;
+                    intent_sourcecontrol::RepoRef::new(owner, repo)
+                }
                 None => pr_ops::repo_of(&ws)?,
             };
-            let repo_slug = format!("{owner}/{repo}");
+            let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
             let sc = pr_ops::resolve_source_control(injected).await?;
-            let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
                 intent_sourcecontrol::Error::NotFound(_) => {
                     Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
@@ -28070,9 +29007,11 @@ impl WorkspaceApi for Services {
             // works with, so `ws.pr.snapshot`, monitor wakes and
             // `prMonitor.list` summaries all describe a PR with the same
             // object — this registers nothing and triggers no monitoring.
-            // Every forge sub-read inside degrades on its own.
+            // Every forge sub-read inside degrades on its own; only quota
+            // exhaustion (`RateLimited`) fails the snapshot, exactly as a
+            // rate-limited `get_pr` above would.
             let (requirements, review_comment_count, _ejection_known) =
-                pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await;
+                pr_ops::merge_requirements_for_pr(sc.as_ref(), &repo_ref, pr_number, &pr).await?;
             let unresolved_thread_count = requirements.threads.unresolved;
             // The conversation-comment count is not part of the checklist; a
             // failing read reports zero rather than failing the snapshot.
@@ -28200,7 +29139,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_pulls_list(
         &self,
         owner: String,
@@ -28242,7 +29180,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_pulls_search(
         &self,
         owner: String,
@@ -28424,7 +29361,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_issues_list(
         &self,
         owner: String,
@@ -28466,7 +29402,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn github_issues_search(
         &self,
         owner: String,
@@ -28706,7 +29641,7 @@ impl WorkspaceApi for Services {
         let registry = self.settings_registry.clone();
         let ls_remote_base = self.branches_ls_remote_base.clone();
         Box::pin(async move {
-            let cache_root = cache_parent.join(".repo-cache");
+            let cache_root = intent_git::repo_cache::cache_root_for(&cache_parent);
             if let Some(cached) =
                 intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await?
             {
@@ -29788,9 +30723,18 @@ impl WorkspaceApi for Services {
         client_id: ClientId,
         name: Option<String>,
         capabilities: Option<serde_json::Value>,
+        host: ClientHostInfo,
     ) -> BoxFuture<'_, Result<()>> {
         let svc = self.clone();
-        Box::pin(async move { svc.client_hello_upsert(client_id, name, capabilities).await })
+        Box::pin(async move {
+            svc.client_hello_upsert(client_id, name, capabilities, host)
+                .await
+        })
+    }
+
+    fn ensure_client(&self, client_id: ClientId) -> BoxFuture<'_, Result<()>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.client_ensure(client_id).await })
     }
 
     fn draft_get(
@@ -29828,13 +30772,58 @@ impl WorkspaceApi for Services {
         Box::pin(async move { svc.drafts_clear(workspace_id, agent_id, client_id).await })
     }
 
-    /// `browser.exec` — agent-initiated CDP forward (REV-1, PROTOCOL §5.14/§12.4).
+    fn browser_list_tabs(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'_, Result<Vec<intent_core::BrowserTab>>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tabs_list(workspace_id).await })
+    }
+
+    fn browser_upsert_tab(
+        &self,
+        host: ClientId,
+        tab: intent_core::BrowserTabInput,
+    ) -> BoxFuture<'_, Result<intent_core::BrowserTab>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tab_upsert(host, tab).await })
+    }
+
+    fn browser_remove_tab(&self, host: ClientId, tab_id: String) -> BoxFuture<'_, Result<()>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tab_remove(host, tab_id).await })
+    }
+
+    fn browser_sync_tabs(
+        &self,
+        host: ClientId,
+        tabs: Vec<intent_core::BrowserTabInput>,
+    ) -> BoxFuture<'_, Result<Vec<String>>> {
+        let svc = self.clone();
+        Box::pin(async move { svc.browser_tabs_sync(host, tabs).await })
+    }
+
+    /// `browser.exec` — agent-initiated CDP forward (REV-2, PROTOCOL §5.14/§12.4).
     ///
     /// When an agent triggers this via the MCP `ws.browser.exec` binding
     /// there is no per-connection reverse channel to use (the caller is the
     /// daemon-hosted MCP server, not a client connection), so we route the
-    /// batch to the first-registered live client via the injected
-    /// [`AgentReverseDispatch`]. Attribution fields (`workspaceId`, `agentId`,
+    /// batch through the injected [`AgentReverseDispatch`]. The target is
+    /// the workspace's **driving client** ([`Self::driving_client_target`],
+    /// REV-2 Model 5 & 10: pin → host of the workspace's claimed tabs →
+    /// first-connected eligible client); a driving client that is offline is
+    /// a hard `-32603` ("browser client … for this workspace is not
+    /// connected"), never a silent fallback. Two rules run before dispatch:
+    /// every `tabId` the batch names (envelope or per action) must be an
+    /// open registry tab of this workspace (`-32602` "tab not found"), and
+    /// `listTabs` is answered by the daemon from the registry — all hosts
+    /// aggregated, no reverse call — so a `listTabs` batch never mixes with
+    /// FE-executed actions (`-32602`). After a successful dispatch, a
+    /// `claimTab` that succeeded re-homes the row to the driving client as
+    /// re-resolved at commit time (`browser:tab-updated { changes: {
+    /// hostClientId, ownerAgentId } }`, see
+    /// [`Self::browser_tab_claim_migrate`]).
+    /// Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
     /// shaping stays in [`browser_ops`], via the agent-surface variant
@@ -29863,10 +30852,83 @@ impl WorkspaceApi for Services {
                     "browser.exec: actions must be a non-empty array".to_string(),
                 ));
             }
+            // Every tab the batch names must be an open registry tab of this
+            // workspace — before anything is answered or dispatched; the
+            // driving client is the one host, so no per-tab host lookup is
+            // involved (Model 5).
+            let mut named_tabs: Vec<&str> = actions
+                .iter()
+                .filter_map(|a| a["tabId"].as_str())
+                .chain(tab_id.as_deref())
+                .filter(|id| !id.is_empty())
+                .collect();
+            named_tabs.sort_unstable();
+            named_tabs.dedup();
+            for id in &named_tabs {
+                let known = self
+                    .store
+                    .get_browser_tab(id)
+                    .await?
+                    .is_some_and(|tab| tab.workspace_id == workspace_id);
+                if !known {
+                    return Err(Error::InvalidParams(format!(
+                        "browser.exec: tab not found: {id}"
+                    )));
+                }
+            }
+            let list_tabs_count = actions
+                .iter()
+                .filter(|a| a["action"] == browser_tabs::LIST_TABS_ACTION)
+                .count();
+            if list_tabs_count > 0 {
+                if list_tabs_count != actions.len() {
+                    return Err(Error::InvalidParams(
+                        "browser.exec: listTabs is answered by the daemon and cannot be batched \
+                         with other actions"
+                            .to_string(),
+                    ));
+                }
+                let mut results = Vec::with_capacity(actions.len());
+                for action in &actions {
+                    let scope = match &action["scope"] {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(scope) => Some(scope.as_str()),
+                        other => {
+                            return Err(Error::InvalidParams(format!(
+                                "browser.exec: listTabs scope must be \"mine\", \"unclaimed\" or \
+                                 \"all\", got {other}"
+                            )))
+                        }
+                    };
+                    results.push(
+                        self.browser_tabs_list_for_agent(&workspace_id, scope, agent_id.as_ref())
+                            .await?,
+                    );
+                }
+                return Ok(if results.len() == 1 {
+                    results.remove(0)
+                } else {
+                    serde_json::json!({ "results": results })
+                });
+            }
             let Some(dispatch) = self.reverse_dispatch.clone() else {
                 return Err(Error::Internal(
                     "browser.exec: no client connected".to_string(),
                 ));
+            };
+            let target = self.driving_client_target(&workspace_id).await?;
+            // Claims re-home their tab after the dispatch; record which
+            // client executed them (the commit re-validates the host).
+            let claims: Vec<String> = actions
+                .iter()
+                .filter(|a| a["action"] == "claimTab")
+                .filter_map(|a| a["tabId"].as_str().or(tab_id.as_deref()))
+                .map(str::to_string)
+                .collect();
+            let executed_on = if claims.is_empty() {
+                None
+            } else {
+                dispatch.resolve(&target).ok().map(|r| r.client_id)
             };
             // Shape by *request* arity: the FE aborts a batch on the first
             // failing action, so the reply's results count can be shorter
@@ -29875,24 +30937,97 @@ impl WorkspaceApi for Services {
             let args = browser_ops::BrowserExecArgs {
                 actions,
                 tab_id,
-                agent_id: agent_id.map(|a| a.as_str().to_string()),
+                agent_id: agent_id.as_ref().map(|a| a.as_str().to_string()),
                 workspace_id: Some(workspace_id.as_str().to_string()),
             };
             let forwarded = browser_ops::build_forward_params(&args);
-            let response =
-                dispatch
-                    .dispatch("browser.exec", forwarded)
-                    .await
-                    .map_err(|e| match e {
-                        intent_core::ReverseDispatchError::NoClient => {
-                            Error::Internal("browser.exec: no client connected".to_string())
-                        }
-                        intent_core::ReverseDispatchError::Transport { message, .. } => {
-                            Error::Internal(format!("browser.exec: {message}"))
-                        }
-                    })?;
+            let response = match dispatch.dispatch("browser.exec", forwarded, target).await {
+                Ok(response) => response,
+                Err(ReverseDispatchError::NoClient) => {
+                    return Err(Error::Internal(
+                        "browser.exec: no client connected".to_string(),
+                    ));
+                }
+                Err(err) => {
+                    let message = self.browser_dispatch_error_message(err).await;
+                    return Err(Error::Internal(format!("browser.exec: {message}")));
+                }
+            };
+            if let Some(executed_on) = executed_on {
+                for tab_id in browser_ops::successful_claims(&response, &claims) {
+                    self.browser_tab_claim_migrate(&tab_id, &executed_on, agent_id.as_ref())
+                        .await?;
+                }
+            }
             browser_ops::shape_agent_result(&response, requested_actions)
                 .map_err(|e| Error::Internal(e.message))
+        })
+    }
+
+    /// `browser.navigateTab { tabId, url }` (REV-2 Model 4): route a
+    /// navigation request to the client that renders the live tab — the
+    /// workspace's driving client for a claimed tab, the physical host for
+    /// an unclaimed one — as a reverse `browser.exec { action: "navigate"
+    /// }` and echo that action's result envelope. The host then reports the
+    /// resulting navigation through `browser.upsertTab` and every client
+    /// follows the canonical row.
+    fn browser_navigate_tab(
+        &self,
+        tab_id: String,
+        url: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let tab = self
+                .browser_tab_required("browser.navigateTab", &tab_id)
+                .await?;
+            let response = self
+                .browser_tab_dispatch(
+                    "browser.navigateTab",
+                    &tab,
+                    serde_json::json!({ "action": "navigate", "tabId": tab_id, "url": url }),
+                )
+                .await?;
+            browser_ops::shape_result(&response).map_err(|e| Error::Internal(e.message))
+        })
+    }
+
+    /// `browser.closeTab { tabId, force? }` (REV-2 Model 6): route the close
+    /// to the tab's routing target (as `browser_navigate_tab`) so the host's
+    /// own `browser.removeTab` deletes the row. With `force` the row is
+    /// tombstoned daemon-side regardless (after a best-effort routed close
+    /// when the target is reachable); a target that is offline without
+    /// `force` is `Error::Internal`. Unknown tab ⇒ `Error::InvalidParams`.
+    fn browser_close_tab(
+        &self,
+        tab_id: String,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let tab = self
+                .browser_tab_required("browser.closeTab", &tab_id)
+                .await?;
+            let action = serde_json::json!({ "action": "closeTab", "tabId": tab_id });
+            if force {
+                let target = self.browser_tab_route_target(&tab).await?;
+                let reachable = self
+                    .reverse_dispatch
+                    .as_ref()
+                    .is_some_and(|d| d.resolve(&target).is_ok());
+                if reachable {
+                    // The host is told directly; failures fall through to
+                    // the tombstone, which its next sync reconciles.
+                    let _ = self
+                        .browser_tab_dispatch("browser.closeTab", &tab, action)
+                        .await;
+                }
+                self.browser_tab_force_close(&tab_id).await?;
+                return Ok(serde_json::json!({ "ok": true }));
+            }
+            let response = self
+                .browser_tab_dispatch("browser.closeTab", &tab, action)
+                .await?;
+            browser_ops::shape_result(&response).map_err(|e| Error::Internal(e.message))?;
+            Ok(serde_json::json!({ "ok": true }))
         })
     }
 
@@ -30511,7 +31646,7 @@ impl Services {
     /// Run the requested action's step sequence, accumulating per-step status.
     /// A failing step short-circuits with `success:false`; on success the
     /// recomputed metrics + refreshed git-status are emitted.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn ac_run_pipeline(
         &self,
         workspace_id: &WorkspaceId,
@@ -30804,10 +31939,9 @@ impl Services {
         if let Some(number) = ws.pr_number {
             return Ok((number, ws.pr_url.clone().unwrap_or_default()));
         }
-        let (owner, repo) = pr_ops::repo_of(&ws)
+        let repo_ref = pr_ops::repo_of(&ws)
             .map_err(|_| Error::Internal("No remote configured for this repository".to_string()))?;
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
 
         let branch = ws.branch.clone();
         let target_branch = target
@@ -30858,9 +31992,8 @@ impl Services {
         let mut ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
             Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
         })?;
-        let (owner, repo) = pr_ops::repo_of(&ws)?;
+        let repo_ref = pr_ops::repo_of(&ws)?;
         let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
         let options = intent_sourcecontrol::MergeOptions {
             commit_title,
             commit_message,
@@ -31022,7 +32155,10 @@ impl Services {
     /// Restore agent attribution for the files of the undone commits (mirrors the
     /// TS `recordAgentWrite` loop): after the soft reset each changed path is
     /// re-attributed to its original agent/task at whichever stage it now sits.
-    /// Best-effort — failures never fail the undo.
+    /// Scans with rename detection off so an undone rename yields rows for
+    /// both its old (deleted) and new (added) path — the commit's `files`
+    /// carry both, and the next attributed checkpoint needs both to land the
+    /// deletion. Best-effort — failures never fail the undo.
     async fn ac_restore_undo_attribution(
         &self,
         workspace_id: &WorkspaceId,
@@ -31032,11 +32168,11 @@ impl Services {
         if metadata.is_empty() {
             return;
         }
-        let Ok(status) = intent_git::status::status(worktree) else {
+        let Ok(files) = intent_git::status::files_without_renames(worktree) else {
             return;
         };
         let mut by_path: HashMap<String, (bool, &'static str)> = HashMap::new();
-        for f in &status.files {
+        for f in &files {
             let word = match f.status {
                 intent_core::GitFileStatus::Added | intent_core::GitFileStatus::Untracked => {
                     "added"
@@ -31309,7 +32445,7 @@ impl Services {
     /// (locally via `update-ref`, or on the remote via a refspec push), rebasing
     /// onto trunk first when the branch is behind. Mirrors the TS local-trunk /
     /// remote-trunk merge flow incl. the squash strategy and auto-rebase.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn ac_merge(
         &self,
         workspace_id: &WorkspaceId,
@@ -31646,7 +32782,7 @@ impl Services {
     /// trunk when it exists, else a local `update-ref` of `refs/heads/<trunk>`.
     /// `token` is the caller-resolved GitHub token (the merge flow resolves it
     /// once via [`Self::ac_git_token`] and threads it through).
-    #[allow(clippy::unused_self)] // instance method for parity with the other ac_* steps
+    #[expect(clippy::unused_self)] // instance method for parity with the other ac_* steps
     fn ac_advance_trunk(
         &self,
         worktree: &Path,

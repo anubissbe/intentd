@@ -11,8 +11,8 @@ use intent_acp::{
     PermissionOutcome, PermissionPolicy, PermissionRequestData,
 };
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, Error, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, Error, MessageOrigin, Workspace,
+    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -30,6 +30,7 @@ use super::{
 use crate::agent_ops::user_message_blocks;
 use crate::events::{EventBus, SubscriptionFilter};
 use crate::microvm::{MicrovmVm, GUEST_WORKSPACE_DIR};
+use crate::test_support::test_tempdir;
 use crate::Services;
 
 /// `SQLite` db inside an RAII temp dir: the dir sweep (on drop, including on
@@ -43,13 +44,7 @@ struct TempDb {
 
 impl TempDb {
     fn new() -> Self {
-        let mut dir = tempfile::Builder::new()
-            .prefix("intentd-mgr-")
-            .tempdir()
-            .expect("create test tempdir");
-        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
-            dir.disable_cleanup(true);
-        }
+        let dir = test_tempdir("intentd-mgr-");
         let path = dir.path().join("mgr.db");
         Self { path, _dir: dir }
     }
@@ -1090,6 +1085,7 @@ async fn process_cap_events_queued_resumed_evicted() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -2776,7 +2772,13 @@ async fn aborted_acquire_release_still_kicks_drain_for_parked_message() {
     // Mid-kill, a send parks behind the claim (its inline drain kick loses
     // `try_begin` against the held claim).
     mgr.services
-        .agent_queue_message_op(victim.clone(), "parked behind claim".into(), None, None)
+        .agent_queue_message_op(
+            victim.clone(),
+            "parked behind claim".into(),
+            None,
+            None,
+            None,
+        )
         .await
         .expect("queue message");
     assert_eq!(services.queue_snapshot(&victim).len(), 1, "message parked");
@@ -3471,19 +3473,14 @@ fn pid_alive(pid: u32) -> bool {
 /// A self-cleaning temp git repo with one committed file modified in the workdir.
 struct TempRepo {
     dir: PathBuf,
-}
-
-impl Drop for TempRepo {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
+    _guard: tempfile::TempDir,
 }
 
 /// Seed `a.txt`, commit it, then leave an unstaged modification (2 adds / 1 del).
 fn seed_repo() -> TempRepo {
     use git2::{Repository, Signature};
-    let dir = std::env::temp_dir().join(format!("intentd-ft-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let guard = test_tempdir("intentd-ft-");
+    let dir = guard.path().to_path_buf();
     let repo = Repository::init(&dir).unwrap();
     {
         let mut cfg = repo.config().unwrap();
@@ -3502,7 +3499,7 @@ fn seed_repo() -> TempRepo {
             .unwrap();
     }
     std::fs::write(dir.join("a.txt"), "line1\nCHANGED\nline3\nline4\n").unwrap();
-    TempRepo { dir }
+    TempRepo { dir, _guard: guard }
 }
 
 /// An agent `file:changed` runs the BE-internal review pipeline (§17.1): the
@@ -3560,6 +3557,7 @@ async fn agent_file_change_records_tracked_change_and_diff() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -4185,6 +4183,7 @@ async fn seed_agent_with_task_graph(
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -4686,8 +4685,8 @@ async fn start_session_carries_session_mcp_servers_on_session_load() {
 /// paths — the Drop scrub tolerates missing paths). `start_session` keys the
 /// guest-cwd translation on `_vm.is_some()`, which is all these tests need.
 fn mark_handle_microvm(mgr: &AgentManager, id: &AgentId) {
-    let stub_root =
-        std::env::temp_dir().join(format!("intentd-test-vmstub-{}", uuid::Uuid::new_v4()));
+    let stub_root = std::env::temp_dir() // tmp-hygiene: allow — path arithmetic only; the stub VM paths are never created on disk
+        .join(format!("intentd-test-vmstub-{}", uuid::Uuid::new_v4()));
     let vm = MicrovmVm {
         vm_dir: stub_root.join("vm"),
         rootfs: stub_root.join("vm/rootfs"),
@@ -5609,6 +5608,1005 @@ async fn terminal_failure_requeue_defaults_turn_id_to_new_id() {
     );
 }
 
+/// The intent-hq/intent#4703 failure text: a chat-stream 413 wrapped the way
+/// the ACP layer surfaces it.
+fn context_size_error_text() -> &'static str {
+    "internal error: session/prompt failed: JSON-RPC error -32603: Internal error: \
+     HTTP error: 413 Request Entity Too Large: {\"httpStatus\":413,\
+     \"message\":\"Conversation context too large for model\"}"
+}
+
+/// A payload one char over `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS`, built from
+/// a recognisable token so the retry test can prove it never reached the
+/// provider.
+fn oversized_payload() -> String {
+    let mut s = String::new();
+    while s.chars().count() <= super::CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS {
+        s.push_str("OVERSIZED-PAYLOAD-TOKEN ");
+    }
+    s
+}
+
+/// intent-hq/intent#4703: a context-size (413) failure on an entry above
+/// the size threshold re-queues the recovery MARKER in place of the payload,
+/// keeping the correlation `turn_id`, `queued_at`, `messageMetadata`,
+/// priority, and `requeuedAfterFailure: true`. `persisted` is forced to
+/// `false` so the retry drain appends the marker as the turn's user row.
+#[tokio::test]
+async fn context_size_requeue_replaces_oversized_entry_with_marker() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (WorkspaceId::from("ws-413-big"), AgentId::from("a-413-big"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    let payload = oversized_payload();
+    let original_chars = payload.chars().count();
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413".to_string()),
+        queued_at: Some("2026-01-01T00:00:00Z".to_string()),
+        message_metadata: Some(json!({"type": "hook_dispatch"})),
+        interrupt_priority: true,
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        &payload,
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(
+        queued.content,
+        super::context_size_requeue_marker(original_chars),
+        "oversized payload replaced by the recovery marker"
+    );
+    assert!(
+        queued.content.contains(&format!("{original_chars} chars")),
+        "marker names the dropped size: {}",
+        queued.content
+    );
+    assert!(!queued.content.contains("OVERSIZED-PAYLOAD-TOKEN"));
+    assert!(queued.requeued_after_failure);
+    assert!(
+        !queued.persisted,
+        "marker must be appended as the retry's user row"
+    );
+    assert_eq!(queued.turn_id, "turn-413");
+    assert_eq!(queued.queued_at, "2026-01-01T00:00:00Z");
+    assert_eq!(
+        queued.message_metadata,
+        Some(json!({"type": "hook_dispatch"}))
+    );
+    assert!(queued.interrupt_priority);
+    // Wire shape (`agent.getQueue`) shows the marker as a failure requeue.
+    let wire = queued.to_value(0);
+    assert_eq!(wire["requeuedAfterFailure"], json!(true));
+    assert_eq!(wire["content"], json!(queued.content));
+    assert_eq!(wire["turnId"], json!("turn-413"));
+}
+
+/// A context-size failure on an entry AT or UNDER the threshold is the
+/// accumulated context's problem, not the message's: the entry re-queues
+/// unchanged with `persisted` as given (existing behaviour). Covers a small
+/// ask, a payload of exactly `CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS` chars
+/// (the boundary is strictly greater-than), and a multibyte payload whose
+/// BYTE length exceeds the threshold while its char count does not (the
+/// threshold counts chars).
+#[tokio::test]
+async fn context_size_requeue_keeps_small_entry_unchanged() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-small"),
+        AgentId::from("a-413-small"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let threshold = super::CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS;
+    let exact = "x".repeat(threshold);
+    assert_eq!(exact.chars().count(), threshold);
+    let multibyte = "é".repeat(threshold);
+    assert_eq!(multibyte.chars().count(), threshold);
+    assert!(
+        multibyte.len() > threshold,
+        "byte length exceeds the threshold"
+    );
+
+    for (turn, content) in [
+        ("turn-413-small", "small ask"),
+        ("turn-413-exact", exact.as_str()),
+        ("turn-413-multibyte", multibyte.as_str()),
+    ] {
+        let options = super::TurnOptions {
+            turn_id: Some(turn.to_string()),
+            ..super::TurnOptions::default()
+        };
+        super::persist_error_and_requeue(
+            &mgr,
+            &id,
+            &ws,
+            content,
+            &options,
+            true,
+            context_size_error_text(),
+        )
+        .await;
+
+        let queued = mgr
+            .services
+            .dequeue_message(&id)
+            .expect("failed message requeued");
+        assert_eq!(queued.content, content, "{turn}: content unchanged");
+        assert!(
+            queued.persisted,
+            "{turn}: already-persisted row is not re-appended"
+        );
+        assert!(queued.requeued_after_failure);
+        assert_eq!(queued.turn_id, turn);
+    }
+}
+
+/// An oversized entry whose turn failed for a NON-context-size reason
+/// re-queues verbatim: the marker swap is gated on the 413 classifier, not
+/// on size alone.
+#[tokio::test]
+async fn non_context_size_failure_keeps_oversized_entry_unchanged() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-big-boom"),
+        AgentId::from("a-big-boom"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let payload = oversized_payload();
+    let options = super::TurnOptions::default();
+    super::persist_error_and_requeue(&mgr, &id, &ws, &payload, &options, true, "boom").await;
+
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(queued.content, payload);
+    assert!(queued.persisted);
+    assert!(queued.requeued_after_failure);
+}
+
+/// End-to-end (intent-hq/intent#4703): after a 413 on an oversized entry
+/// whose user row was ALREADY persisted by the failed turn, `agent.retry`
+/// sends the MARKER to the provider — the marker lands as the retry turn's
+/// user row exactly once, the original row stays in the transcript exactly
+/// once (neither duplicated nor removed), and the original payload is never
+/// re-sent.
+#[tokio::test]
+async fn context_size_requeue_retry_sends_marker_to_provider() {
+    let script = mock_agent_script();
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": "OVERSIZED-PAYLOAD-TOKEN",
+                "response": "original-delivered",
+            },
+            {
+                "ifPromptContains": "[Queued message of",
+                "response": "marker-received",
+            },
+        ],
+        "response": "neither marker nor payload in prompt",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+    ]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-retry"),
+        AgentId::from("a-413-retry"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+
+    let payload = oversized_payload();
+    // The failed turn already persisted the oversized user row (that is what
+    // `persisted = true` on the requeue asserts).
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([{ "type": "text", "text": payload }]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413-retry".to_string()),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        &payload,
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("agent.retry");
+    assert_eq!(result["redriven"], json!(true));
+    assert_eq!(result["turnId"], json!("turn-413-retry"));
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry turn completes and the agent goes idle");
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    let marker_rows = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && m.content[0]["text"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("[Queued message of"))
+        })
+        .count();
+    assert_eq!(
+        marker_rows, 1,
+        "the marker lands in the transcript exactly once: {messages:?}"
+    );
+    let original_rows = messages
+        .iter()
+        .filter(|m| {
+            m.role == "user"
+                && serde_json::to_string(&m.content)
+                    .unwrap()
+                    .contains("OVERSIZED-PAYLOAD-TOKEN")
+        })
+        .count();
+    assert_eq!(
+        original_rows, 1,
+        "the already-persisted original row stays exactly once (never re-appended, never \
+         removed): {messages:?}"
+    );
+    let assistant = messages
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("retried turn produced assistant output");
+    assert!(
+        serde_json::to_string(&assistant.content)
+            .unwrap()
+            .contains("marker-received"),
+        "provider received the marker, not the payload: {messages:?}"
+    );
+}
+
+/// A system-origin queue entry for the combined-flush requeue tests.
+fn flush_entry(suffix: &str, content: String) -> crate::agent_ops::QueuedMessage {
+    crate::agent_ops::QueuedMessage {
+        id: format!("qm-413-{suffix}"),
+        turn_id: format!("turn-413-{suffix}"),
+        content,
+        image_blocks: None,
+        file_blocks: None,
+        queued_at: format!("2026-01-01T00:00:0{}Z", suffix.len() % 10),
+        editing: false,
+        persisted: false,
+        requeued_after_failure: false,
+        message_metadata: Some(json!({"source": suffix})),
+        prepend_content: None,
+        prepend_image_blocks: None,
+        prepend_file_blocks: None,
+        interrupt_priority: false,
+        user_origin: false,
+        hold_kind: None,
+        hold_until: None,
+        child_agent_id: None,
+    }
+}
+
+/// Run a real combined flush over `batch` (rows persisted, entries
+/// annotated) and fail the resulting turn with the given error text.
+/// Returns the flushed entries as the turn carried them and the queue
+/// restored by the requeue in head-first order.
+async fn flush_then_fail(
+    mgr: &super::AgentManager,
+    ws: &WorkspaceId,
+    id: &AgentId,
+    batch: Vec<crate::agent_ops::QueuedMessage>,
+    error_text: &str,
+) -> (
+    Vec<crate::agent_ops::QueuedMessage>,
+    Vec<crate::agent_ops::QueuedMessage>,
+) {
+    let draining = mgr.services.mark_draining(id, &batch);
+    let super::FlushPrep::Turn { content, options } =
+        super::prepare_flush_turn(mgr, id, ws, batch, draining).await
+    else {
+        panic!("flush prep starts a turn");
+    };
+    let flushed = options
+        .flushed_entries
+        .clone()
+        .expect("flush options carry the flushed entries");
+    assert!(
+        flushed.iter().all(|e| e.persisted),
+        "every flushed entry persisted before the turn"
+    );
+    super::persist_error_and_requeue(mgr, id, ws, &content, &options, true, error_text).await;
+    let mut restored = Vec::new();
+    while let Some(entry) = mgr.services.dequeue_message(id) {
+        restored.push(entry);
+    }
+    (flushed, restored)
+}
+
+/// Combined flush (intent-hq/intent#4703): a 413 on a batch of one
+/// oversized entry between two small siblings restores the THREE entries
+/// individually at the queue front in original order — the small ones
+/// verbatim with their durable rows respected (`persisted: true`), the
+/// oversized one as the marker with `persisted: false` — each keeping its
+/// own id / `turn_id` / `queued_at` / metadata. The wire-only combined
+/// prompt is never parked as a single entry.
+#[tokio::test]
+async fn context_size_requeue_splits_flush_batch_and_replaces_only_oversized_entry() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-batch"),
+        AgentId::from("a-413-batch"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let batch = vec![
+        flush_entry("a", "small first".to_string()),
+        flush_entry("bb", oversized_payload()),
+        flush_entry("ccc", "small last".to_string()),
+    ];
+    let (flushed, restored) =
+        flush_then_fail(&mgr, &ws, &id, batch, context_size_error_text()).await;
+
+    assert_eq!(restored.len(), 3, "entries restored individually");
+    assert_eq!(
+        restored.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["qm-413-a", "qm-413-bb", "qm-413-ccc"],
+        "original order and ids kept"
+    );
+    for (entry, suffix) in restored.iter().zip(["a", "bb", "ccc"]) {
+        assert_eq!(entry.turn_id, format!("turn-413-{suffix}"));
+        assert_eq!(entry.message_metadata.as_ref().unwrap()["source"], suffix);
+        assert!(
+            entry.requeued_after_failure,
+            "{suffix}: requeuedAfterFailure"
+        );
+        assert!(!entry.editing);
+    }
+    assert!(restored[0].content.starts_with("small first"));
+    assert!(
+        restored[0].persisted,
+        "small sibling's durable row is not re-appended"
+    );
+    // The marker names the size of the entry AS FLUSHED (annotated).
+    assert_eq!(
+        restored[1].content,
+        super::context_size_requeue_marker(flushed[1].content.chars().count()),
+        "only the oversized entry becomes the marker"
+    );
+    assert_eq!(restored[0].content, flushed[0].content);
+    assert_eq!(restored[2].content, flushed[2].content);
+    assert!(
+        !restored[1].persisted,
+        "marker must be appended as the retry's user row"
+    );
+    assert!(restored[2].content.starts_with("small last"));
+    assert!(restored[2].persisted);
+    assert!(
+        restored
+            .iter()
+            .all(|e| !e.content.contains("OVERSIZED-PAYLOAD-TOKEN")),
+        "the oversized payload is gone from the queue"
+    );
+}
+
+/// Combined flush where EVERY entry is under the threshold but their SUM
+/// exceeded the model's limit: a 413 restores each entry verbatim
+/// (`persisted: true`, no marker) — the accumulated prompt was the problem,
+/// no single payload can be blamed, and nothing is lost.
+#[tokio::test]
+async fn context_size_requeue_restores_all_small_flush_entries_verbatim() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-batch-small"),
+        AgentId::from("a-413-batch-small"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let threshold = super::CONTEXT_SIZE_REQUEUE_THRESHOLD_CHARS;
+    let half = "h".repeat(threshold / 2 + 1);
+    let batch = vec![
+        flush_entry("a", half.clone()),
+        flush_entry("bb", half.clone()),
+        flush_entry("ccc", half.clone()),
+    ];
+    let combined_chars: usize = batch.iter().map(|e| e.content.chars().count()).sum();
+    assert!(combined_chars > threshold, "combined prompt over threshold");
+
+    let (flushed, restored) =
+        flush_then_fail(&mgr, &ws, &id, batch, context_size_error_text()).await;
+
+    assert_eq!(restored.len(), 3);
+    for ((entry, flushed), suffix) in restored.iter().zip(&flushed).zip(["a", "bb", "ccc"]) {
+        assert_eq!(entry.id, format!("qm-413-{suffix}"));
+        assert_eq!(
+            entry.content, flushed.content,
+            "{suffix}: payload kept verbatim (no marker)"
+        );
+        assert!(entry.content.starts_with(&half));
+        assert!(entry.persisted, "{suffix}: durable row respected");
+        assert!(entry.requeued_after_failure);
+    }
+}
+
+/// A NON-context-size failure on a combined flush turn keeps today's
+/// behaviour: the combined prompt requeues as ONE `persisted: true` entry
+/// under the head entry's `turn_id` (the flushed entries ride the options
+/// but are used only by the 413 branch).
+#[tokio::test]
+async fn non_context_size_flush_failure_requeues_combined_prompt_as_one_entry() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-flush-boom"),
+        AgentId::from("a-flush-boom"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let batch = vec![
+        flush_entry("a", oversized_payload()),
+        flush_entry("bb", "small".to_string()),
+    ];
+    let (_flushed, restored) = flush_then_fail(&mgr, &ws, &id, batch, "boom").await;
+
+    assert_eq!(restored.len(), 1, "combined prompt requeued as one entry");
+    assert!(restored[0].content.contains("OVERSIZED-PAYLOAD-TOKEN"));
+    assert!(restored[0].content.contains("small"));
+    assert!(restored[0].persisted);
+    assert_eq!(restored[0].turn_id, "turn-413-a");
+}
+
+/// `content` and `prepend_content` are measured separately: a 413 on a
+/// small message carrying an oversized preempted `prepend_content`
+/// (monorepo#1014) swaps ONLY the prepend for the marker; `content` and
+/// `persisted` are untouched (the prepend is prompt-only, its row is
+/// already durable). The mirror case — oversized `content`, small prepend —
+/// swaps only `content`.
+#[tokio::test]
+async fn context_size_requeue_measures_prepend_content_separately() {
+    let (_tmp, mgr) = manager().await;
+    let (ws, id) = (
+        WorkspaceId::from("ws-413-prepend"),
+        AgentId::from("a-413-prepend"),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+
+    let payload = oversized_payload();
+    let original_chars = payload.chars().count();
+    let marker = super::context_size_requeue_marker(original_chars);
+
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413-prepend-big".to_string()),
+        prepend_content: Some(payload.clone()),
+        prepend_image_blocks: Some(json!([{"data": "AA==", "mimeType": "image/png"}])),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        "small ask",
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(queued.content, "small ask", "small content untouched");
+    assert!(
+        queued.persisted,
+        "persisted untouched: only the prepend changed"
+    );
+    assert_eq!(
+        queued.prepend_content.as_deref(),
+        Some(marker.as_str()),
+        "oversized prepend replaced by the marker"
+    );
+    assert_eq!(
+        queued.prepend_image_blocks,
+        Some(json!([{"data": "AA==", "mimeType": "image/png"}])),
+        "prepend attachments ride along"
+    );
+    assert!(queued.requeued_after_failure);
+
+    let options = super::TurnOptions {
+        turn_id: Some("turn-413-prepend-small".to_string()),
+        prepend_content: Some("small preempted".to_string()),
+        ..super::TurnOptions::default()
+    };
+    super::persist_error_and_requeue(
+        &mgr,
+        &id,
+        &ws,
+        &payload,
+        &options,
+        true,
+        context_size_error_text(),
+    )
+    .await;
+    let queued = mgr
+        .services
+        .dequeue_message(&id)
+        .expect("failed message requeued");
+    assert_eq!(
+        queued.content, marker,
+        "oversized content becomes the marker"
+    );
+    assert!(!queued.persisted);
+    assert_eq!(
+        queued.prepend_content.as_deref(),
+        Some("small preempted"),
+        "small prepend kept verbatim"
+    );
+}
+
+struct StopRedeliveryFlush413 {
+    /// The queue as restored by the 413 requeue (head-first).
+    restored: Vec<crate::agent_ops::QueuedMessage>,
+    /// The failed flush turn's outbound prompt text.
+    first_text: String,
+    /// The retry turn's outbound prompt text + block types.
+    retry_text: String,
+    retry_blocks: Vec<String>,
+    messages: Vec<intent_core::AgentMessage>,
+}
+
+/// Drive the real stop-redelivery + combined-flush + 413 + `agent.retry`
+/// sequence against the mock provider: a zero-output user stop arms the
+/// stopped message (`stopped_text` + an image) for redelivery, two entries
+/// (`(content, own prepend)`) are queued and flushed as ONE turn
+/// (`spawn_worker` merges the armed payload in AFTER `prepare_flush_turn`
+/// captured the entries), the mock fails that first prompt with the
+/// intent-hq/intent#4703 413, and `agent.retry` redrives.
+async fn stop_redelivery_flush_413_retry(
+    tag: &str,
+    stopped_text: &str,
+    queued: [(&str, Option<&str>); 2],
+) -> StopRedeliveryFlush413 {
+    let script = mock_agent_script();
+    let scratch = test_tempdir(&format!("itd-413-{tag}-"));
+    let prompt_log = scratch.path().join("prompts.log");
+    let prompt_log_s = prompt_log.to_string_lossy().into_owned();
+    let attempt_file = scratch.path().join("attempts");
+    let attempt_file_s = attempt_file.to_string_lossy().into_owned();
+    // `advertiseLoadSession` keeps the retry on the RESUME path: a recreated
+    // session replays the transcript (stopped row included) as history and
+    // suppresses prepend text wholesale, which would mask what this checks.
+    let behavior = json!({
+        "advertiseLoadSession": true,
+        "promptRpcErrorAttempts": 1,
+        "promptRpcError": {
+            "code": -32603,
+            "message": "Internal error: HTTP error: 413 Request Entity Too Large: \
+                        {\"httpStatus\":413,\"message\":\"Conversation context too large for model\"}",
+        },
+        "response": "retry-delivered",
+    })
+    .to_string();
+    let _env = EnvGuard::set_all(&[
+        ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+        ("MOCK_AGENT_BEHAVIOR", behavior.as_str()),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
+        ("MOCK_AGENT_ATTEMPT_FILE", attempt_file_s.as_str()),
+    ]);
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let (ws, id) = (
+        WorkspaceId::from(format!("ws-413-{tag}")),
+        AgentId::from(format!("a-413-{tag}")),
+    );
+    seed_agent(&mgr, &ws, &id).await;
+    set_session_provider(&mgr, &ws, &id, "mock").await;
+
+    // Real zero-output stop (spawn-window fallback path): the stopped user
+    // row becomes the armed redelivery payload.
+    track(&mgr, &id);
+    assert!(mgr.try_begin(&id, &ws).await);
+    mgr.services
+        .store
+        .append_agent_message(
+            &id,
+            "user",
+            &json!([
+                { "type": "text", "text": stopped_text },
+                { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+            ]),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    mgr.services.set_live_turn(&id, "msg-stop-413", Vec::new());
+    assert!(mgr.interrupt(&id).await, "fallback stop finds the agent");
+    assert!(
+        mgr.stop_redelivery.lock().unwrap().contains_key(&id),
+        "zero-output stop arms the redelivery payload"
+    );
+    assert!(!mgr.is_busy(&id), "stop released the slot");
+
+    for (content, prepend) in queued {
+        let prepend = prepend.map(|p| crate::agent_ops::QueuedPrepend {
+            content: Some(p.to_string()),
+            image_blocks: None,
+            file_blocks: None,
+        });
+        mgr.services.enqueue_message(
+            &id,
+            content.to_string(),
+            None,
+            None,
+            None,
+            prepend,
+            false,
+            MessageOrigin::Automatic,
+        );
+    }
+    // The drain flushes both entries into ONE turn; the mock fails it 413.
+    mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let status = mgr.services.store.get_agent_session_status(&id).await;
+            if status.ok() == Some(AgentStatus::Error)
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the flush turn fails terminally with the 413");
+    assert!(
+        !mgr.stop_redelivery.lock().unwrap().contains_key(&id),
+        "the flush consumed the armed payload"
+    );
+    let restored = mgr
+        .services
+        .agent_queues
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .unwrap_or_default();
+
+    let result = mgr
+        .agent_retry(id.clone(), ws.clone())
+        .await
+        .expect("agent.retry");
+    assert_eq!(result["redriven"], json!(true), "{result}");
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+            if session.status == AgentStatus::RuntimeIdle
+                && !mgr.is_busy(&id)
+                && mgr.workers.lock().unwrap().is_empty()
+                && !mgr.services.has_ready_to_send(&id)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("retry turn completes and the agent goes idle");
+
+    let prompts: Vec<Value> = std::fs::read_to_string(&prompt_log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("prompt log line"))
+        .collect();
+    assert_eq!(
+        prompts.len(),
+        2,
+        "failed flush + one retry turn: {prompts:?}"
+    );
+    let first_text = prompts[0]["text"].as_str().expect("text").to_string();
+    let retry_text = prompts[1]["text"].as_str().expect("text").to_string();
+    let retry_blocks = prompts[1]["blockTypes"]
+        .as_array()
+        .expect("blockTypes")
+        .iter()
+        .filter_map(|b| b.as_str().map(str::to_string))
+        .collect();
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .expect("messages");
+    StopRedeliveryFlush413 {
+        restored,
+        first_text,
+        retry_text,
+        retry_blocks,
+        messages,
+    }
+}
+
+fn user_rows_containing(messages: &[intent_core::AgentMessage], needle: &str) -> usize {
+    messages
+        .iter()
+        .filter(|m| m.role == "user" && serde_json::to_string(&m.content).unwrap().contains(needle))
+        .count()
+}
+
+/// A SMALL stopped message armed for redelivery rides a combined flush that
+/// fails 413 over an oversized sibling: the per-entry requeue keeps the
+/// redelivery on the LAST entry (text + image), the oversized tail's own
+/// content becomes the marker, the small head is untouched, and the retry
+/// prompt carries the stopped message exactly once, ahead of the batch —
+/// nothing is lost.
+#[tokio::test]
+async fn context_size_flush_requeue_keeps_small_stop_redelivery_prepend() {
+    let StopRedeliveryFlush413 {
+        restored,
+        retry_text,
+        retry_blocks,
+        messages,
+        ..
+    } = stop_redelivery_flush_413_retry(
+        "stop-small",
+        "stopped before output",
+        [("queued follow-up", None), (&oversized_payload(), None)],
+    )
+    .await;
+
+    assert_eq!(
+        restored.len(),
+        2,
+        "entries restored individually: {restored:?}"
+    );
+    let head = &restored[0];
+    assert!(head.content.starts_with("queued follow-up"));
+    assert!(head.persisted, "small head keeps its durable row");
+    assert!(
+        head.prepend_content.is_none(),
+        "no duplicated redelivery on the head"
+    );
+    assert!(head.requeued_after_failure);
+    let tail = &restored[1];
+    assert!(
+        tail.content.starts_with("[Queued message of"),
+        "{}",
+        tail.content
+    );
+    assert!(!tail.persisted);
+    assert_eq!(
+        tail.prepend_content.as_deref(),
+        Some("stopped before output"),
+        "the armed redelivery rides the last entry"
+    );
+    assert!(
+        tail.prepend_image_blocks
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|b| b.iter().any(|b| b["data"] == json!("aGVsbG8="))),
+        "the redelivered image rides along: {:?}",
+        tail.prepend_image_blocks
+    );
+
+    let stop_pos = retry_text
+        .find("stopped before output")
+        .unwrap_or_else(|| panic!("retry redelivers the stopped message: {retry_text:?}"));
+    assert_eq!(
+        retry_text.matches("stopped before output").count(),
+        1,
+        "redelivered exactly once: {retry_text:?}"
+    );
+    let follow_pos = retry_text
+        .find("queued follow-up")
+        .expect("head entry in retry");
+    assert!(
+        stop_pos < follow_pos,
+        "stopped message precedes the batch: {retry_text:?}"
+    );
+    assert!(
+        retry_text.contains("[Queued message of"),
+        "marker reached the provider"
+    );
+    assert!(
+        !retry_text.contains("OVERSIZED-PAYLOAD-TOKEN"),
+        "the oversized payload never reaches the retry"
+    );
+    assert!(
+        retry_blocks.iter().any(|t| t == "image"),
+        "redelivered image reached the wire: {retry_blocks:?}"
+    );
+
+    assert_eq!(
+        user_rows_containing(&messages, "queued follow-up"),
+        1,
+        "{messages:?}"
+    );
+    assert_eq!(
+        user_rows_containing(&messages, "OVERSIZED-PAYLOAD-TOKEN"),
+        1
+    );
+    assert_eq!(user_rows_containing(&messages, "[Queued message of"), 1);
+    let assistant = messages
+        .iter()
+        .rfind(|m| m.role == "assistant")
+        .expect("retry output");
+    assert!(serde_json::to_string(&assistant.content)
+        .unwrap()
+        .contains("retry-delivered"));
+}
+
+/// An OVERSIZED stopped message armed for redelivery over a flush of two
+/// small entries: the 413 requeue swaps only the last entry's prepend for
+/// the marker (`content` + `persisted` untouched), the small siblings stay
+/// verbatim and ordered, and the retry prompt carries the marker instead of
+/// the payload.
+#[tokio::test]
+async fn context_size_flush_requeue_replaces_oversized_stop_redelivery_prepend() {
+    let payload = oversized_payload();
+    let StopRedeliveryFlush413 {
+        restored,
+        retry_text,
+        messages,
+        ..
+    } = stop_redelivery_flush_413_retry(
+        "stop-big",
+        &payload,
+        [("small first", None), ("small last", None)],
+    )
+    .await;
+
+    assert_eq!(
+        restored.len(),
+        2,
+        "entries restored individually: {restored:?}"
+    );
+    let head = &restored[0];
+    assert!(head.content.starts_with("small first"));
+    assert!(head.persisted);
+    assert!(head.prepend_content.is_none());
+    let tail = &restored[1];
+    assert!(tail.content.starts_with("small last"));
+    assert!(
+        tail.persisted,
+        "last entry keeps its durable row: only the prepend changed"
+    );
+    assert_eq!(
+        tail.prepend_content.as_deref(),
+        Some(super::context_size_requeue_marker(payload.chars().count()).as_str()),
+        "the oversized redelivery becomes the marker"
+    );
+
+    assert!(
+        !retry_text.contains("OVERSIZED-PAYLOAD-TOKEN"),
+        "{retry_text:?}"
+    );
+    let marker_pos = retry_text
+        .find("[Queued message of")
+        .expect("marker in retry prompt");
+    let first_pos = retry_text.find("small first").expect("head entry in retry");
+    let last_pos = retry_text.find("small last").expect("tail entry in retry");
+    assert!(
+        marker_pos < first_pos && first_pos < last_pos,
+        "marker, then the siblings in order: {retry_text:?}"
+    );
+    assert_eq!(
+        user_rows_containing(&messages, "small first"),
+        1,
+        "{messages:?}"
+    );
+    assert_eq!(user_rows_containing(&messages, "small last"), 1);
+    assert_eq!(
+        user_rows_containing(&messages, "OVERSIZED-PAYLOAD-TOKEN"),
+        1
+    );
+}
+
+/// The consumed stop redelivery rides the LAST flushed entry so the retry
+/// rebuilds the failed turn's aggregate prepend order: entry prepends in
+/// entry order, then the stop redelivery. Both flushed entries carry their
+/// own prepend here; attaching the redelivery to the head would reorder it
+/// ahead of the second entry's prepend on the retry.
+#[tokio::test]
+async fn context_size_flush_requeue_keeps_stop_redelivery_prepend_order() {
+    let StopRedeliveryFlush413 {
+        restored,
+        first_text,
+        retry_text,
+        ..
+    } = stop_redelivery_flush_413_retry(
+        "stop-order",
+        "stopped before output",
+        [
+            ("first body", Some("first own prepend")),
+            ("second body", Some("second own prepend")),
+        ],
+    )
+    .await;
+
+    assert_eq!(restored.len(), 2, "{restored:?}");
+    assert_eq!(
+        restored[0].prepend_content.as_deref(),
+        Some("first own prepend"),
+        "head keeps only its own prepend"
+    );
+    assert_eq!(
+        restored[1].prepend_content.as_deref(),
+        Some("second own prepend\n\nstopped before output"),
+        "the redelivery follows the last entry's own prepend"
+    );
+
+    let expected = "first own prepend\n\nsecond own prepend\n\nstopped before output";
+    assert!(
+        first_text.contains(expected),
+        "failed flush aggregate order: {first_text:?}"
+    );
+    assert!(
+        retry_text.contains(expected),
+        "retry preserves the aggregate order: {retry_text:?}"
+    );
+    let prepend_section = |text: &str| -> String {
+        let start = text.find("first own prepend").expect("prepend start");
+        let end = text.find("first body").expect("batch start");
+        assert!(start < end, "prepends precede the batch: {text:?}");
+        text[start..end].to_string()
+    };
+    assert_eq!(
+        prepend_section(&retry_text),
+        prepend_section(&first_text),
+        "retry prepend section matches the first attempt"
+    );
+    assert_eq!(
+        retry_text.matches("stopped before output").count(),
+        1,
+        "{retry_text:?}"
+    );
+    let body_first = retry_text.find("first body").unwrap();
+    let body_second = retry_text.find("second body").unwrap();
+    assert!(body_first < body_second, "{retry_text:?}");
+}
+
 /// Wire surface (monorepo#1022): the terminal `agent:failed` +
 /// `agent:stream:end` pair carries the failed turn's `turnId` when present,
 /// and omits the key entirely when absent (never `null`).
@@ -5619,7 +6617,15 @@ async fn terminal_failure_events_carry_turn_id() {
     seed_agent(&mgr, &ws, &id).await;
 
     let mut sub = bus.subscribe(SubscriptionFilter::default());
-    super::publish_terminal_failure_events(&mgr, &id, &ws, "boom", Some("turn-tfe-1")).await;
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        "boom",
+        Some("turn-tfe-1"),
+        super::FailedProviderSource::CommittedTurn,
+    )
+    .await;
 
     let mut events = Vec::new();
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
@@ -5639,7 +6645,15 @@ async fn terminal_failure_events_carry_turn_id() {
 
     // Omit-when-absent: a None turn id leaves both payloads without the key.
     let mut sub = bus.subscribe(SubscriptionFilter::default());
-    super::publish_terminal_failure_events(&mgr, &id, &ws, "boom2", None).await;
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        "boom2",
+        None,
+        super::FailedProviderSource::CommittedTurn,
+    )
+    .await;
     let mut events = Vec::new();
     while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
         events.extend(batch);
@@ -5655,6 +6669,141 @@ async fn terminal_failure_events_carry_turn_id() {
             ev.data
         );
     }
+}
+
+/// Collect the `agent:failed` payload the terminal publisher emits for one
+/// quota-classified failure under the given provider source.
+async fn quota_failed_payload(
+    mgr: &AgentManager,
+    bus: &EventBus,
+    ws: &WorkspaceId,
+    id: &AgentId,
+    source: super::FailedProviderSource,
+) -> Value {
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    super::publish_terminal_failure_events(
+        mgr,
+        id,
+        ws,
+        "session/new failed: rate_limit_error: usage limit reached",
+        None,
+        source,
+    )
+    .await;
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    events
+        .iter()
+        .find(|e| e.event_type == "agent:failed")
+        .expect("agent:failed event")
+        .data
+        .clone()
+}
+
+/// A quota failure's `providerId` comes from the source matching the step
+/// that failed. The seeded state is the one an `agent.setModel` switch
+/// leaves behind until the new child is up: `last_turn_provider` still names
+/// the PREVIOUS provider. A failed TURN (`CommittedTurn`) is correctly
+/// attributed to it; a failed spawn / session setup (`SpawnAttempt`) must name
+/// the provider the attempt resolved instead, consume that record so it can
+/// never label a later unrelated failure, and — when no attempt was recorded
+/// — omit the field rather than fall back to the stale turn identity.
+#[tokio::test]
+async fn quota_failure_provider_follows_failed_step() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-qfp"), AgentId::from("a-qfp"));
+    seed_agent(&mgr, &ws, &id).await;
+    mgr.services
+        .store
+        .set_agent_session_last_turn_model(&ws, &id, None, "auggie")
+        .await
+        .expect("seed previous provider as last_turn_provider");
+
+    let turn = quota_failed_payload(
+        &mgr,
+        &bus,
+        &ws,
+        &id,
+        super::FailedProviderSource::CommittedTurn,
+    )
+    .await;
+    assert_eq!(turn["errorCode"], json!("quota-exceeded"));
+    assert_eq!(turn["providerId"], json!("auggie"), "{turn}");
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    let spawn = quota_failed_payload(
+        &mgr,
+        &bus,
+        &ws,
+        &id,
+        super::FailedProviderSource::SpawnAttempt,
+    )
+    .await;
+    assert_eq!(spawn["errorCode"], json!("quota-exceeded"));
+    assert_eq!(spawn["providerId"], json!("mock"), "{spawn}");
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "the attempt record is consumed by the publisher"
+    );
+
+    let unrecorded = quota_failed_payload(
+        &mgr,
+        &bus,
+        &ws,
+        &id,
+        super::FailedProviderSource::SpawnAttempt,
+    )
+    .await;
+    assert_eq!(unrecorded["errorCode"], json!("quota-exceeded"));
+    assert!(
+        unrecorded.get("providerId").is_none(),
+        "no attempt record: omit rather than stamp the stale turn provider: {unrecorded}"
+    );
+}
+
+/// No spawn-attempt record outlives its attempt: a spawn failure that is NOT
+/// a quota rejection still consumes it (the publisher runs once per failed
+/// attempt, quota or not), and a teardown that cancels an in-flight attempt
+/// (`stop` / `workspace.delete` → `detach`) drops it — so an agent that is
+/// never retried does not retain a per-agent entry.
+#[tokio::test]
+async fn spawn_attempt_provider_never_outlives_its_attempt() {
+    let (_tmp, mgr, _bus) = manager_with_bus().await;
+    let (ws, id) = (WorkspaceId::from("ws-sap"), AgentId::from("a-sap"));
+    seed_agent(&mgr, &ws, &id).await;
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    super::publish_terminal_failure_events(
+        &mgr,
+        &id,
+        &ws,
+        "session/new failed: internal error",
+        None,
+        super::FailedProviderSource::SpawnAttempt,
+    )
+    .await;
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "a non-quota spawn failure consumes the attempt record"
+    );
+
+    mgr.spawn_attempt_provider
+        .lock()
+        .unwrap()
+        .insert(id.clone(), "mock".to_string());
+    mgr.stop(&id).await;
+    assert!(
+        !mgr.spawn_attempt_provider.lock().unwrap().contains_key(&id),
+        "teardown drops the record of a cancelled attempt"
+    );
 }
 
 /// Durable-before-observable (monorepo#2009): the terminal-failure handlers
@@ -5854,6 +7003,7 @@ async fn drain_emits_queue_processing_with_turn_id() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -6322,7 +7472,7 @@ async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
     // so they're immediately ready to send.
     let _ = mgr
         .services
-        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None)
+        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None, None)
         .await
         .expect("queue");
 
@@ -7751,13 +8901,13 @@ async fn send_queued_message_now_delivers_entry_and_preserves_rest_of_queue() {
     let _agent = track_mock_agent(&mgr, &id, false);
     let first = mgr
         .services
-        .agent_queue_message_op(id.clone(), "first queued".into(), None, None)
+        .agent_queue_message_op(id.clone(), "first queued".into(), None, None, None)
         .await
         .expect("queue first");
     let first_id = first["queuedMessage"]["id"].as_str().unwrap().to_string();
     let second = mgr
         .services
-        .agent_queue_message_op(id.clone(), "second queued".into(), None, None)
+        .agent_queue_message_op(id.clone(), "second queued".into(), None, None, None)
         .await
         .expect("queue second");
     let second_id = second["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -7802,7 +8952,7 @@ async fn send_queued_message_now_not_found_has_no_side_effects() {
     let (ws, id) = (WorkspaceId::from("ws-1"), AgentId::from("a-sqmn-missing"));
     seed_agent(&mgr, &ws, &id).await;
     mgr.services
-        .agent_queue_message_op(id.clone(), "still queued".into(), None, None)
+        .agent_queue_message_op(id.clone(), "still queued".into(), None, None, None)
         .await
         .expect("queue");
 
@@ -7858,7 +9008,7 @@ async fn send_queued_message_now_preempts_busy_turn_without_kill() {
         .unwrap();
     let queued = mgr
         .services
-        .agent_queue_message_op(id.clone(), "urgent queued".into(), None, None)
+        .agent_queue_message_op(id.clone(), "urgent queued".into(), None, None, None)
         .await
         .expect("queue");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -7898,13 +9048,13 @@ async fn send_queued_message_now_restores_entry_when_slot_unavailable() {
     assert!(mgr.try_begin(&id, &ws).await);
     let other = mgr
         .services
-        .agent_queue_message_op(id.clone(), "ahead".into(), None, None)
+        .agent_queue_message_op(id.clone(), "ahead".into(), None, None, None)
         .await
         .expect("queue other");
     let other_id = other["queuedMessage"]["id"].as_str().unwrap().to_string();
     let queued = mgr
         .services
-        .agent_queue_message_op(id.clone(), "send me now".into(), None, None)
+        .agent_queue_message_op(id.clone(), "send me now".into(), None, None, None)
         .await
         .expect("queue target");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -7938,7 +9088,7 @@ async fn send_queued_message_now_persist_failure_requeues_front() {
     seed_agent(&mgr, &ws, &id).await;
     let queued = mgr
         .services
-        .agent_queue_message_op(id.clone(), "doomed append".into(), None, None)
+        .agent_queue_message_op(id.clone(), "doomed append".into(), None, None, None)
         .await
         .expect("queue");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -7982,7 +9132,7 @@ async fn send_queued_message_now_leaves_entry_queued_when_quarantined() {
     seed_agent(&mgr, &ws, &id).await;
     let queued = mgr
         .services
-        .agent_queue_message_op(id.clone(), "parked".into(), None, None)
+        .agent_queue_message_op(id.clone(), "parked".into(), None, None, None)
         .await
         .expect("queue");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -8040,7 +9190,7 @@ async fn send_queued_message_now_annotates_stale_redrive() {
     let _agent = track_mock_agent(&mgr, &id, false);
     let queued = mgr
         .services
-        .agent_queue_message_op(id.clone(), "queued before report".into(), None, None)
+        .agent_queue_message_op(id.clone(), "queued before report".into(), None, None, None)
         .await
         .expect("queue");
     let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -8668,25 +9818,17 @@ async fn interrupt_send_during_turn_startup_queues_keep_alive() {
 // --- SP-B: spawn `agent_type` derived from the specialist's `agentType` -------
 
 /// Self-cleaning temp directory for hermetic specialist-file fixtures.
-struct TempSpecialistsDir(PathBuf);
+struct TempSpecialistsDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
 impl TempSpecialistsDir {
     fn new() -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("intentd-spb-specialists-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("create specialists dir");
-        Self(dir)
+        let guard = test_tempdir("intentd-spb-specialists-");
+        Self(guard.path().to_path_buf(), guard)
     }
 
     /// Write `<id>.md` with the given raw markdown-with-frontmatter content.
     fn write(&self, id: &str, content: &str) {
         std::fs::write(self.0.join(format!("{id}.md")), content).expect("write specialist file");
-    }
-}
-
-impl Drop for TempSpecialistsDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -9269,6 +10411,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -9488,7 +10631,7 @@ async fn archive_workspace_parks_queue_until_unarchive() {
     // `agent_queue_message_op` is a no-op while the slot is held).
     assert!(mgr.try_begin(&id, &ws).await);
     mgr.services
-        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None)
+        .agent_queue_message_op(id.clone(), "follow-up".into(), None, None, None)
         .await
         .expect("queue message");
     assert_eq!(services.queue_snapshot(&id).len(), 1, "message queued");
@@ -10236,8 +11379,16 @@ async fn try_drain_queue_no_op_when_already_busy() {
     let mgr = Arc::new(mgr);
     let (ws, id) = (WorkspaceId::from("ws-drain"), AgentId::from("a-drain"));
     // Queue a ready message so the only barrier is the busy flag.
-    mgr.services
-        .enqueue_message(&id, "queued".to_string(), None, None, None, None, false);
+    mgr.services.enqueue_message(
+        &id,
+        "queued".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     assert!(mgr.try_begin(&id, &ws).await);
 
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -10279,8 +11430,16 @@ async fn try_drain_queue_skips_agent_parked_in_error() {
         .await
         .expect("park session in error");
     // A ready-to-send message is waiting (the terminal-failure requeue).
-    mgr.services
-        .enqueue_message(&id, "requeued".to_string(), None, None, None, None, false);
+    mgr.services.enqueue_message(
+        &id,
+        "requeued".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
 
     mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
 
@@ -11249,8 +12408,16 @@ async fn failed_drain_persist_is_reattempted_by_retry_drain() {
 
     // Queue an unpersisted message, then hide the transcript table so the
     // drain's pre-turn `persist_user` append fails.
-    mgr.services
-        .enqueue_message(&id, "boom".to_string(), None, None, None, None, false);
+    mgr.services.enqueue_message(
+        &id,
+        "boom".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
         .execute(mgr.services.store.write_pool())
         .await
@@ -11433,8 +12600,16 @@ async fn drain_against_vanished_session_drops_queue() {
     );
     seed_agent(&mgr, &ws, &id).await;
 
-    mgr.services
-        .enqueue_message(&id, "wedged".to_string(), None, None, None, None, false);
+    mgr.services.enqueue_message(
+        &id,
+        "wedged".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     mgr.services
         .store
         .delete_agent_session(&ws, &id)
@@ -11672,8 +12847,9 @@ async fn flush_persist_failure_for_vanished_session_drops_whole_batch() {
         child_agent_id: None,
     };
     let batch = vec![entry("head", true), entry("tail", false)];
+    let draining = mgr.services.mark_draining(&id, &batch);
 
-    let prep = super::prepare_flush_turn(&mgr, &id, &ws, batch).await;
+    let prep = super::prepare_flush_turn(&mgr, &id, &ws, batch, draining).await;
     assert!(
         matches!(prep, super::FlushPrep::Parked),
         "vanished-session flush parks instead of starting a turn"
@@ -11726,9 +12902,16 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     let mut sub = bus.subscribe(SubscriptionFilter::default());
     // Queue an unpersisted message, then hide the transcript table so every
     // pre-turn `persist_user` attempt (initial + bounded retries) fails.
-    let (enqueued, _) =
-        mgr.services
-            .enqueue_message(&id, "boom".to_string(), None, None, None, None, false);
+    let (enqueued, _) = mgr.services.enqueue_message(
+        &id,
+        "boom".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
         .execute(mgr.services.store.write_pool())
         .await
@@ -11896,8 +13079,16 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
         .await
         .expect("set mock provider");
 
-    mgr.services
-        .enqueue_message(&id, "blip".to_string(), None, None, None, None, false);
+    mgr.services.enqueue_message(
+        &id,
+        "blip".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        MessageOrigin::Automatic,
+    );
     sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
         .execute(mgr.services.store.write_pool())
         .await
@@ -11964,7 +13155,8 @@ async fn transient_drain_persist_blip_self_heals_via_bounded_retry() {
 #[tokio::test]
 async fn pre_output_transport_failure_redrives_silently_once() {
     let script = mock_agent_script();
-    let attempt_file = std::env::temp_dir().join(format!("itd-764-once-{}", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir("itd-764-once-");
+    let attempt_file = scratch.path().join("attempts");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     let behavior = json!({
         "exitDuringPromptAttempts": 1,
@@ -12056,7 +13248,6 @@ async fn pre_output_transport_failure_redrives_silently_once() {
         messages.iter().any(|m| m.role == "assistant"),
         "the redriven turn completed with assistant output: {messages:?}"
     );
-    let _ = std::fs::remove_file(&attempt_file);
 }
 
 /// End-to-end auth-required prompt failure (intent-hq/intent#3941): a real
@@ -12231,7 +13422,8 @@ async fn worker_driven_streaming_failure_records_streak_exactly_once() {
 #[tokio::test]
 async fn second_pre_output_transport_failure_takes_terminal_path() {
     let script = mock_agent_script();
-    let attempt_file = std::env::temp_dir().join(format!("itd-764-twice-{}", uuid::Uuid::new_v4()));
+    let scratch = test_tempdir("itd-764-twice-");
+    let attempt_file = scratch.path().join("attempts");
     let attempt_file_s = attempt_file.to_string_lossy().into_owned();
     let behavior = json!({
         "exitDuringPromptAttempts": 2,
@@ -12310,7 +13502,6 @@ async fn second_pre_output_transport_failure_takes_terminal_path() {
         stop_reason.contains("transport closed before output"),
         "stop_reason names the transport failure: {stop_reason}"
     );
-    let _ = std::fs::remove_file(&attempt_file);
 }
 
 /// Warn-and-continue: a prompt idle timeout injects a persisted user-role
@@ -12364,6 +13555,7 @@ async fn idle_timeout_injects_warning_and_redrives() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
 
     // The warning redrive + queued drain complete: the agent settles idle.
@@ -12808,6 +14000,7 @@ async fn queue_dequeue_round_trip_preserves_image_and_file_blocks() {
         None,
         None,
         false,
+        MessageOrigin::Automatic,
     );
     let drained = mgr
         .services
@@ -13012,8 +14205,8 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.provider = Some("auggie".to_string());
-    let ws_dir = std::env::temp_dir().join(format!("intentd-rs-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&ws_dir).unwrap();
+    let ws_guard = test_tempdir("intentd-rs-");
+    let ws_dir = ws_guard.path().to_path_buf();
     let mut workspace = intent_core::Workspace {
         id: WorkspaceId::from("ws-rs"),
         title: "WS".to_string(),
@@ -13052,6 +14245,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -13065,7 +14259,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
 
     // Switch to a non-existent path → fall back to temp.
     workspace.path = Some(
-        std::env::temp_dir()
+        std::env::temp_dir() // tmp-hygiene: allow — never created
             .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
             .display()
             .to_string(),
@@ -13073,8 +14267,6 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
     let resolved =
         resolve_spawn(&session, Some(&workspace), &settings, None).expect("falls back to temp");
     assert_eq!(resolved.cwd, std::env::temp_dir());
-
-    let _ = std::fs::remove_dir_all(&ws_dir);
 }
 
 /// The chief workspace (no worktree on disk) spawns in the dedicated
@@ -13089,13 +14281,14 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
     let chief = intent_core::chief_workspace();
 
     // Fresh (not-yet-created) chief cwd root → created on demand and used.
-    let data_dir = std::env::temp_dir().join(format!("intentd-chief-{}", uuid::Uuid::new_v4()));
+    let data_guard = test_tempdir("intentd-chief-");
+    let data_dir = data_guard.path().to_path_buf();
     let chief_root = intent_core::chief_cwd_root(&data_dir);
     assert!(!chief_root.exists(), "fresh data dir: root must not exist");
     let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&chief_root))
         .expect("chief resolves");
     assert_eq!(resolved.cwd, chief_root);
-    assert_ne!(resolved.cwd, PathBuf::from("/tmp"), "never /tmp");
+    assert_ne!(resolved.cwd, PathBuf::from("/tmp"), "never /tmp"); // tmp-hygiene: allow (literal)
     assert!(chief_root.is_dir(), "chief cwd created on demand");
     let entries = std::fs::read_dir(&chief_root).unwrap().count();
     assert_eq!(entries, 0, "dedicated chief cwd is empty");
@@ -13118,8 +14311,6 @@ async fn resolve_spawn_chief_uses_dedicated_cwd() {
     let resolved = resolve_spawn(&session, Some(&chief), &settings, Some(&blocked_root))
         .expect("chief resolves despite blocked root");
     assert_eq!(resolved.cwd, std::env::temp_dir());
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }
 
 /// A workspace with only `repository_path` on disk (an `isNewRepo`
@@ -13130,8 +14321,8 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     let settings = intent_core::settings_file::SettingsFile::default();
     let mut session = session_with_specialist(None);
     session.provider = Some("auggie".to_string());
-    let repo_dir = std::env::temp_dir().join(format!("intentd-rs-repo-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&repo_dir).unwrap();
+    let repo_guard = test_tempdir("intentd-rs-repo-");
+    let repo_dir = repo_guard.path().to_path_buf();
     let mut workspace = intent_core::Workspace {
         id: WorkspaceId::from("ws-repo-fb"),
         title: "WS".to_string(),
@@ -13170,6 +14361,7 @@ async fn resolve_spawn_falls_back_to_repository_path() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: Some(intent_core::CheckoutMode::Direct),
@@ -13183,8 +14375,8 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     assert_ne!(resolved.cwd, std::env::temp_dir(), "never the temp dir");
 
     // `worktree_path` still wins over `repository_path` when both exist.
-    let wt_dir = std::env::temp_dir().join(format!("intentd-rs-wt-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&wt_dir).unwrap();
+    let wt_guard = test_tempdir("intentd-rs-wt-");
+    let wt_dir = wt_guard.path().to_path_buf();
     workspace.worktree_path = Some(wt_dir.display().to_string());
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("worktree_path still wins");
@@ -13193,7 +14385,7 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     // A stale (non-directory) `path` must not suppress a live candidate
     // further down the chain — each entry is `is_dir()`-checked individually.
     workspace.path = Some(
-        std::env::temp_dir()
+        std::env::temp_dir() // tmp-hygiene: allow — never created
             .join(format!("intentd-stale-path-{}", uuid::Uuid::new_v4()))
             .display()
             .to_string(),
@@ -13206,7 +14398,7 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     // A missing repository_path directory falls through to the temp dir.
     workspace.worktree_path = None;
     workspace.repository_path = Some(
-        std::env::temp_dir()
+        std::env::temp_dir() // tmp-hygiene: allow — never created
             .join(format!("intentd-missing-{}", uuid::Uuid::new_v4()))
             .display()
             .to_string(),
@@ -13214,9 +14406,6 @@ async fn resolve_spawn_falls_back_to_repository_path() {
     let resolved =
         resolve_spawn(&session, Some(&workspace), &settings, None).expect("falls back to temp");
     assert_eq!(resolved.cwd, std::env::temp_dir());
-
-    let _ = std::fs::remove_dir_all(&repo_dir);
-    let _ = std::fs::remove_dir_all(&wt_dir);
 }
 
 // --- Prompt block shape helpers ----------------------------------------------
@@ -13570,6 +14759,7 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -13885,7 +15075,8 @@ fn text_prompt_produces_one_acp_text_content_block() {
 /// the workspace path and returns its declared `agentType`.
 #[tokio::test]
 async fn derive_agent_type_uses_workspace_project_specialists_dir() {
-    let ws_dir = std::env::temp_dir().join(format!("intentd-dat-{}", uuid::Uuid::new_v4()));
+    let ws_guard = test_tempdir("intentd-dat-");
+    let ws_dir = ws_guard.path().to_path_buf();
     let specialists_dir = ws_dir.join(".intent/specialists");
     std::fs::create_dir_all(&specialists_dir).unwrap();
     std::fs::write(
@@ -13939,6 +15130,7 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -13981,8 +15173,6 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         derive_is_orchestrator(&services, &orch_session, Some(&repo_only)),
         "derive_is_orchestrator must fall back to repositoryPath"
     );
-
-    let _ = std::fs::remove_dir_all(&ws_dir);
 }
 
 // --- Context references → stdinContext builder (Fidelity B) ---------------
@@ -14948,8 +16138,16 @@ mod stale_redrive_tests {
         // Enqueue FIRST, then persist the report: queued_at < report_ts, the
         // exact incident ordering (message queued while the reporting turn
         // was still in flight).
-        mgr.services
-            .enqueue_message(&id, "stale wake".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "stale wake".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
         set_delegated_report(&mgr, &ws, &id, &now_iso()).await;
 
@@ -15027,6 +16225,7 @@ mod stale_redrive_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
         let mut entry = mgr
             .services
@@ -15306,7 +16505,7 @@ mod dequeue_wait_tests {
         let _agent = track_mock_agent(&mgr, &id, false);
         let queued = mgr
             .services
-            .agent_queue_message_op(id.clone(), "queued work".into(), None, None)
+            .agent_queue_message_op(id.clone(), "queued work".into(), None, None, None)
             .await
             .expect("queue");
         let entry_id = queued["queuedMessage"]["id"].as_str().unwrap().to_string();
@@ -15670,6 +16869,657 @@ mod flush_batch_id_tests {
                 .is_some(),
             "the batch's fresh entries are still stamped"
         );
+    }
+}
+
+/// Drain identity link (intent-hq/intentd#1783): [`super::stamp_queued_message_id`]
+/// stamps `queueInfo.queuedMessageId` = the entry's own id on every drained
+/// entry, threshold-independent, alongside the wait/batch stamps, always
+/// naming the entry delivering NOW, and skipping `persisted: true` requeues.
+#[cfg(test)]
+mod queued_message_id_stamp_tests {
+    use super::dequeue_wait_tests::{iso_secs_ago, queued_msg};
+    use super::*;
+
+    #[test]
+    fn sub_threshold_entry_gets_identity_link_only() {
+        let mut msg = queued_msg("instant hop", &intent_core::now_iso(), false);
+        super::super::annotate_dequeue_wait(&mut msg);
+        assert_eq!(msg.message_metadata, None, "precondition: no wait stamp");
+        super::super::stamp_queued_message_id(&mut msg);
+        assert_eq!(
+            msg.message_metadata,
+            Some(json!({ "queueInfo": { "queuedMessageId": "qm-wait-test" } })),
+            "queueInfo carries ONLY the identity link"
+        );
+    }
+
+    #[test]
+    fn identity_link_rides_alongside_wait_and_batch_stamps() {
+        let mut entries = vec![
+            queued_msg("first", &iso_secs_ago(60), false),
+            queued_msg("second", &iso_secs_ago(60), false),
+        ];
+        entries[1].id = "qm-second".to_string();
+        for e in &mut entries {
+            super::super::annotate_dequeue_wait(e);
+            super::super::stamp_queued_message_id(e);
+        }
+        super::super::stamp_flush_batch_id(&mut entries);
+        for (e, expected) in entries.iter().zip(["qm-wait-test", "qm-second"]) {
+            let info = &e.message_metadata.as_ref().unwrap()["queueInfo"];
+            assert_eq!(
+                info["queuedMessageId"], expected,
+                "each row names its own entry: {info}"
+            );
+            assert!(
+                info["queuedAt"].as_str().is_some(),
+                "wait stamp kept: {info}"
+            );
+            assert!(
+                info["waitedMs"].as_u64().is_some(),
+                "wait stamp kept: {info}"
+            );
+            assert!(
+                info["batchId"].as_str().is_some(),
+                "batch stamp added: {info}"
+            );
+        }
+    }
+
+    #[test]
+    fn caller_metadata_is_preserved_next_to_the_link() {
+        let mut msg = queued_msg("answer", &intent_core::now_iso(), false);
+        msg.message_metadata = Some(json!({
+            "type": "question_answers",
+            "answeredQuestionsMessageId": "msg-asked",
+        }));
+        super::super::stamp_queued_message_id(&mut msg);
+        assert_eq!(
+            msg.message_metadata,
+            Some(json!({
+                "type": "question_answers",
+                "answeredQuestionsMessageId": "msg-asked",
+                "queueInfo": { "queuedMessageId": "qm-wait-test" },
+            })),
+            "caller keys untouched, queueInfo added"
+        );
+    }
+
+    #[test]
+    fn link_always_names_the_delivering_entry() {
+        // A requeue re-drained under a fresh entry id re-links to that id —
+        // unlike the wait/batch stamps, this one overwrites.
+        let mut msg = queued_msg("retried", &iso_secs_ago(60), false);
+        msg.id = "qm-fresh".to_string();
+        msg.message_metadata = Some(json!({
+            "queueInfo": { "queuedAt": "2026-01-01T00:00:00Z", "waitedMs": 42, "queuedMessageId": "qm-old" }
+        }));
+        super::super::stamp_queued_message_id(&mut msg);
+        let info = &msg.message_metadata.as_ref().unwrap()["queueInfo"];
+        assert_eq!(info["queuedMessageId"], "qm-fresh");
+        assert_eq!(info["queuedAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(info["waitedMs"], 42);
+    }
+
+    #[test]
+    fn persisted_requeue_is_never_stamped() {
+        let mut msg = queued_msg("already durable", &iso_secs_ago(60), true);
+        super::super::stamp_queued_message_id(&mut msg);
+        assert_eq!(
+            msg.message_metadata, None,
+            "persisted rows are never rewritten"
+        );
+    }
+
+    /// `queueInfo` is daemon-reserved: a non-object value (or a non-object
+    /// `messageMetadata`, which the wire path rejects anyway) is replaced so
+    /// the drained row still names its entry — no carve-out.
+    #[test]
+    fn non_object_queue_info_is_replaced_by_the_link() {
+        let mut msg = queued_msg("odd", &iso_secs_ago(60), false);
+        msg.message_metadata = Some(json!("not-an-object"));
+        super::super::stamp_queued_message_id(&mut msg);
+        assert_eq!(
+            msg.message_metadata,
+            Some(json!({ "queueInfo": { "queuedMessageId": "qm-wait-test" } }))
+        );
+        for odd in [json!(7), Value::Null, json!("x"), json!([1])] {
+            let mut msg = queued_msg("odd", &iso_secs_ago(60), false);
+            msg.message_metadata = Some(json!({ "keep": true, "queueInfo": odd }));
+            super::super::stamp_queued_message_id(&mut msg);
+            assert_eq!(
+                msg.message_metadata,
+                Some(json!({
+                    "keep": true,
+                    "queueInfo": { "queuedMessageId": "qm-wait-test" },
+                })),
+                "caller keys kept, reserved queueInfo replaced"
+            );
+        }
+    }
+}
+
+/// §6.5 drain-ordering barrier under concurrency (intent-hq/intentd#1783
+/// review): a drained entry stays in EVERY client-visible queue snapshot —
+/// including the `agent:queue:updated` an UNRELATED mutation publishes while
+/// the drain arm is suspended between dequeue and its user-row persist — and
+/// is retired exactly once, on both the settled and the rollback paths.
+#[cfg(test)]
+mod draining_overlay_tests {
+    use super::*;
+    use intent_core::events::{AGENT_MESSAGE, AGENT_QUEUE_UPDATED};
+
+    fn ids(snapshot: &[Value]) -> Vec<String> {
+        snapshot
+            .iter()
+            .map(|m| m["id"].as_str().expect("entry id").to_string())
+            .collect()
+    }
+
+    fn lists(queue: &Value, id: &str) -> bool {
+        queue
+            .as_array()
+            .expect("queue array")
+            .iter()
+            .any(|m| m["id"] == json!(id))
+    }
+
+    async fn drain_bus(sub: &mut crate::events::Subscription) -> Vec<intent_core::Event> {
+        let mut events = Vec::new();
+        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+            events.extend(batch);
+        }
+        events
+    }
+
+    /// The unrelated mutation's own publish: the write-through +
+    /// `agent:queue:updated` choke point every enqueue / edit / remove flows
+    /// through (`publish_queue_updated_for`). Called explicitly because the
+    /// hidden transcript table that parks the drain also blinds the
+    /// session-lookup variant the ops use (the session read joins it).
+    async fn publish_mutation(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+        mgr.services.publish_queue_updated_for(id, ws).await;
+    }
+
+    /// Block until the drain arm has actually popped `message_id` out of the
+    /// live queue into the draining overlay — i.e. it is parked between
+    /// dequeue and its user-row persist. Synchronizing on the registry rather
+    /// than a fixed sleep matters: if the arm has not reached its dequeue yet
+    /// when the test enqueues a second entry, the batch-flush path pops BOTH
+    /// entries into one combined turn and the test's edit of the second entry
+    /// fails with "Queued message not found".
+    async fn wait_until_draining(mgr: &AgentManager, id: &AgentId, message_id: &str) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let parked = mgr
+                    .services
+                    .draining_queue_entries
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .is_some_and(|d| d.iter().any(|m| m.id == message_id));
+                if parked {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the drain arm pops the entry into the draining overlay");
+    }
+
+    /// Stale-snapshot regression (intent-hq/intentd#1783 re-review): a
+    /// publisher that captured its queue BEFORE suspending on the
+    /// write-through persist must not emit that pre-enqueue snapshot after
+    /// resuming. Interleaving: P starts publishing against [B] and parks on
+    /// the persist gate (held by the test); A is then enqueued and popped
+    /// into the draining overlay (row persist pending, guard alive); the gate
+    /// is released and P completes. P's `agent:queue:updated` must list A —
+    /// the snapshot is read at publish time, inside the publish gate, not at
+    /// call time.
+    #[tokio::test]
+    async fn publisher_suspended_across_persist_never_emits_a_pre_enqueue_snapshot() {
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-stale-publish"),
+            AgentId::from("a-stale-publish"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        let (b, _) = mgr.services.enqueue_message(
+            &id,
+            "entry B".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+
+        let persist_gate = mgr.services.agent_queue_persist_gate.clone();
+        let held = persist_gate.lock().await;
+        let publisher = tokio::spawn({
+            let (mgr, ws, id) = (mgr.clone(), ws.clone(), id.clone());
+            async move { mgr.services.publish_queue_updated_for(&id, &ws).await }
+        });
+        // Let P run up to the persist gate and park there (current-thread
+        // runtime: the spawned task only progresses while this task yields).
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!publisher.is_finished(), "P is parked on the persist gate");
+
+        let (a, _) = mgr.services.enqueue_message(
+            &id,
+            "entry A".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        let (_, guard) = mgr
+            .services
+            .take_queued_message_draining(&id, &a.id)
+            .expect("A pops into the draining overlay");
+        drop(held);
+        publisher.await.expect("publisher task");
+
+        let events = drain_bus(&mut sub).await;
+        let queue_events: Vec<&intent_core::Event> = events
+            .iter()
+            .filter(|e| e.event_type == AGENT_QUEUE_UPDATED)
+            .collect();
+        assert_eq!(queue_events.len(), 1, "exactly P's publish: {events:?}");
+        let queue = &queue_events[0].data["queue"];
+        assert!(
+            lists(queue, &a.id) && lists(queue, &b.id),
+            "P's snapshot is read at publish time: it lists the entry that \
+             was enqueued and started draining while P was suspended: {queue}"
+        );
+        drop(guard);
+    }
+
+    /// Overlay semantics in isolation: the popped entry heads the snapshot
+    /// while its guard lives; unrelated enqueue / edit / remove keep it
+    /// listed; a hand-back (same id) or a failure requeue (new id, same
+    /// `turnId`) lists it ONCE; dropping the guard retires it.
+    #[tokio::test]
+    async fn draining_guard_keeps_entry_listed_until_dropped() {
+        let (_tmp, mgr) = manager().await;
+        let id = AgentId::from("a-overlay");
+        let enqueue = |text: &str| {
+            mgr.services
+                .enqueue_message(
+                    &id,
+                    text.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    MessageOrigin::Automatic,
+                )
+                .0
+        };
+        let (a, b) = (enqueue("A"), enqueue("B"));
+
+        let (popped, guard) = mgr.services.dequeue_message_draining(&id).expect("A pops");
+        assert_eq!(popped.id, a.id);
+        assert!(
+            mgr.services.take_queued_message(&id, &a.id).is_none(),
+            "the live queue no longer holds A"
+        );
+        let snap = mgr.services.queue_snapshot(&id);
+        assert_eq!(ids(&snap), vec![a.id.clone(), b.id.clone()]);
+        assert_eq!(snap[0]["position"], json!(0));
+        assert_eq!(snap[1]["position"], json!(1));
+
+        // Unrelated mutations while A drains keep A at the head.
+        let c = enqueue("C");
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec![a.id.clone(), b.id.clone(), c.id.clone()]
+        );
+        mgr.services
+            .agent_edit_queued_message_op(id.clone(), b.id.clone(), "B edited".into(), None)
+            .await
+            .expect("edit B");
+        mgr.services
+            .agent_remove_queued_message_op(id.clone(), c.id.clone())
+            .await
+            .expect("remove C");
+        let snap = mgr.services.queue_snapshot(&id);
+        assert_eq!(ids(&snap), vec![a.id.clone(), b.id.clone()]);
+        assert_eq!(snap[1]["content"], json!("B edited"));
+
+        // Hand-back with the guard alive: listed once, from the live queue.
+        mgr.services.requeue_front(&id, popped.clone());
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec![a.id.clone(), b.id.clone()]
+        );
+        mgr.services
+            .take_queued_message(&id, &a.id)
+            .expect("A taken back out");
+
+        // Failure requeue (new id, same turn id): listed once, no original.
+        let mut retry = popped.clone();
+        retry.id = "qm-a-retry".to_string();
+        retry.requeued_after_failure = true;
+        mgr.services.requeue_front(&id, retry);
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec!["qm-a-retry".to_string(), b.id.clone()]
+        );
+        mgr.services
+            .take_queued_message(&id, "qm-a-retry")
+            .expect("retry entry taken back out");
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec![a.id.clone(), b.id.clone()],
+            "overlay copy shows again once the live copy is gone"
+        );
+
+        drop(guard);
+        assert_eq!(ids(&mgr.services.queue_snapshot(&id)), vec![b.id.clone()]);
+    }
+
+    /// A merged guard (single popped entry folded into a batch flush behind
+    /// it) retires every covered entry in one drop.
+    #[tokio::test]
+    async fn merged_guard_retires_all_covered_entries() {
+        let (_tmp, mgr) = manager().await;
+        let id = AgentId::from("a-overlay-merge");
+        for text in ["A", "B", "C"] {
+            mgr.services.enqueue_message(
+                &id,
+                text.to_string(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                MessageOrigin::Automatic,
+            );
+        }
+        let (_, mut guard) = mgr.services.dequeue_message_draining(&id).expect("A pops");
+        let (batch, extra) = mgr
+            .services
+            .dequeue_ready_batch_draining(&id, false, 1)
+            .expect("B and C pop");
+        assert_eq!(batch.len(), 2);
+        guard.merge(extra);
+        assert_eq!(
+            mgr.services.queue_snapshot(&id).len(),
+            3,
+            "all three listed"
+        );
+        drop(guard);
+        assert!(mgr.services.queue_snapshot(&id).is_empty(), "no ghosts");
+    }
+
+    /// Real drain arm, settled path: A is parked between dequeue and its row
+    /// persist (hidden transcript table, one 2s-backoff retry). Unrelated
+    /// enqueue / edit / enqueue / remove run in that window — each publishes
+    /// its own `agent:queue:updated`, every one of which still lists A at the
+    /// head. The first snapshot WITHOUT A is published only after A's user-row
+    /// `agent:message` echo.
+    #[tokio::test]
+    async fn unrelated_mutations_mid_drain_never_publish_a_snapshot_without_the_entry() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_PERSIST_RETRY_BACKOFF_MS", "2000"),
+        ]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-drain-barrier"),
+            AgentId::from("a-drain-barrier"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let (a, _) = mgr.services.enqueue_message(
+            &id,
+            "entry A".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("hide agent_message table");
+        let drain = tokio::spawn(mgr.clone().try_drain_queue(id.clone(), ws.clone()));
+        wait_until_draining(&mgr, &id, &a.id).await;
+
+        // A is dequeued; its persist attempt fails against the hidden table
+        // and the arm suspends in the retry backoff. Mutate the queue around it.
+        let (b, _) = mgr.services.enqueue_message(
+            &id,
+            "entry B".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        publish_mutation(&mgr, &ws, &id).await;
+        mgr.services
+            .agent_edit_queued_message_op(id.clone(), b.id.clone(), "entry B edited".into(), None)
+            .await
+            .expect("edit B");
+        publish_mutation(&mgr, &ws, &id).await;
+        let (c, _) = mgr.services.enqueue_message(
+            &id,
+            "entry C".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        publish_mutation(&mgr, &ws, &id).await;
+        mgr.services
+            .agent_remove_queued_message_op(id.clone(), c.id.clone())
+            .await
+            .expect("remove C");
+        publish_mutation(&mgr, &ws, &id).await;
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec![a.id.clone(), b.id.clone()],
+            "the getQueue view lists the in-flight entry at the head"
+        );
+
+        sqlx::query("ALTER TABLE agent_message_broken RENAME TO agent_message")
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("restore agent_message table");
+        drain.await.expect("drain task");
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+                if session.status == AgentStatus::RuntimeIdle
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                    && mgr.services.queue_snapshot(&id).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both entries drain and the agent goes idle");
+
+        let events = drain_bus(&mut sub).await;
+        let row_idx = events
+            .iter()
+            .position(|e| e.event_type == AGENT_MESSAGE && e.data["queuedMessageId"] == json!(a.id))
+            .expect("A's user-row echo carries the identity link");
+        let before: Vec<&intent_core::Event> = events[..row_idx]
+            .iter()
+            .filter(|e| e.event_type == AGENT_QUEUE_UPDATED)
+            .collect();
+        assert!(
+            before.len() >= 4,
+            "enqueue B / edit B / enqueue C / remove C each published mid-drain: {}",
+            before.len()
+        );
+        for e in &before {
+            assert_eq!(
+                e.data["queue"][0]["id"],
+                json!(a.id),
+                "a mid-drain snapshot lists the draining entry at the head: {}",
+                e.data
+            );
+        }
+        let first_without_a = events
+            .iter()
+            .position(|e| e.event_type == AGENT_QUEUE_UPDATED && !lists(&e.data["queue"], &a.id))
+            .expect("the settled snapshot without A");
+        assert!(
+            first_without_a > row_idx,
+            "the first snapshot without A ({first_without_a}) follows its row echo ({row_idx})"
+        );
+        assert_eq!(
+            events[first_without_a].data["queue"][0]["content"],
+            json!("entry B edited"),
+            "the settled snapshot carries the unrelated edit, nothing lost"
+        );
+    }
+
+    /// Real drain arm, rollback path: the persist exhausts its retry while B
+    /// was enqueued mid-drain. No snapshot ever omits A (by id before the
+    /// rollback, by `turnId` after — the requeue mints a new id), the restored
+    /// queue is [A' (requeuedAfterFailure), B], and no ghost copy of the
+    /// original id survives the arm.
+    #[tokio::test]
+    async fn failed_drain_persist_rolls_back_without_flashing_or_ghosting() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_PERSIST_RETRY_BACKOFF_MS", "1500"),
+        ]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-drain-rollback"),
+            AgentId::from("a-drain-rollback"),
+        );
+        seed_agent(&mgr, &ws, &id).await;
+        let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        session.provider = Some("mock".to_string());
+        mgr.services
+            .store
+            .update_agent_session(&ws, &session)
+            .await
+            .expect("set mock provider");
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+        let (a, _) = mgr.services.enqueue_message(
+            &id,
+            "entry A".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("hide agent_message table");
+        let drain = tokio::spawn(mgr.clone().try_drain_queue(id.clone(), ws.clone()));
+        wait_until_draining(&mgr, &id, &a.id).await;
+
+        let (b, _) = mgr.services.enqueue_message(
+            &id,
+            "entry B".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        publish_mutation(&mgr, &ws, &id).await;
+        assert_eq!(
+            ids(&mgr.services.queue_snapshot(&id)),
+            vec![a.id.clone(), b.id.clone()]
+        );
+
+        drain.await.expect("drain task");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let status = mgr
+                    .services
+                    .store
+                    .get_agent_session_status(&id)
+                    .await
+                    .unwrap();
+                if status == AgentStatus::Error
+                    && !mgr.is_busy(&id)
+                    && mgr.workers.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("drain parks the session in error");
+        sqlx::query("ALTER TABLE agent_message_broken RENAME TO agent_message")
+            .execute(mgr.services.store.write_pool())
+            .await
+            .expect("restore agent_message table");
+
+        let snap = mgr.services.queue_snapshot(&id);
+        assert_eq!(snap.len(), 2, "restored queue, no ghost: {snap:?}");
+        assert_eq!(snap[0]["turnId"], json!(a.turn_id));
+        assert_eq!(snap[0]["requeuedAfterFailure"], json!(true));
+        assert_ne!(snap[0]["id"], json!(a.id), "the requeue minted a new id");
+        assert_eq!(snap[1]["id"], json!(b.id));
+
+        let events = drain_bus(&mut sub).await;
+        let queue_events: Vec<&intent_core::Event> = events
+            .iter()
+            .filter(|e| e.event_type == AGENT_QUEUE_UPDATED)
+            .collect();
+        assert!(
+            queue_events.len() >= 2,
+            "the mid-drain enqueue and the rollback each published: {}",
+            queue_events.len()
+        );
+        for e in &queue_events {
+            let queue = e.data["queue"].as_array().expect("queue array");
+            assert!(
+                queue
+                    .iter()
+                    .any(|m| m["id"] == json!(a.id) || m["turnId"] == json!(a.turn_id)),
+                "no snapshot ever omits the draining entry: {}",
+                e.data
+            );
+        }
     }
 }
 
@@ -16587,6 +18437,7 @@ mod harness_wake_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
         assert!(mgr.services.has_ready_to_send(&id));
 
@@ -17171,8 +19022,16 @@ mod pending_questions_no_gate {
         let mgr = Arc::new(mgr);
         let (ws, id) = mock_agent(&mgr, "ws-pq-drain", "a-pq-drain").await;
 
-        mgr.services
-            .enqueue_message(&id, "parked".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "parked".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         let asked = mark_pending(&mgr, &ws, &id).await;
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -17418,8 +19277,8 @@ mod archived_flush_gates {
     #[tokio::test]
     async fn parked_archive_wake_rides_the_unarchiving_user_turn() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-ua-flush-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-ua-flush-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -17515,7 +19374,6 @@ mod archived_flush_gates {
         // ONE combined provider turn whose prompt carries the wake, the
         // user message, and the trailing one-shot unarchive notice.
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(prompts.len(), 1, "one combined turn: {prompts:?}");
         let text = &prompts[0];
         let w = text
@@ -17702,8 +19560,16 @@ mod archived_flush_gates {
         archive_row(&mgr, &ws).await;
 
         // Automatic entries alone stay parked.
-        mgr.services
-            .enqueue_message(&id, "auto wake".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "auto wake".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         assert!(!mgr.is_busy(&id), "automatic-only queue stays parked");
         assert_eq!(mgr.services.queue_snapshot(&id).len(), 1);
@@ -17713,7 +19579,7 @@ mod archived_flush_gates {
         // A user-origin entry queued INTO the archived workspace (at or
         // after `archivedAt`) exempts the gate: the next kick drains
         // everything and unarchives.
-        mgr.services.enqueue_message_with_origin(
+        mgr.services.enqueue_message(
             &id,
             "user follow-up".to_string(),
             None,
@@ -17721,7 +19587,7 @@ mod archived_flush_gates {
             None,
             None,
             false,
-            true,
+            MessageOrigin::User,
         );
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         await_settled(&mgr, &id).await;
@@ -17749,7 +19615,7 @@ mod archived_flush_gates {
         seed_mock_agent(&mgr, &ws, &id).await;
 
         // A user message parked by the busy race BEFORE the archive.
-        mgr.services.enqueue_message_with_origin(
+        mgr.services.enqueue_message(
             &id,
             "pre-archival user leftover".to_string(),
             None,
@@ -17757,7 +19623,7 @@ mod archived_flush_gates {
             None,
             None,
             false,
-            true,
+            MessageOrigin::User,
         );
         // Ensure `queuedAt` strictly precedes `archivedAt` even at coarse
         // clock resolution.
@@ -18007,7 +19873,7 @@ mod attention_request_clear_gates {
             origin: MessageOrigin::User,
             ..TurnOptions::default()
         };
-        mgr.services.enqueue_message_with_origin(
+        mgr.services.enqueue_message(
             &id,
             "parked user answer".to_string(),
             None,
@@ -18015,7 +19881,7 @@ mod attention_request_clear_gates {
             None,
             opts.queued_prepend(),
             opts.interrupt_priority,
-            opts.origin.is_user(),
+            opts.origin,
         );
         let mut sub = bus.subscribe(SubscriptionFilter::default());
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -18024,6 +19890,43 @@ mod attention_request_clear_gates {
         assert!(
             saw_cleared_event(&mut sub).await,
             "drained user-origin entry emits attentionRequestCleared"
+        );
+        let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+        assert_eq!(session.attention_request_kind, None);
+        assert_eq!(session.attention_request_reason, None);
+        assert_eq!(session.attention_request_timestamp, None);
+    }
+
+    /// A reply the FE parks behind a busy turn goes through
+    /// `agent.queueMessage`, not `agent.sendMessage`. The op must enqueue the
+    /// entry user-origin so its drain clears the request on a TOP-LEVEL
+    /// FOREGROUND agent exactly like an idle-agent reply does.
+    #[tokio::test]
+    async fn drained_queue_message_op_entry_clears_attention_request() {
+        let script = mock_agent_script();
+        let _env = EnvGuard::set_all(&[
+            ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
+            ("INTENTD_SPAWN_RETRY_BACKOFF_MS", "10,20"),
+        ]);
+        let (_tmp, mgr, bus) = manager_with_bus().await;
+        let mgr = Arc::new(mgr);
+        let (ws, id) = (
+            WorkspaceId::from("ws-attn-drain-queue-op"),
+            AgentId::from("a-attn-drain-queue-op"),
+        );
+        seed_with_pending_request(&mgr, &ws, &id).await;
+
+        mgr.services
+            .agent_queue_message_op(id.clone(), "queued user reply".into(), None, None, None)
+            .await
+            .expect("queue user reply");
+        let mut sub = bus.subscribe(SubscriptionFilter::default());
+        mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
+        await_worker_idle(&mgr, &id).await;
+
+        assert!(
+            saw_cleared_event(&mut sub).await,
+            "drained agent.queueMessage entry emits attentionRequestCleared"
         );
         let session = mgr.services.store.get_agent_session(&id).await.unwrap();
         assert_eq!(session.attention_request_kind, None);
@@ -18056,6 +19959,7 @@ mod attention_request_clear_gates {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
         let mut sub = bus.subscribe(SubscriptionFilter::default());
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -18279,8 +20183,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn drain_flushes_two_ready_entries_into_one_combined_turn() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-flush-on-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-flush-on-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -18302,6 +20206,7 @@ mod flush_queued_messages_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
         mgr.services.enqueue_message(
             &id,
@@ -18311,6 +20216,7 @@ mod flush_queued_messages_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -18330,7 +20236,6 @@ mod flush_queued_messages_tests {
 
         // ONE provider turn carrying the combined prompt.
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(prompts.len(), 1, "one combined turn: {prompts:?}");
         let text = &prompts[0];
         assert!(
@@ -18377,8 +20282,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn setting_off_keeps_one_turn_per_message() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-flush-off-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-flush-off-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -18415,6 +20320,7 @@ mod flush_queued_messages_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
         mgr.services.enqueue_message(
             &id,
@@ -18424,6 +20330,7 @@ mod flush_queued_messages_tests {
             None,
             None,
             false,
+            MessageOrigin::Automatic,
         );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
@@ -18442,7 +20349,6 @@ mod flush_queued_messages_tests {
         .expect("both turns complete");
 
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(
             prompts.len(),
             2,
@@ -18463,8 +20369,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn system_only_batches_system_entries_and_leaves_user_entry_for_solo_fifo_drain() {
         let script = mock_agent_script();
-        let prompt_log =
-            std::env::temp_dir().join(format!("itd-flush-systemonly-{}.log", uuid::Uuid::new_v4()));
+        let scratch = test_tempdir("itd-flush-systemonly-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -18496,9 +20402,17 @@ mod flush_queued_messages_tests {
         );
         seed_mock_agent(&mgr, &ws, &id).await;
 
-        mgr.services
-            .enqueue_message(&id, "sys-1".to_string(), None, None, None, None, false);
-        mgr.services.enqueue_message_with_origin(
+        mgr.services.enqueue_message(
+            &id,
+            "sys-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        mgr.services.enqueue_message(
             &id,
             "user-1".to_string(),
             None,
@@ -18506,10 +20420,18 @@ mod flush_queued_messages_tests {
             None,
             None,
             false,
-            true,
+            MessageOrigin::User,
         );
-        mgr.services
-            .enqueue_message(&id, "sys-2".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "sys-2".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         timeout(Duration::from_secs(15), async {
@@ -18527,7 +20449,6 @@ mod flush_queued_messages_tests {
         .expect("both the combined system turn and the solo user turn complete");
 
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(
             prompts.len(),
             2,
@@ -18558,10 +20479,8 @@ mod flush_queued_messages_tests {
     #[tokio::test]
     async fn system_only_single_system_entry_drains_solo() {
         let script = mock_agent_script();
-        let prompt_log = std::env::temp_dir().join(format!(
-            "itd-flush-systemonly-solo-{}.log",
-            uuid::Uuid::new_v4()
-        ));
+        let scratch = test_tempdir("itd-flush-systemonly-solo-");
+        let prompt_log = scratch.path().join("prompts.log");
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
         let _env = EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
@@ -18592,8 +20511,16 @@ mod flush_queued_messages_tests {
         );
         seed_mock_agent(&mgr, &ws, &id).await;
 
-        mgr.services
-            .enqueue_message(&id, "sys-only".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "sys-only".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
 
         mgr.clone().try_drain_queue(id.clone(), ws.clone()).await;
         timeout(Duration::from_secs(15), async {
@@ -18611,7 +20538,6 @@ mod flush_queued_messages_tests {
         .expect("solo turn completes");
 
         let prompts = read_prompt_log(&prompt_log);
-        let _ = std::fs::remove_file(&prompt_log);
         assert_eq!(prompts.len(), 1, "single solo turn: {prompts:?}");
         assert!(
             !prompts[0].contains("queued messages while you were working"),
@@ -18638,10 +20564,26 @@ mod flush_queued_messages_tests {
         );
         seed_mock_agent(&mgr, &ws, &id).await;
 
-        mgr.services
-            .enqueue_message(&id, "boom-1".to_string(), None, None, None, None, false);
-        mgr.services
-            .enqueue_message(&id, "boom-2".to_string(), None, None, None, None, false);
+        mgr.services.enqueue_message(
+            &id,
+            "boom-1".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
+        mgr.services.enqueue_message(
+            &id,
+            "boom-2".to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            MessageOrigin::Automatic,
+        );
         sqlx::query("ALTER TABLE agent_message RENAME TO agent_message_broken")
             .execute(mgr.services.store.write_pool())
             .await
@@ -18923,5 +20865,271 @@ mod session_model_tests {
             AgentManager::session_model_effort(codex, Some("grok:foo[low]"), None),
             None
         );
+    }
+}
+
+/// Enqueue-origin table (intent-hq/intentd#1790): every queue-producing front
+/// door records the `MessageOrigin` its caller carries, so a user reply that
+/// parks behind a busy turn still clears the pending attention request (and
+/// keeps the archived-workspace exemption) when it drains. The agent's turn
+/// slot is held for the whole table so each front door falls into its
+/// queue-fallback path, and the recorded `QueuedMessage.user_origin` is read
+/// straight off the in-memory queue (it is neither persisted nor on the wire).
+///
+/// One row per front door — adding a queue-producing entry point means adding
+/// a row here. `agent.editAndRegenerate` has no row: it is not a queue
+/// producer (it stops the in-flight turn, then routes through `send_message`
+/// with `origin = User`).
+mod enqueue_origin_table {
+    use super::*;
+    use intent_core::{MessageOrigin, NoteCreate, NoteId, WorkspaceApi};
+
+    #[derive(Debug, Clone, Copy)]
+    enum FrontDoor {
+        /// FE `agent.sendMessage` (`WorkspaceApi::agent_send_message`,
+        /// `MessageOrigin::User`).
+        FeSendMessage,
+        /// MCP `ws.agent.send` → the same trait method with
+        /// `MessageOrigin::Automatic`.
+        McpSendMessage,
+        /// `agent.queueMessage` (a user-typed queue entry).
+        QueueMessage,
+        /// `agent.sendToTask` (agent-to-agent, task note with an assignee).
+        SendToTask,
+        /// `agent.sendQueuedMessageNow` losing the slot race: the dequeued
+        /// entry is restored at the front as user-origin.
+        SendQueuedMessageNow,
+        /// Wake / hook / system notice (`deliver_wake_message`).
+        WakeNotice,
+    }
+
+    struct Row {
+        method: &'static str,
+        door: FrontDoor,
+        expect_user: bool,
+    }
+
+    const ROWS: &[Row] = &[
+        Row {
+            method: "agent.sendMessage (FE)",
+            door: FrontDoor::FeSendMessage,
+            expect_user: true,
+        },
+        Row {
+            method: "agent.sendMessage (MCP)",
+            door: FrontDoor::McpSendMessage,
+            expect_user: false,
+        },
+        Row {
+            method: "agent.queueMessage",
+            door: FrontDoor::QueueMessage,
+            expect_user: true,
+        },
+        Row {
+            method: "agent.sendToTask",
+            door: FrontDoor::SendToTask,
+            expect_user: false,
+        },
+        Row {
+            method: "agent.sendQueuedMessageNow (slot held)",
+            door: FrontDoor::SendQueuedMessageNow,
+            expect_user: true,
+        },
+        Row {
+            method: "wake / hook notice (deliver_wake_message)",
+            door: FrontDoor::WakeNotice,
+            expect_user: false,
+        },
+    ];
+
+    const CONTENT: &str = "origin probe";
+
+    /// `assign_agent` validates the `agent-{uuid}` shape, so every row uses
+    /// a well-formed id.
+    fn agent_id(index: usize) -> AgentId {
+        AgentId::from(format!("agent-17900000-0000-4000-8000-{index:012}").as_str())
+    }
+
+    async fn seed_assigned_task(services: &Services, ws: &WorkspaceId, id: &AgentId) -> NoteId {
+        let note = services
+            .create_note(
+                ws.clone(),
+                NoteCreate {
+                    title: "origin probe task".into(),
+                    content: Some("body".into()),
+                    tags: None,
+                    parent_id: None,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create note")
+            .note;
+        WorkspaceApi::mark_as_task(
+            services,
+            ws.clone(),
+            note.id.clone(),
+            "not_started".into(),
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("mark as task");
+        services
+            .assign_agent(ws.clone(), note.id.clone(), id.0.clone(), None)
+            .await
+            .expect("assign agent");
+        note.id
+    }
+
+    /// Drive one front door with the slot already held and return the id of
+    /// the queue entry it produced.
+    async fn drive(
+        door: FrontDoor,
+        mgr: &Arc<AgentManager>,
+        ws: &WorkspaceId,
+        id: &AgentId,
+    ) -> String {
+        let svc = &mgr.services;
+        match door {
+            FrontDoor::FeSendMessage | FrontDoor::McpSendMessage => {
+                let origin = match door {
+                    FrontDoor::FeSendMessage => MessageOrigin::User,
+                    _ => MessageOrigin::Automatic,
+                };
+                let r = svc
+                    .agent_send_message(
+                        ws.clone(),
+                        id.clone(),
+                        CONTENT.into(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        origin,
+                    )
+                    .await
+                    .expect("send");
+                assert_eq!(r["queued"], json!(true), "slot held → queue fallback: {r}");
+                r["queuedMessage"]["id"]
+                    .as_str()
+                    .expect("entry id")
+                    .to_string()
+            }
+            FrontDoor::QueueMessage => {
+                let r = svc
+                    .agent_queue_message(id.clone(), CONTENT.into(), None, None, None)
+                    .await
+                    .expect("queue");
+                r["queuedMessage"]["id"]
+                    .as_str()
+                    .expect("entry id")
+                    .to_string()
+            }
+            FrontDoor::SendToTask => {
+                let note_id = seed_assigned_task(svc, ws, id).await;
+                let r = svc
+                    .agent_send_to_task(ws.clone(), note_id, CONTENT.into(), None, None)
+                    .await
+                    .expect("send to task");
+                assert_eq!(r["ok"], json!(true), "{r}");
+                assert_eq!(
+                    r["result"]["queued"],
+                    json!(true),
+                    "slot held → queue fallback: {r}"
+                );
+                r["result"]["queuedMessage"]["id"]
+                    .as_str()
+                    .expect("entry id")
+                    .to_string()
+            }
+            FrontDoor::SendQueuedMessageNow => {
+                let (parked, _) = svc.enqueue_message(
+                    id,
+                    CONTENT.into(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    MessageOrigin::Automatic,
+                );
+                let r = svc
+                    .agent_send_queued_message_now(ws.clone(), id.clone(), parked.id.clone())
+                    .await
+                    .expect("send now");
+                assert_eq!(
+                    r["queued"],
+                    json!(true),
+                    "slot held → restored at front: {r}"
+                );
+                parked.id
+            }
+            FrontDoor::WakeNotice => {
+                let r = svc
+                    .deliver_wake_message(
+                        ws,
+                        id,
+                        CONTENT,
+                        Some(&json!({ "type": "event_notification" })),
+                    )
+                    .await
+                    .expect("wake");
+                assert_eq!(r["queued"], json!(true), "slot held → fast enqueue: {r}");
+                r["queuedMessage"]["id"]
+                    .as_str()
+                    .expect("entry id")
+                    .to_string()
+            }
+        }
+    }
+
+    fn recorded_user_origin(svc: &Services, id: &AgentId, entry_id: &str) -> bool {
+        let guard = svc.agent_queues.lock().unwrap();
+        guard
+            .get(id)
+            .and_then(|queue| queue.iter().find(|m| m.id == entry_id))
+            .unwrap_or_else(|| panic!("entry {entry_id} missing from {id}'s queue"))
+            .user_origin
+    }
+
+    #[tokio::test]
+    async fn every_front_door_records_its_origin() {
+        for (index, row) in ROWS.iter().enumerate() {
+            let (_tmp, mgr) = manager().await;
+            let mgr = Arc::new(mgr);
+            mgr.services.attach_agent_manager(&mgr);
+            let ws = WorkspaceId::from(format!("ws-origin-{index}").as_str());
+            let id = agent_id(index);
+            seed_agent(&mgr, &ws, &id).await;
+            assert!(
+                mgr.try_begin(&id, &ws).await,
+                "hold the slot for {}",
+                row.method
+            );
+
+            let entry_id = drive(row.door, &mgr, &ws, &id).await;
+            assert!(
+                mgr.is_busy(&id),
+                "{}: the held slot must survive the call",
+                row.method
+            );
+            assert_eq!(
+                recorded_user_origin(&mgr.services, &id, &entry_id),
+                row.expect_user,
+                "{}: recorded user_origin should be {} ({:?})",
+                row.method,
+                row.expect_user,
+                row.door
+            );
+        }
     }
 }

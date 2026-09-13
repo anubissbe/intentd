@@ -8,7 +8,19 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{AgentId, ClientId, HookId, NoteId, PrMonitorId, WorkspaceGitRootId, WorkspaceId};
+use crate::repo_ref::RepoRef;
 use crate::settings_file::SandboxType;
+
+/// Builds a [`RepoRef`] from an optional owner/name pair: `Some` only when
+/// both halves are present and non-empty.
+fn repo_ref_from_parts(owner: Option<&str>, name: Option<&str>) -> Option<RepoRef> {
+    match (owner, name) {
+        (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => {
+            Some(RepoRef::new(owner, name))
+        }
+        _ => None,
+    }
+}
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the `PascalCase` variant names (`Active`/`Inactive`/`Archived`/
@@ -173,7 +185,7 @@ pub enum WorkspaceDisplayStatus {
 /// Workspace entity (§9.1).
 // The bool fields mirror the protocol's wire shape; grouping them would
 // change the serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -306,6 +318,12 @@ pub struct Workspace {
     /// Omitted for pre-existing rows created before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_environment: Option<SandboxType>,
+    /// Per-workspace browser-client pin (REV-2): the logical `clientId`
+    /// agent-initiated `browser.exec` requests for this workspace are routed
+    /// to (`workspace.setBrowserClient`). Omitted (not `null`) when unpinned
+    /// — the first-connected eligible client then serves the workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_client_id: Option<ClientId>,
     /// Disk footprint of the daemon-managed workspace directory
     /// (`<workspaces_root>/<workspaceId>`: repo checkout, tool-outputs, agent
     /// sandboxes, everything). Never populated on `workspace.list` /
@@ -341,6 +359,19 @@ impl Workspace {
         .into_iter()
         .flatten()
         .find(|p| !p.is_empty())
+    }
+
+    /// The workspace's forge repository as a case-insensitive [`RepoRef`]
+    /// (`repositoryOwner` / `repositoryName`). Compare and key on this rather
+    /// than the raw fields: two workspaces whose slugs differ only in ASCII
+    /// case name the same repository. `None` when either half is missing or
+    /// empty.
+    #[must_use]
+    pub fn repo(&self) -> Option<RepoRef> {
+        repo_ref_from_parts(
+            self.repository_owner.as_deref(),
+            self.repository_name.as_deref(),
+        )
     }
 }
 
@@ -441,6 +472,7 @@ pub fn chief_workspace() -> Workspace {
         waiting: false,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         checkout_mode: None,
         execution_environment: None,
         disk_usage: None,
@@ -539,7 +571,7 @@ pub struct ContextUsage {
 }
 
 // serde's `skip_serializing_if` requires a `fn(&T) -> bool` signature.
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &u64) -> bool {
     *value == 0
 }
@@ -852,6 +884,12 @@ pub struct WorkspaceAgentInfo {
     pub is_responding: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_agent_id: Option<AgentId>,
+    /// The session's persisted `is_background` flag (the same value served
+    /// as `metadata.isBackground` on `agent.list`/`agent.get`, §5.5), so
+    /// clients can gate background agents from the summary alone. Additive
+    /// (monorepo#3789): omitted when `false`, never `false` on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_background: bool,
 }
 
 /// `Workspace.agentSummary` card aggregate. The iOS coverflow reads the richer
@@ -1113,7 +1151,7 @@ pub struct WorkspaceUpdate {
 /// Deserialize a JSON `null` as `Some(None)` (explicit clear) and a missing
 /// field as `None` (no change), so `Option<Option<T>>` on [`WorkspaceUpdate`]
 /// can distinguish the two. A present non-null value maps to `Some(Some(v))`.
-#[allow(clippy::option_option)] // the nesting IS the absent-vs-null distinction
+#[expect(clippy::option_option)] // the nesting IS the absent-vs-null distinction
 fn deserialize_optional_field<'de, T, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Option<T>>, D::Error>
@@ -1555,6 +1593,10 @@ pub struct NoteSetContentResult {
     /// [`TaskConvertBlocksResult::warnings`]).
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// The note's `rev` after the write (post auto-conversion refetch): the
+    /// base a follow-up conditional write should send as `expectedVersion`.
+    #[serde(default)]
+    pub rev: i64,
 }
 
 /// Result of `note.updateMetadata`. Either a normal title/tags update or a
@@ -2820,9 +2862,12 @@ pub(crate) const IS_INITIAL_AGENT_KEY: &str = "isInitialAgent";
 pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
 
 /// Who originated an `agent.sendMessage`-shaped delivery (PROTOCOL §5.5).
-/// `User` marks the FE `agent.sendMessage` RPC — the ONLY user-originated
-/// entry point — which is an explicit user action: it revives an archived
-/// workspace and retires a pending attention request. Everything else (MCP
+/// `User` marks the explicit user-action front doors — the FE
+/// `agent.sendMessage` RPC, a user-typed `agent.queueMessage` entry (the
+/// FE's mid-turn reply path, restored as `User` on drain),
+/// `agent.sendQueuedMessageNow`, and `agent.editAndRegenerate` — each of
+/// which revives an archived workspace and retires a pending attention
+/// request. Everything else (MCP
 /// front-door sends, reportToParent / completion-watch / event-subscription
 /// wakes, `agent.sendToTask`, `agent.wakeOrCreate`, internal continuations)
 /// is `Automatic`: parked in the queue while the target's workspace is
@@ -2833,7 +2878,9 @@ pub(crate) const SPONSOR_AGENT_ID_KEY: &str = "sponsorAgentId";
 /// paths fail closed (never mistaken for a user action).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MessageOrigin {
-    /// FE-originated `agent.sendMessage` (typed message or wizard answers).
+    /// FE-originated user action: `agent.sendMessage` (typed message or
+    /// wizard answers), a drained `agent.queueMessage` entry,
+    /// `agent.sendQueuedMessageNow`, or `agent.editAndRegenerate`.
     User,
     /// System/agent-originated delivery.
     #[default]
@@ -2869,7 +2916,7 @@ pub const WORKSPACE_STATUS_MESSAGE_MAX_LENGTH: usize = 500;
 /// (not persisted, §19.2). `provider` is immutable once set on first real use.
 // The bool fields mirror the TS wire shape; grouping them would change the
 // serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
@@ -3322,7 +3369,7 @@ pub struct AgentMetadata {
 /// iOS coverflow reads.
 // The bool fields mirror the TS wire shape; grouping them would change the
 // serialized contract.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLite {
@@ -4029,7 +4076,7 @@ pub struct FileStatus {
 /// The bools mirror the wire contract 1:1 (each an independent flag on the
 /// `git.status` result), so folding them into enums would diverge the model
 /// from the protocol shape.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitStatus {
@@ -4147,15 +4194,20 @@ pub enum ScriptMode {
 }
 
 /// Runtime status of a script process (ported from the TS `ScriptStatus`,
-/// plus `restarting` — new in intentd, monorepo#1318). `restarting` covers the
-/// restart-in-flight window (the auto-restart backoff and the `script.restart`
-/// stop→start gap) so clients can distinguish it from a final exit; the
-/// respawn flips it back to `running`.
+/// plus `restarting` — new in intentd, monorepo#1318 — and `starting` —
+/// intent-hq/intent#4858). `restarting` covers the restart-in-flight window
+/// (the auto-restart backoff and the `script.restart` stop→start gap) so
+/// clients can distinguish it from a final exit; the respawn flips it back to
+/// `running`. `starting` covers the `script.start` launch window: it is set
+/// synchronously before `script.start` replies and holds until the spawn's
+/// `running` (or `exited` on a spawn failure), so a status read after `start`
+/// returns never observes the pre-launch `idle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptStatus {
     #[default]
     Idle,
+    Starting,
     Running,
     Restarting,
     Exited,
@@ -4388,6 +4440,17 @@ pub struct PrMonitor {
     pub updated_at: String,
 }
 
+impl PrMonitor {
+    /// The monitored repository as a case-insensitive [`RepoRef`]
+    /// (`repoOwner` / `repoName`). Compare and key on this rather than the
+    /// raw fields: monitors whose slugs differ only in ASCII case watch the
+    /// same repository.
+    #[must_use]
+    pub fn repo(&self) -> RepoRef {
+        RepoRef::new(self.repo_owner.as_str(), self.repo_name.as_str())
+    }
+}
+
 /// How a [`WorkspaceGitRoot`] came to be tracked. Wire/DB words are the
 /// lowercase variant names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4447,10 +4510,43 @@ pub struct WorkspaceGitRoot {
     pub updated_at: String,
 }
 
+impl WorkspaceGitRoot {
+    /// The root's detected forge repository as a case-insensitive [`RepoRef`]
+    /// (`repoOwner` / `repoName`). Compare and key on this rather than the
+    /// raw fields: roots whose slugs differ only in ASCII case name the same
+    /// repository. `None` when either half is missing or empty.
+    #[must_use]
+    pub fn repo(&self) -> Option<RepoRef> {
+        repo_ref_from_parts(self.repo_owner.as_deref(), self.repo_name.as_deref())
+    }
+}
+
+/// Host identification a client supplies about *its own* device in
+/// `client.hello` (§5.17) — the mirror image of the `hostname` /
+/// `prettyHostname` / `deviceKind` triple the daemon reports about itself in
+/// `host.status` / `server.pairingInfo`, with the same semantics: `hostname`
+/// is the OS hostname, `pretty_hostname` the user-facing device name (macOS
+/// Computer Name) falling back to the hostname, `device_kind` the detected
+/// device category. All optional: clients pre-dating the fields send none.
+/// Persisted on the `client` row and refreshed on every hello.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientHostInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pretty_hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_kind: Option<String>,
+}
+
 /// Logical client record (§9.2, §16). The stable, client-supplied identity that
 /// survives reconnects; persisted to the `client` table with `name`,
-/// `capabilities`, `first_seen`, and `last_seen`. The ephemeral per-connection
-/// id is transport-only and never stored here.
+/// `capabilities`, the [`ClientHostInfo`] triple, `first_seen`, and
+/// `last_seen`. `last_hello_at` is `None` for a row minted only to key an
+/// anonymous connection's drafts (§5.16) — such a client never completed
+/// `client.hello`. The ephemeral per-connection id is transport-only and
+/// never stored here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Client {
@@ -4458,8 +4554,12 @@ pub struct Client {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub capabilities: serde_json::Value,
+    #[serde(flatten)]
+    pub host: ClientHostInfo,
     pub first_seen: String,
     pub last_seen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hello_at: Option<String>,
 }
 
 /// Per-client chat draft (§9.10, §15), keyed by `(workspaceId, agentId,
@@ -4478,6 +4578,239 @@ pub struct Draft {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<serde_json::Value>,
     pub updated_at: String,
+}
+
+/// Visibility of a daemon-owned browser tab (REV-2). `hidden` is an
+/// agent-owned-tab state only; user tabs are always `visible`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserTabVisibility {
+    #[default]
+    Visible,
+    Hidden,
+}
+
+impl BrowserTabVisibility {
+    /// Stored / wire spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BrowserTabVisibility::Visible => "visible",
+            BrowserTabVisibility::Hidden => "hidden",
+        }
+    }
+
+    /// Parse the stored spelling; unknown values fall back to `Visible`.
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "hidden" => BrowserTabVisibility::Hidden,
+            _ => BrowserTabVisibility::Visible,
+        }
+    }
+}
+
+/// Emulated viewport of a browser tab (`{ width, height }`, CSS pixels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserTabSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Daemon-owned logical browser tab (REV-2 Model 2). Persisted to the
+/// `browser_tab` table; the daemon is the shared source of truth for every
+/// connected client. `host_client_id` is the logical client whose process owns
+/// the live webview — CDP-backed actions run there and it reports canonical
+/// `url` / `title`; every other client is a viewer. `tab_id` is minted by the
+/// host and unique per daemon. Panel geometry is client-local and never
+/// stored.
+///
+/// `displayed` is the host-reported **layout fact** of the hidden-by-default
+/// contract (§5.9, monorepo#3045): `true` when the tab is not hidden AND is
+/// the active tab of the panel holding it in the workspace's saved layout.
+/// `None` means the host has never reported it (a pre-`displayed` host, or
+/// no report yet since the daemon started — see the store's process-local
+/// overlay); it is never `false` by default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTab {
+    pub tab_id: String,
+    pub workspace_id: WorkspaceId,
+    pub host_client_id: ClientId,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_name: Option<String>,
+    #[serde(default)]
+    pub visibility: BrowserTabVisibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emulated_size: Option<BrowserTabSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed: Option<bool>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl BrowserTab {
+    /// Field-wise diff against a host report: every wire field whose value
+    /// differs from the stored row, keyed by wire name and carrying the
+    /// reported value (`null` when cleared). Empty when the report matches —
+    /// the "nothing changed ⇒ no event" test.
+    #[must_use]
+    pub fn changes_from(
+        &self,
+        input: &BrowserTabInput,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut changes = serde_json::Map::new();
+        if self.workspace_id != input.workspace_id {
+            changes.insert(
+                "workspaceId".to_string(),
+                serde_json::Value::String(input.workspace_id.0.clone()),
+            );
+        }
+        if self.url != input.url {
+            changes.insert(
+                "url".to_string(),
+                serde_json::Value::String(input.url.clone()),
+            );
+        }
+        if self.requested_url != input.requested_url {
+            changes.insert(
+                "requestedUrl".to_string(),
+                serde_json::json!(input.requested_url),
+            );
+        }
+        if self.title != input.title {
+            changes.insert("title".to_string(), serde_json::json!(input.title));
+        }
+        if self.owner_agent_id != input.owner_agent_id {
+            changes.insert(
+                "ownerAgentId".to_string(),
+                serde_json::json!(input.owner_agent_id),
+            );
+        }
+        if self.owner_agent_name != input.owner_agent_name {
+            changes.insert(
+                "ownerAgentName".to_string(),
+                serde_json::json!(input.owner_agent_name),
+            );
+        }
+        if self.visibility != input.visibility {
+            changes.insert(
+                "visibility".to_string(),
+                serde_json::json!(input.visibility),
+            );
+        }
+        if self.emulated_size != input.emulated_size {
+            changes.insert(
+                "emulatedSize".to_string(),
+                serde_json::json!(input.emulated_size),
+            );
+        }
+        if self.displayed != input.displayed {
+            changes.insert("displayed".to_string(), serde_json::json!(input.displayed));
+        }
+        changes
+    }
+
+    /// Overwrite the host-reported fields from `input`, leaving the
+    /// daemon-owned host / timestamps untouched.
+    pub fn apply_input(&mut self, input: BrowserTabInput) {
+        let BrowserTabInput {
+            tab_id: _,
+            workspace_id,
+            url,
+            requested_url,
+            title,
+            owner_agent_id,
+            owner_agent_name,
+            visibility,
+            emulated_size,
+            displayed,
+        } = input;
+        self.workspace_id = workspace_id;
+        self.url = url;
+        self.requested_url = requested_url;
+        self.title = title;
+        self.owner_agent_id = owner_agent_id;
+        self.owner_agent_name = owner_agent_name;
+        self.visibility = visibility;
+        self.emulated_size = emulated_size;
+        self.displayed = displayed;
+    }
+}
+
+/// Host-reported tab state: a [`BrowserTab`] minus the daemon-owned fields
+/// (host and timestamps). The `tab` param of `browser.upsertTab` (with
+/// `workspaceId` taken from the envelope) and each entry of the
+/// `browser.syncTabs` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserTabInput {
+    pub tab_id: String,
+    pub workspace_id: WorkspaceId,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_name: Option<String>,
+    #[serde(default)]
+    pub visibility: BrowserTabVisibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emulated_size: Option<BrowserTabSize>,
+    /// Layout fact (see [`BrowserTab::displayed`]); omitted / `null` when
+    /// the host does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displayed: Option<bool>,
+}
+
+/// Outcome of a host-reported `browser.upsertTab`: the persisted row plus
+/// how it changed, so the caller can emit `browser:tab-opened` (new row) or
+/// `browser:tab-updated { changes }` (field-wise diff of the wire fields) — or
+/// nothing when the report matched the stored state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserTabUpsertOutcome {
+    Opened(BrowserTab),
+    Updated {
+        tab: BrowserTab,
+        changes: serde_json::Value,
+    },
+    Unchanged(BrowserTab),
+}
+
+impl BrowserTabUpsertOutcome {
+    /// The persisted row regardless of outcome.
+    #[must_use]
+    pub fn tab(&self) -> &BrowserTab {
+        match self {
+            BrowserTabUpsertOutcome::Opened(tab)
+            | BrowserTabUpsertOutcome::Updated { tab, .. }
+            | BrowserTabUpsertOutcome::Unchanged(tab) => tab,
+        }
+    }
+}
+
+/// Result of a host's `browser.syncTabs` reconciliation (REV-2 Model 6).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrowserTabSyncResult {
+    /// Tab ids the host must drop: closed daemon-side while it was offline,
+    /// or hosted by another client.
+    pub drop: Vec<String>,
+    /// Rows created by the snapshot (⇒ `browser:tab-opened`).
+    pub opened: Vec<BrowserTab>,
+    /// Rows whose wire fields changed (⇒ `browser:tab-updated`).
+    pub updated: Vec<(BrowserTab, serde_json::Value)>,
+    /// Rows of this host absent from the snapshot (⇒ `browser:tab-closed`).
+    pub closed: Vec<BrowserTab>,
 }
 
 /// A persistently-registered repository (parity with the TS `KnownRepo`). Backs
@@ -4532,6 +4865,105 @@ mod tests {
         assert_eq!(ws.effective_path(), Some("/repo"));
         ws.repository_path = Some(String::new());
         assert_eq!(ws.effective_path(), None);
+    }
+
+    /// [`Workspace::repo`]: case-variant `repositoryOwner` / `repositoryName`
+    /// fold to one [`RepoRef`] identity; `None` when either half is missing or
+    /// empty.
+    #[test]
+    fn workspace_repo_folds_case_and_requires_both_halves() {
+        let mut ws = chief_workspace();
+        assert_eq!(ws.repo(), None);
+
+        ws.repository_owner = Some("Intent-HQ".to_string());
+        assert_eq!(ws.repo(), None);
+        ws.repository_name = Some(String::new());
+        assert_eq!(ws.repo(), None);
+
+        ws.repository_name = Some("IntentD".to_string());
+        let upper = ws.repo().expect("both halves present");
+        assert_eq!(upper, RepoRef::new("intent-hq", "intentd"));
+        assert_eq!(upper.owner, "Intent-HQ");
+        assert_eq!(upper.name, "IntentD");
+
+        let mut lower = ws.clone();
+        lower.repository_owner = Some("intent-hq".to_string());
+        lower.repository_name = Some("intentd".to_string());
+        assert_eq!(lower.repo(), ws.repo());
+
+        ws.repository_owner = Some(String::new());
+        assert_eq!(ws.repo(), None);
+        ws.repository_owner = None;
+        assert_eq!(ws.repo(), None);
+    }
+
+    fn git_root_with_repo(owner: Option<&str>, name: Option<&str>) -> WorkspaceGitRoot {
+        WorkspaceGitRoot {
+            id: WorkspaceGitRootId::from("root-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            path: "/repo".to_string(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: owner.map(str::to_string),
+            repo_name: name.map(str::to_string),
+            registered_by_agent_ids: Vec::new(),
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: None,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+        }
+    }
+
+    /// [`WorkspaceGitRoot::repo`]: same contract as [`Workspace::repo`] —
+    /// case-variant slugs are one identity, and a missing or empty half
+    /// yields `None`.
+    #[test]
+    fn workspace_git_root_repo_folds_case_and_requires_both_halves() {
+        assert_eq!(
+            git_root_with_repo(Some("Intent-HQ"), Some("IntentD")).repo(),
+            git_root_with_repo(Some("intent-hq"), Some("intentd")).repo()
+        );
+        assert_eq!(
+            git_root_with_repo(Some("Intent-HQ"), Some("IntentD")).repo(),
+            Some(RepoRef::new("INTENT-HQ", "INTENTD"))
+        );
+        assert_eq!(git_root_with_repo(None, None).repo(), None);
+        assert_eq!(git_root_with_repo(Some("intent-hq"), None).repo(), None);
+        assert_eq!(git_root_with_repo(None, Some("intentd")).repo(), None);
+        assert_eq!(git_root_with_repo(Some(""), Some("intentd")).repo(), None);
+        assert_eq!(git_root_with_repo(Some("intent-hq"), Some("")).repo(), None);
+    }
+
+    /// [`PrMonitor::repo`] equals a case-variant [`RepoRef`] while keeping
+    /// the stored casing on the fields.
+    #[test]
+    fn pr_monitor_repo_equals_case_variant_repo_ref() {
+        let monitor = PrMonitor {
+            monitor_id: PrMonitorId::from("m-1"),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "Intent-HQ".to_string(),
+            repo_name: "IntentD".to_string(),
+            pr_number: 7,
+            state: PrMonitorState::Active,
+            last_snapshot: None,
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+        };
+        let repo = monitor.repo();
+        assert_eq!(repo, RepoRef::new("intent-hq", "intentd"));
+        assert_eq!(repo.identity_key(), "intent-hq/intentd");
+        assert_eq!(repo.owner, "Intent-HQ");
+        assert_eq!(repo.name, "IntentD");
+        assert_ne!(repo, RepoRef::new("other-org", "intentd"));
     }
 
     /// [`note_list_slim_row`] projection (§5.2, monorepo#3573): `content` is
@@ -5210,6 +5642,7 @@ mod tests {
             waiting: false,
             token_usage: None,
             cow_supported: None,
+            browser_client_id: None,
             checkout_mode: None,
             execution_environment: None,
             disk_usage: None,
@@ -5263,6 +5696,7 @@ mod tests {
             is_streaming: false,
             is_responding: false,
             parent_agent_id: Some(AgentId::from("agent-root")),
+            is_background: true,
         };
         let summary = WorkspaceAgentSummary {
             count: 1,
@@ -5298,6 +5732,9 @@ mod tests {
         assert_eq!(v["agents"][0]["isResponding"], false);
         // `parentAgentId` (v2.9): the delegating agent, camelCased on the wire.
         assert_eq!(v["agents"][0]["parentAgentId"], "agent-root");
+        // `isBackground` (monorepo#3789): present only when the session is
+        // background, camelCased on the wire.
+        assert_eq!(v["agents"][0]["isBackground"], true);
         // `agentIds` is emitted alongside `agents` (forward-compat TS parity).
         assert_eq!(v["agentIds"][0], "agent-1");
         assert_eq!(v["agentIds"].as_array().unwrap().len(), 1);
@@ -5713,8 +6150,10 @@ mod tests {
     }
 
     /// `WorkspaceAgentInfo` omits the optional `specialist`/`lastActivity`/
-    /// `parentAgentId` keys when absent (not `null`), while the non-optional
-    /// flags stay present.
+    /// `parentAgentId` keys when absent (not `null`) and the additive
+    /// `isBackground` flag when `false` (monorepo#3789), while the
+    /// non-optional flags stay present; a pre-#3789 payload without the key
+    /// deserializes as foreground.
     #[test]
     fn workspace_agent_info_optionals_absent() {
         let agent = WorkspaceAgentInfo {
@@ -5726,14 +6165,18 @@ mod tests {
             is_streaming: false,
             is_responding: false,
             parent_agent_id: None,
+            is_background: false,
         };
         let v = serde_json::to_value(&agent).unwrap();
         assert!(v.get("specialist").is_none());
         assert!(v.get("lastActivity").is_none());
         assert!(v.get("parentAgentId").is_none());
+        assert!(v.get("isBackground").is_none());
         assert_eq!(v["status"], "pending");
         assert_eq!(v["isStreaming"], false);
         assert_eq!(v["isResponding"], false);
+        let back: WorkspaceAgentInfo = serde_json::from_value(v).unwrap();
+        assert!(!back.is_background);
     }
 
     /// `AgentLite` carries the nested `metadata` object (`isBackground`/

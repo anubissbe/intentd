@@ -113,6 +113,8 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agents.acpNodeMaxOldSpaceMb",
     "agents.idleReapMinutes",
     "agents.reportToParentDebounceSeconds",
+    "agents.historyReplayToolContentChars",
+    "agents.toolPayloadRetentionDays",
     "agents.flushQueuedMessages",
     "agents.resumeInterruptedOnStart",
     "events.streamRetentionHours",
@@ -133,6 +135,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agentFeatures.mcpTools",
     "prMonitor.debounceSeconds",
     "prMonitor.pollSeconds",
+    "prMonitor.hourlyRequestBudget",
 ];
 
 /// Where a key's effective value comes from (lowest to highest precedence).
@@ -977,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
+    #[expect(clippy::float_cmp)] // asserting exact literals round-tripped through config parsing
     fn precedence_is_default_then_file_then_flag() {
         let (_dir, path) = temp_config(Some("[server.wsApi]\nenabled = true\nport = 6000\n"));
         let reg = SettingsRegistry::load(&path).expect("load");

@@ -30,7 +30,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
-use uuid::Uuid;
 
 /// Fixed 64-hex token, adopted by the daemon via the `INTENTD_AUTH_TOKEN` seam.
 const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
@@ -38,6 +37,7 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
     child: Child,
+    _data_dir_guard: tempfile::TempDir,
     data_dir: PathBuf,
 }
 
@@ -45,15 +45,11 @@ impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
 
-fn temp_data_dir() -> PathBuf {
-    let id = Uuid::new_v4().simple().to_string();
-    let dir = PathBuf::from("/tmp").join(format!("itd-wss-host-{}", &id[..8]));
-    std::fs::create_dir_all(&dir).expect("mkdir data dir");
-    dir
+fn temp_data_dir() -> tempfile::TempDir {
+    common::test_tempdir_in("/tmp", "itd-wss-host-")
 }
 
 fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
@@ -225,11 +221,13 @@ where
 /// Boot a daemon with the WSS listener enabled and return the live handle + a pinned WSS
 /// client config plus the bound TCP port (discovered via UDS `system.status`).
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
@@ -364,6 +362,129 @@ async fn host_detection_services_over_wss() {
         !env.to_string().contains(TOKEN),
         "host.env must not leak secret env values"
     );
+}
+
+/// Setup is deliberately unavailable over WSS, even after an app-capability
+/// hello. The real UDS path requires that handshake and owns its operation.
+#[tokio::test]
+async fn antigravity_setup_is_local_app_only_and_connection_owned() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn uds_call(
+        reader: &mut BufReader<UnixStream>,
+        id: i64,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let frame = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        reader
+            .get_mut()
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+        loop {
+            let mut line = String::new();
+            timeout(common::rpc_read_timeout(), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let response: Value = serde_json::from_str(&line).unwrap();
+            if response["id"] == id {
+                return response;
+            }
+        }
+    }
+
+    let (daemon, port, cfg) = boot().await;
+    let mut ws = connect_ws(port, cfg).await;
+    let hello = wss_rpc(
+        &mut ws,
+        1,
+        "client.hello",
+        json!({"capabilities":{"antigravitySetup":1}}),
+    )
+    .await;
+    assert_eq!(hello["server"]["capabilities"]["antigravitySetup"], 1);
+    for (id, method) in (2_i64..).zip([
+        "providers.setup.status",
+        "providers.setup.start",
+        "providers.setup.login",
+        "providers.setup.cancel",
+    ]) {
+        ws.send(Message::Text(
+            json!({"jsonrpc":"2.0","id":id,"method":method,"params":{"providerId":"antigravity"}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let response = wss_expect_error(&mut ws, id).await;
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], id);
+        assert_eq!(response["error"]["code"], -32001);
+        assert_eq!(
+            response["error"]["message"],
+            "Antigravity setup requires an authorized local app connection"
+        );
+        assert!(response.get("result").is_none());
+    }
+    let mut local = BufReader::new(
+        UnixStream::connect(daemon.data_dir.join("intentd.sock"))
+            .await
+            .unwrap(),
+    );
+    let request = json!({"providerId":"antigravity"});
+    let anonymous = uds_call(&mut local, 10, "providers.setup.status", request.clone()).await;
+    assert_eq!(anonymous["error"]["code"], -32001);
+    let hello = uds_call(
+        &mut local,
+        11,
+        "client.hello",
+        json!({"capabilities":{"antigravitySetup":1}}),
+    )
+    .await;
+    assert!(hello.get("error").is_none());
+    let status = uds_call(&mut local, 12, "providers.setup.status", request.clone()).await;
+    assert_eq!(status["result"]["phase"], "idle");
+    assert!(status["result"]["cliDetected"].is_boolean());
+    assert!(status["result"]["runtimeInstalled"].is_boolean());
+    assert!(status["result"]["operationId"].is_null());
+    // A deliberately invalid custom path guarantees no downloads or real ACP
+    // subprocesses, even on a developer host with Antigravity installed.
+    let setting = uds_call(&mut local,13,"settings.update",json!({"changes":[{"path":"providers.paths","value":{"antigravity":daemon.data_dir.join("missing-bridge")}}]})).await;
+    assert!(setting.get("error").is_none(), "{setting}");
+    let started = uds_call(&mut local, 14, "providers.setup.start", request).await;
+    let operation_id = started["result"]["operationId"].as_str().unwrap();
+    let mut other = BufReader::new(
+        UnixStream::connect(daemon.data_dir.join("intentd.sock"))
+            .await
+            .unwrap(),
+    );
+    uds_call(
+        &mut other,
+        15,
+        "client.hello",
+        json!({"capabilities":{"antigravitySetup":1}}),
+    )
+    .await;
+    let params = json!({"providerId":"antigravity","operationId":operation_id});
+    for method in ["providers.setup.login", "providers.setup.cancel"] {
+        let response = uds_call(&mut other, 16, method, params.clone()).await;
+        assert_eq!(response["error"]["code"], -32602);
+    }
+    let cancelled = uds_call(&mut local, 17, "providers.setup.cancel", params.clone()).await;
+    assert_eq!(cancelled["result"]["phase"], "cancelled");
+    let login = uds_call(&mut local, 18, "providers.setup.login", params).await;
+    assert_eq!(login["error"]["code"], -32602);
+    uds_call(&mut local, 19, "client.hello", json!({})).await;
+    let revoked = uds_call(
+        &mut local,
+        20,
+        "providers.setup.status",
+        json!({"providerId":"antigravity"}),
+    )
+    .await;
+    assert_eq!(revoked["error"]["code"], -32001);
 }
 
 /// host.findApp / host.listInstalledEditors over the real WSS wire.
@@ -547,7 +668,8 @@ async fn host_provider_auth_status_over_wss() {
 #[tokio::test]
 async fn host_claude_auth_status_honors_cli_json_and_force_over_wss() {
     use std::os::unix::fs::PermissionsExt;
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let bin_dir = data_dir.join("bin");
     let home_dir = data_dir.join("home");
     std::fs::create_dir_all(&bin_dir).unwrap();
@@ -585,6 +707,7 @@ exit "$code"
     let child = spawn_serve(&data_dir, "both", &env);
     let _daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
     let socket = data_dir.join("intentd.sock");
@@ -741,6 +864,7 @@ async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
         diff_summary: None,
         token_usage: None,
         cow_supported: None,
+        browser_client_id: None,
         display_status: None,
         waiting: false,
         checkout_mode: None,
@@ -785,11 +909,10 @@ where
 #[tokio::test]
 async fn host_exec_over_wss() {
     let (daemon, port, cfg) = boot().await;
-    // Real filesystem root the daemon can `cd` into; kept alive until the
-    // daemon drops (its `Drop` removes the whole data dir; the workspace root
-    // is a sibling temp dir, cleaned up here).
-    let root = std::env::temp_dir().join(format!("itd-wss-exec-root-{}", Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&root).expect("mkdir workspace root");
+    // Real filesystem root the daemon can `cd` into; a sibling temp dir the
+    // guard removes when the test ends.
+    let root_guard = common::test_tempdir("itd-wss-exec-root-");
+    let root = root_guard.path().to_path_buf();
     let ws_id = seed_workspace_with_path(&daemon.data_dir, &root).await;
     let mut ws = connect_ws(port, cfg).await;
 
@@ -918,9 +1041,8 @@ async fn host_exec_over_wss() {
     // symlink cwd keeps working.
     #[cfg(unix)]
     {
-        let outside =
-            std::env::temp_dir().join(format!("itd-wss-exec-outside-{}", Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&outside).expect("mkdir outside dir");
+        let outside_guard = common::test_tempdir("itd-wss-exec-outside-");
+        let outside = outside_guard.path().to_path_buf();
         std::os::unix::fs::symlink(&outside, root.join("escape")).expect("plant escape symlink");
         let frame = json!({
             "jsonrpc": "2.0", "id": 206, "method": "host.exec",
@@ -966,11 +1088,7 @@ async fn host_exec_over_wss() {
             inside_link["exitCode"], 0,
             "in-workspace symlink cwd ⇒ ok: {inside_link}"
         );
-
-        let _ = std::fs::remove_dir_all(&outside);
     }
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Read one `events.event` frame whose `event.type` matches `type_filter` AND
@@ -1418,7 +1536,8 @@ async fn host_exec_stream_acp_handshake_probe_over_wss() {
 /// holding a unique binary; asserts host.findBinary resolves that binary.
 #[tokio::test]
 async fn host_find_binary_uses_login_shell_path() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Create a unique temp dir with a fake binary
     let pid = std::process::id();
@@ -1461,6 +1580,7 @@ async fn host_find_binary_uses_login_shell_path() {
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -1508,11 +1628,13 @@ async fn host_find_binary_uses_login_shell_path() {
 /// WSS e2e for host.providerDiscovery: proves the providers + npx wire envelope.
 #[tokio::test]
 async fn host_provider_discovery_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -1743,7 +1865,8 @@ async fn host_provider_discovery_over_wss() {
 #[cfg(unix)]
 #[tokio::test]
 async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Fake `pi` that reports a version older than PI_CLI_MIN_VERSION.
     let fake_pi = data_dir.join("fake-pi");
@@ -1763,6 +1886,7 @@ async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -1816,7 +1940,8 @@ async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
 /// `secondaryResolvedPath` stay auto-detected (never the override path).
 #[tokio::test]
 async fn host_provider_discovery_honors_path_overrides_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Fake executables the overrides point at — valid (absolute + executable)
     // regardless of what is really installed on the host.
@@ -1848,6 +1973,7 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -1909,7 +2035,8 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
 /// repeat discovery call is idempotent.
 #[tokio::test]
 async fn host_provider_discovery_self_heals_default_provider_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Force one registered provider to report installed regardless of the
     // real host: point its providers.paths override(s) at fake executables.
@@ -1937,6 +2064,7 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -2020,7 +2148,8 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
 /// `path`, and `-32603` when the path collides with an existing file.
 #[tokio::test]
 async fn host_create_directory_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Pin the daemon-host home so the tilde-expansion assertion is exact.
     let home = data_dir.join("home");
@@ -2033,6 +2162,7 @@ async fn host_create_directory_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -2148,7 +2278,8 @@ async fn host_create_directory_over_wss() {
 /// honored for relocated folders.
 #[tokio::test]
 async fn host_list_directory_over_wss() {
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
 
     // Pin the daemon-host home so the favorites assertions are exact:
     // Desktop exists conventionally, Downloads is relocated via the XDG
@@ -2170,6 +2301,7 @@ async fn host_list_directory_over_wss() {
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 
@@ -2231,11 +2363,13 @@ async fn host_list_directory_over_wss() {
 async fn host_discovery_cache_positive_and_negative_over_wss() {
     use std::os::unix::fs::PermissionsExt;
 
-    let data_dir = temp_data_dir();
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
     let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
+        _data_dir_guard: data_dir_guard,
         data_dir: data_dir.clone(),
     };
 

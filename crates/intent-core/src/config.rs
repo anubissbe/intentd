@@ -64,6 +64,30 @@ pub const ACP_NODE_MAX_OLD_SPACE_MB_MAX: u32 = 65_536;
 /// restart required.
 pub const DEFAULT_REPORT_TO_PARENT_DEBOUNCE_SECONDS: u32 = 30;
 
+/// Default per-block character cap (`agents.historyReplayToolContentChars`)
+/// applied to each `tool_use` input and `tool_result` output in the recovery
+/// replay that rebuilds a lost ACP session; longer bodies are middle-truncated.
+/// Read live at replay time — no restart required.
+pub const DEFAULT_HISTORY_REPLAY_TOOL_CONTENT_CHARS: u32 = 4000;
+
+/// Lower bound accepted for `agents.historyReplayToolContentChars`: below
+/// 500 characters a replayed tool block carries too little of the original
+/// call to orient the resumed agent.
+pub const HISTORY_REPLAY_TOOL_CONTENT_CHARS_MIN: u32 = 500;
+
+/// Upper bound accepted for `agents.historyReplayToolContentChars` (100k
+/// characters per block).
+pub const HISTORY_REPLAY_TOOL_CONTENT_CHARS_MAX: u32 = 100_000;
+
+/// Default retention window in days (`agents.toolPayloadRetentionDays`) after
+/// which stored tool payloads are shrunk to the replay-shaped preview; `0`
+/// (the default) disables the sweep and keeps full bodies forever. Read live
+/// at each sweep tick — no restart required.
+pub const DEFAULT_TOOL_PAYLOAD_RETENTION_DAYS: u32 = 0;
+
+/// Upper bound accepted for `agents.toolPayloadRetentionDays` (ten years).
+pub const TOOL_PAYLOAD_RETENTION_DAYS_MAX: u32 = 3650;
+
 /// Default ephemeral-event retention TTL in hours (`events.streamRetentionHours`,
 /// §10.2); `0` disables the retention/compaction sweep entirely. Defaults to 72h
 /// (3 days) so dev/release databases do not grow unboundedly; set to `0` to opt
@@ -110,6 +134,33 @@ pub const DEFAULT_PR_MONITOR_POLL_SECONDS: u64 = 30;
 /// Floor for `prMonitor.pollSeconds` — a tighter interval would hammer the
 /// forge. Sub-minimum values (notably `0`) are clamped up at read time.
 pub const MIN_PR_MONITOR_POLL_SECONDS: u64 = 10;
+
+/// Default for `prMonitor.hourlyRequestBudget` — the forge REST calls per
+/// hour the centralized PR-monitor loop plans to spend across every
+/// monitored PR. This is a **cadence cost model**, not a hard ceiling: the
+/// loop does not count or block requests against it; it derives the per-PR
+/// poll interval from it, costing each distinct-PR poll
+/// `PR_MONITOR_REQUESTS_PER_POLL` (3) steady-state REST calls and stretching
+/// the interval above `pollSeconds` once `distinct PRs × 3 × 3600 / budget`
+/// exceeds it. Actual spend can differ from the model (the 3-call unit is a
+/// single-page estimate — multi-page review lists and degraded-path REST
+/// fallbacks cost more; GraphQL reads ride their own quota); the shared
+/// rate-limit gate is the backstop for genuine quota exhaustion. 1500/h is
+/// ~30% of GitHub's
+/// 5,000/h authenticated core quota, leaving headroom for the PR-refresh
+/// sweep and agents' own `gh` use.
+pub const DEFAULT_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 1500;
+
+/// Floor for `prMonitor.hourlyRequestBudget` (one call per minute). Sub-floor
+/// values (notably `0`, which would divide by zero) are clamped up at read
+/// time.
+pub const MIN_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 60;
+
+/// Ceiling for `prMonitor.hourlyRequestBudget` — GitHub's authenticated core
+/// quota; a larger model would plan more polling than the forge can serve.
+/// Over-ceiling values are clamped down at read time, mirroring the floor
+/// (the settings catalog also rejects them up front).
+pub const MAX_PR_MONITOR_HOURLY_REQUEST_BUDGET: u64 = 5000;
 
 /// Default quiet window a changed PR must observe before its consolidated
 /// wake is delivered (`prMonitor.debounceSeconds`).
