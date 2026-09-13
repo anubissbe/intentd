@@ -35161,25 +35161,51 @@ mod last_activity_events {
                 .expect("raise");
         }
 
-        // Drain all `workspace:attention-changed` events emitted during the burst.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        while timeout(Duration::from_millis(10), sub.recv()).await.is_ok() {}
-
-        // Wait for the debounce window to fire.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Consume the burst's immediate events (`workspace:attention-changed`,
+        // plus any `workspace:displayStatus-changed` a review_required raise
+        // moves) by type until the debounced `workspace:updated` arrives. An
+        // unconditional timed drain raced the debounce timer here: under
+        // package load the window expired while the drain was still consuming,
+        // which discarded the very event asserted below (intent#4886).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut updated: Option<Value> = None;
+        while updated.is_none() {
+            let batch = tokio::time::timeout_at(deadline, sub.recv())
+                .await
+                .expect("workspace:updated delivered")
+                .expect("subscription open");
+            for ev in &batch {
+                let ev = serde_json::to_value(ev).expect("serialize event");
+                if ev["type"] != "workspace:updated" {
+                    continue;
+                }
+                // A second one in the same batch is a coalescing failure.
+                assert!(
+                    updated.is_none(),
+                    "burst coalesced into one workspace:updated, got a second: {ev:?}"
+                );
+                updated = Some(ev);
+            }
+        }
 
         // Should see exactly one workspace:updated { lastActivity }.
-        let ev = recv_one(&mut sub).await;
+        let ev = updated.expect("workspace:updated captured");
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert!(ev["data"]["changes"]["lastActivity"].is_string());
 
-        // No second event (coalesced).
-        assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
-            "burst coalesced into one event"
-        );
+        // No second workspace:updated (coalesced) within a quiet window after
+        // the first. One absolute deadline bounds the whole window, so a
+        // stream of unrelated events cannot keep extending it.
+        let quiet_until = tokio::time::Instant::now() + Duration::from_millis(100);
+        while let Ok(Some(batch)) = tokio::time::timeout_at(quiet_until, sub.recv()).await {
+            for ev in &batch {
+                let ev = serde_json::to_value(ev).expect("serialize event");
+                assert_ne!(
+                    ev["type"], "workspace:updated",
+                    "burst coalesced into one workspace:updated, got a second: {ev:?}"
+                );
+            }
+        }
 
         // The emitted lastActivity matches a fresh workspace.get.
         let ws_after = h.store.get_workspace(&h.ws).await.expect("reload");
