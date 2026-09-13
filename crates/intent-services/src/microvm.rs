@@ -196,7 +196,7 @@ impl From<std::io::Error> for MicrovmError {
 }
 
 /// Non-unix stub of the unix `orchestrator` module: the same public surface
-/// so call sites (agent_manager's microVM spawn path) compile unchanged, but
+/// so call sites (`agent_manager`'s microVM spawn path) compile unchanged, but
 /// every entry point fails with [`MicrovmError::Unsupported`]. The runtime
 /// never reaches this path — `microvm_platform_supported()` is false here,
 /// so `workspace.create` rejects `executionEnvironment: "microvm"` long
@@ -225,6 +225,10 @@ pub mod orchestrator {
     }
 
     /// Always unsupported on non-unix hosts.
+    ///
+    /// # Errors
+    ///
+    /// Always returns `MicrovmError::Unsupported`.
     pub fn resolve_helper_exe() -> Result<PathBuf, MicrovmError> {
         Err(unsupported())
     }
@@ -241,27 +245,59 @@ pub mod orchestrator {
         pub mem_mib: u32,
     }
 
+    /// See the unix module's `auth::RotationWatcher`; carried only so the
+    /// [`MicrovmVm`] field set matches.
+    pub struct RotationWatcher;
+
     /// Stub VM handle: [`MicrovmVm::boot`] always fails, so no instance
     /// exists at runtime on non-unix hosts.
     pub struct MicrovmVm {
+        pub vm_dir: PathBuf,
+        pub rootfs: PathBuf,
+        pub exec_sock: PathBuf,
         pub child: Option<Child>,
+        pub rotation_watcher: Option<RotationWatcher>,
         pub boot_ms: u64,
         pub stop_event: Option<(crate::events::EventBus, WorkspaceId, AgentId)>,
     }
 
     impl MicrovmVm {
+        /// See the unix module; never boots here.
+        ///
+        /// # Errors
+        ///
+        /// Always returns `MicrovmError::Unsupported`.
+        #[expect(clippy::unused_async, reason = "async for call-site parity with unix")]
         pub async fn boot(_spec: &MicrovmSpawnSpec) -> Result<Self, MicrovmError> {
             Err(unsupported())
         }
 
+        /// See the unix module; unreachable without a booted VM.
+        ///
+        /// # Errors
+        ///
+        /// Always returns `MicrovmError::Unsupported`.
+        #[expect(clippy::unused_async, reason = "async for call-site parity with unix")]
         pub async fn guest_setup(&self) -> Result<(), MicrovmError> {
             Err(unsupported())
         }
 
+        /// See the unix module; unreachable without a booted VM.
+        ///
+        /// # Errors
+        ///
+        /// Always returns `MicrovmError::Unsupported`.
+        #[expect(clippy::unused_async, reason = "async for call-site parity with unix")]
         pub async fn stage_mcp_bridge(&self) -> Result<(), MicrovmError> {
             Err(unsupported())
         }
 
+        /// See the unix module; unreachable without a booted VM.
+        ///
+        /// # Errors
+        ///
+        /// Always returns `MicrovmError::Unsupported`.
+        #[expect(clippy::unused_async, reason = "async for call-site parity with unix")]
         pub async fn stage_intent_file(
             &self,
             _name: &str,
@@ -270,6 +306,12 @@ pub mod orchestrator {
             Err(unsupported())
         }
 
+        /// See the unix module; unreachable without a booted VM.
+        ///
+        /// # Errors
+        ///
+        /// Always returns `MicrovmError::Unsupported`.
+        #[expect(clippy::unused_async, reason = "async for call-site parity with unix")]
         pub async fn start_provider(
             &self,
             _argv: &[String],
@@ -285,6 +327,7 @@ pub mod orchestrator {
             Err(unsupported())
         }
 
+        /// See the unix module; the stub child is always `None`.
         pub fn take_child(&mut self) -> Option<Child> {
             self.child.take()
         }
