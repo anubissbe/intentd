@@ -13463,6 +13463,756 @@ async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
     }
 }
 
+/// Names an [`AgentPersistError`](crate::agent_ops::AgentPersistError) for a
+/// failure message. Exhaustive on purpose — no wildcard arm — so the persist
+/// half's error vocabulary is pinned at compile time: adding an
+/// input-rejection variant (or widening the return type back to
+/// [`Error`]) fails this module's build, not just a runtime assertion.
+fn persist_error_text(e: crate::agent_ops::AgentPersistError) -> String {
+    use crate::agent_ops::AgentPersistError;
+    match e {
+        AgentPersistError::Store(msg) => format!("store: {msg}"),
+        AgentPersistError::Internal(msg) => format!("internal: {msg}"),
+        AgentPersistError::Join(e) => format!("join: {e}"),
+    }
+}
+
+/// The plan/persist seam is not re-validated (intentd#1882 gap 1): a plan
+/// built while its provider was enabled and authenticated persists unchanged
+/// after the provider is disabled in settings AND observed not-logged-in
+/// between the two halves — `persist_agent_create` returns `Ok` and the
+/// session row carries the planned `model` / `provider` / `reasoningEffort`.
+/// The same inputs re-planned after the demotion are rejected, proving the
+/// gate would have fired had the persist half consulted it.
+#[tokio::test]
+async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
+    let (_tmp, svc, ws) = setup().await;
+    let now = crate::model_catalog::ModelCatalogCache::now_ms();
+    svc.models_catalog.test_store(
+        "auggie",
+        crate::model_catalog::AUGGIE_CATALOG_VERSION,
+        vec![
+            json!({ "id": "sonnet4.5", "name": "Sonnet 4.5", "provider": "auggie",
+                     "effortLevels": ["low", "high"] }),
+        ],
+        now,
+    );
+    // Plan-time state: auggie enabled (no `providers.enabled` opt-out) and
+    // observed logged-in — not merely cached-unknown.
+    let _auth_reset = AuthVerdictReset("auggie");
+    crate::provider_auth::seed_auth_verdict_for_tests("auggie", Some(true));
+    assert_ne!(
+        svc.effective_settings()
+            .providers
+            .enabled
+            .as_ref()
+            .and_then(|m| m.get("auggie")),
+        Some(&false),
+        "auggie must be enabled at plan time"
+    );
+    let extra = || intent_core::AgentCreateExtra {
+        provider: Some("auggie".into()),
+        reasoning_effort: Some("high".into()),
+        ..Default::default()
+    };
+    let plan = svc
+        .plan_agent_create(
+            "agent.create",
+            ws.clone(),
+            Some("Planned".into()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            extra(),
+            None,
+        )
+        .await
+        .expect("plan while auggie is enabled and authenticated");
+    assert_eq!(plan.model.as_deref(), Some("sonnet4.5"));
+    assert_eq!(plan.provider.as_deref(), Some("auggie"));
+    assert_eq!(plan.reasoning_effort.as_deref(), Some("high"));
+
+    // Demote the planned provider on both create-seam gates between plan and
+    // persist.
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.enabled".into(), json!({ "auggie": false }))])
+        .expect("disable auggie");
+    crate::provider_auth::seed_auth_verdict_for_tests("auggie", Some(false));
+    let replan = svc
+        .plan_agent_create(
+            "agent.create",
+            ws.clone(),
+            Some("Planned".into()),
+            Some("sonnet4.5".into()),
+            None,
+            None,
+            None,
+            false,
+            extra(),
+            None,
+        )
+        .await
+        .expect_err("the demotion must reject a fresh plan");
+    assert!(
+        matches!(replan, Error::InvalidParams(_))
+            && replan.to_string().contains("provider \"auggie\""),
+        "fresh plan must trip the provider gate: {replan:?}"
+    );
+
+    let created = svc
+        .persist_agent_create(plan, None)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "persist must not re-run the plan's gates: {}",
+                persist_error_text(e)
+            )
+        });
+    let id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
+    let session = svc
+        .store()
+        .get_agent_session(&id)
+        .await
+        .expect("session row");
+    assert_eq!(session.name, "Planned");
+    assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+    assert_eq!(session.reasoning_effort.as_deref(), Some("high"));
+}
+
+/// Tier parity (intentd#1882 gap 2): the plan's project-tier root is the
+/// single decider for specialist acceptance. With a specialist present only
+/// in one root's `.intent/specialists`, `agent.create` (stored workspace's
+/// worktree root) and an isolated `workspace.create` (the `repositoryPath`
+/// checkout root) each reject the OTHER root's specialist before any side
+/// effect — no session, workspace row, spec note, `workspace:created` event,
+/// workspaces-root entry, or git worktree — while a specialist known at the
+/// plan's own root is accepted, alias included, with the canonical id
+/// persisted on the session row. The checkout's specialist is untracked, so
+/// the worktree `workspace.create` provisions at `baseRef` does not carry it:
+/// the persist half's non-failing prompt snapshot reads that worktree, finds
+/// nothing, and the create still succeeds — the snapshot root has no say.
+#[tokio::test]
+async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
+    let (tmp, svc, _ws, _bus) = setup_with_bus().await;
+    let workspaces_root = tmp.path.with_extension("workspaces");
+    std::fs::create_dir_all(&workspaces_root).expect("workspaces root");
+    let svc = svc.with_workspaces_root(workspaces_root.clone());
+    // Hermetic user + bundled tiers (one empty dir) so only the per-root
+    // project tiers below can supply the two specialists.
+    let empty_tier = tmp.path.with_extension("specialists");
+    std::fs::create_dir_all(&empty_tier).expect("specialists dir");
+    let svc = svc.with_specialist_dirs(Some(empty_tier.clone()), Some(empty_tier));
+    let project_specialist = |root: &std::path::Path, id: &str, name: &str, alias: &str| {
+        let dir = root.join(".intent").join("specialists");
+        std::fs::create_dir_all(&dir).expect("project specialists dir");
+        std::fs::write(
+            dir.join(format!("{id}.md")),
+            format!(
+                "---\nname: \"{name}\"\ndescription: \"Test specialist\"\naliases: [\"{alias}\"]\n---\n\n{name} prompt"
+            ),
+        )
+        .expect("write project specialist");
+    };
+    // Root A: a local git repo (one commit) that `workspace.create` adopts via
+    // `repositoryPath` and provisions a worktree from. Its specialist is
+    // written AFTER the commit and never staged, so no ref carries it.
+    let checkout_root = tmp.path.with_extension("checkout");
+    let head_branch = {
+        let repo = git2::Repository::init(&checkout_root).expect("init checkout repo");
+        let mut cfg = repo.config().expect("repo config");
+        cfg.set_str("user.name", "Tester").expect("user.name");
+        cfg.set_str("user.email", "t@e.dev").expect("user.email");
+        std::fs::write(checkout_root.join("README.md"), "init\n").expect("README");
+        let mut index = repo.index().expect("index");
+        index
+            .add_path(std::path::Path::new("README.md"))
+            .expect("add README");
+        index.write().expect("write index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write tree"))
+            .expect("tree");
+        let sig = git2::Signature::now("Tester", "t@e.dev").expect("signature");
+        repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+            .expect("initial commit");
+        let branch = repo
+            .head()
+            .expect("head")
+            .shorthand()
+            .expect("branch name")
+            .to_string();
+        branch
+    };
+    project_specialist(&checkout_root, "checkout-only", "Checkout Only", "co");
+    let checkout_worktrees = || {
+        git2::Repository::open(&checkout_root)
+            .expect("open checkout repo")
+            .worktrees()
+            .expect("list worktrees")
+            .len()
+    };
+    let workspaces_root_entries = || {
+        std::fs::read_dir(&workspaces_root)
+            .expect("read workspaces root")
+            .count()
+    };
+    // Root B: the stored workspace's worktree `agent.create` resolves against.
+    let worktree_root = tmp.path.with_extension("worktree");
+    project_specialist(&worktree_root, "worktree-only", "Worktree Only", "wo");
+    let stored_ws = WorkspaceId::new();
+    svc.store()
+        .insert_workspace(&Workspace {
+            worktree_path: Some(worktree_root.to_string_lossy().into_owned()),
+            ..workspace(&stored_ws)
+        })
+        .await
+        .expect("stored workspace");
+
+    let sessions = || async {
+        svc.store()
+            .list_all_agent_sessions()
+            .await
+            .expect("sessions")
+            .len()
+    };
+    let agent_create = |specialist: &str| {
+        svc.agent_create_op(
+            stored_ws.clone(),
+            None,
+            Some("sonnet4.5".into()),
+            Some(specialist.to_string()),
+            None,
+            None,
+            false,
+            intent_core::AgentCreateExtra {
+                provider: Some("auggie".into()),
+                ..Default::default()
+            },
+        )
+    };
+    let workspace_create = |specialist: &str| {
+        WorkspaceApi::create_workspace(
+            &svc,
+            intent_core::WorkspaceCreate {
+                title: Some("W".into()),
+                repository_path: Some(checkout_root.to_string_lossy().into_owned()),
+                repository_name: Some("Checkout".into()),
+                base_ref: Some(head_branch.clone()),
+                initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                    model: Some("sonnet4.5".into()),
+                    provider: Some("auggie".into()),
+                    specialist: Some(specialist.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        )
+    };
+
+    // `agent.create` on the stored workspace: root B decides.
+    let sessions_before = sessions().await;
+    let err = agent_create("checkout-only")
+        .await
+        .expect_err("agent.create must not see root A's specialist");
+    assert!(
+        matches!(err, Error::InvalidParams(_))
+            && err
+                .to_string()
+                .contains("unknown specialist: checkout-only"),
+        "agent.create: {err:?}"
+    );
+    assert_eq!(
+        sessions().await,
+        sessions_before,
+        "agent.create rejection must persist no session"
+    );
+    let created = agent_create("wo")
+        .await
+        .expect("agent.create accepts root B's alias");
+    let id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
+    let session = svc
+        .store()
+        .get_agent_session(&id)
+        .await
+        .expect("session row");
+    assert_eq!(
+        session.specialist.as_deref(),
+        Some("worktree-only"),
+        "canonical id persisted"
+    );
+
+    // `workspace.create` adopting root A: root A decides.
+    let sessions_before = sessions().await;
+    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let notes_before = svc.store().list_all_notes().await.expect("notes").len();
+    let created_events = || async {
+        svc.store()
+            .query_events(&intent_store::EventQuery {
+                event_types: vec![intent_core::events::WORKSPACE_CREATED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query workspace:created")
+            .len()
+    };
+    let events_before = created_events().await;
+    let entries_before = workspaces_root_entries();
+    let worktrees_before = checkout_worktrees();
+    let err = workspace_create("worktree-only")
+        .await
+        .expect_err("workspace.create must not see root B's specialist");
+    assert!(
+        matches!(err, Error::InvalidParams(_))
+            && err
+                .to_string()
+                .contains("unknown specialist: worktree-only"),
+        "workspace.create: {err:?}"
+    );
+    assert_eq!(
+        sessions().await,
+        sessions_before,
+        "rejection must persist no session"
+    );
+    assert_eq!(
+        svc.list_workspaces(true).await.expect("list").len(),
+        workspaces_before,
+        "rejection must precede the workspace row"
+    );
+    assert_eq!(
+        svc.store().list_all_notes().await.expect("notes").len(),
+        notes_before,
+        "rejection must precede the spec note"
+    );
+    assert_eq!(
+        created_events().await,
+        events_before,
+        "rejection must precede workspace:created"
+    );
+    assert_eq!(
+        workspaces_root_entries(),
+        entries_before,
+        "rejection must leave the workspaces root untouched"
+    );
+    assert_eq!(
+        checkout_worktrees(),
+        worktrees_before,
+        "rejection must provision no worktree"
+    );
+    let result = workspace_create("co")
+        .await
+        .expect("workspace.create accepts root A's alias");
+    let initial = result.initial_agent.expect("initialAgent persisted");
+    let id = AgentId::from(initial["id"].as_str().expect("agent id"));
+    let session = svc
+        .store()
+        .get_agent_session(&id)
+        .await
+        .expect("session row");
+    assert_eq!(session.workspace_id, result.workspace.id);
+    assert_eq!(
+        session.specialist.as_deref(),
+        Some("checkout-only"),
+        "canonical id persisted"
+    );
+    assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
+    assert_eq!(session.provider.as_deref(), Some("auggie"));
+    // The snapshot root is the provisioned worktree at `baseRef`, which does
+    // not carry the untracked specialist the plan accepted at the checkout
+    // root — so the frozen identity snapshot is absent while the create
+    // succeeded on the plan root's verdict alone.
+    let worktree = PathBuf::from(
+        result
+            .workspace
+            .worktree_path
+            .as_deref()
+            .expect("isolated create provisions a worktree"),
+    );
+    assert!(
+        worktree.starts_with(&workspaces_root),
+        "worktree {} must live under the workspaces root",
+        worktree.display()
+    );
+    assert_eq!(checkout_worktrees(), worktrees_before + 1);
+    let specialist_rel = std::path::Path::new(".intent")
+        .join("specialists")
+        .join("checkout-only.md");
+    assert!(checkout_root.join(&specialist_rel).is_file());
+    assert!(
+        !worktree.join(&specialist_rel).exists(),
+        "the specialist must be absent at the snapshot root"
+    );
+    let meta = session.metadata.expect("harness stamps write metadata");
+    assert!(
+        meta.get("specialistName").is_none() && meta.get("behaviorPrompt").is_none(),
+        "no identity snapshot from the specialist-less snapshot root: {meta}"
+    );
+}
+
+/// Blank comments and string / char literals in Rust source, length- and
+/// newline-preserving (per char), so brace matching and token scans see code
+/// only. Same lexing rules as the intent-core repo-slug fold lint: `//` and
+/// nested `/* */` comments, `"…"` with escapes, `r#"…"#` raw strings, and
+/// `'x'` / `'\…'` char literals (lifetimes are kept).
+fn blank_rust_non_code(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out: Vec<char> = chars
+        .iter()
+        .map(|&c| if c == '\n' { '\n' } else { ' ' })
+        .collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '/' && next == Some('/') {
+            while i < n && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            let mut depth = 0usize;
+            while i < n {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c == 'r'
+            && {
+                let prev_ok = |k: usize| k == 0 || !is_ident(chars[k - 1]);
+                prev_ok(i) || (chars[i - 1] == 'b' && prev_ok(i - 1))
+            }
+            && {
+                let mut j = i + 1;
+                while chars.get(j) == Some(&'#') {
+                    j += 1;
+                }
+                chars.get(j) == Some(&'"')
+            }
+        {
+            let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
+            i += 1 + hashes + 1;
+            while i < n {
+                if chars[i] == '"'
+                    && chars[i + 1..].iter().take(hashes).all(|&h| h == '#')
+                    && i + hashes < n
+                {
+                    i += 1 + hashes;
+                    break;
+                }
+                i += 1;
+            }
+        } else if c == '"' {
+            i += 1;
+            while i < n && chars[i] != '"' {
+                i += if chars[i] == '\\' { 2 } else { 1 };
+            }
+            i += 1;
+        } else if c == '\'' && next == Some('\\') {
+            i += 3;
+            while i < n && chars[i] != '\'' {
+                i += 1;
+            }
+            i += 1;
+        } else if c == '\'' && chars.get(i + 2) == Some(&'\'') {
+            i += 3;
+        } else {
+            out[i] = c;
+            i += 1;
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// `(body_start, body)` of the first fn whose signature starts with
+/// `signature` in `blanked` (the comment- and literal-free text of `file`):
+/// the text between the body's braces. A vanished signature panics naming
+/// `file:1` so the guard's failure always carries a `file:line` anchor.
+fn fn_body<'a>(file: &str, blanked: &'a str, signature: &str) -> (usize, &'a str) {
+    let sig = blanked
+        .find(signature)
+        .unwrap_or_else(|| panic!("{file}:1: signature not found: `{signature}`"));
+    let open = sig
+        + blanked[sig..].find('{').unwrap_or_else(|| {
+            panic!(
+                "{file}:{}: no body after `{signature}`",
+                line_of(blanked, sig)
+            )
+        });
+    let mut depth = 0usize;
+    for (off, c) in blanked[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (open + 1, &blanked[open + 1..open + off]);
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!(
+        "{file}:{}: unbalanced body for `{signature}`",
+        line_of(blanked, sig)
+    );
+}
+
+fn line_of(blanked: &str, offset: usize) -> usize {
+    blanked[..offset].matches('\n').count() + 1
+}
+
+/// Every `-32602` producer the plan half owns, plus the pre-split wrapper
+/// (`agent_create_op`, which plans AND persists — an invocation after the
+/// row insert re-validates input past the first side effect); none may
+/// appear in the persist half or after `workspace.create`'s row insert.
+const PERSIST_FORBIDDEN: &[&str] = &[
+    "ensure_effort_supported_by_model(",
+    "canonical_id_or_err(",
+    "resolve_create_model_and_effort(",
+    "validate_file_blocks(",
+    "validate_image_blocks(",
+    "validate_image_block_refs(",
+    "agent_create_op(",
+    "InvalidParams",
+];
+
+/// Source guard for the plan/persist split: the body of
+/// `persist_agent_create` (`agent_ops.rs`) calls none of the plan half's
+/// `-32602` producers, and `create_workspace` (`lib.rs`) runs
+/// `plan_agent_create` BEFORE its single `insert_workspace_with_auto_commit`
+/// and `persist_agent_create` AFTER it, with no producer, no re-plan and no
+/// `agent_create_op` wrapper anywhere after the insert. Scans the code with
+/// comments and literals blanked; every failure names `file:line` (a missing
+/// anchor names the fn body's first line, a vanished signature `file:1`).
+/// Moving `resolve_create_model_and_effort` into the persist half fails the
+/// first assertion; moving the plan call below the insert fails the ordering
+/// one; adding an `agent_create_op(...)` call after the insert fails the
+/// post-insert scan.
+///
+/// This is exact-text matching on the blanked source, not call resolution:
+/// a comment or whitespace between a producer's name and its `(`, or a call
+/// through an alias / re-import, is outside its detection, and a helper
+/// whose name ENDS with a forbidden name (e.g. `my_canonical_id_or_err(`)
+/// matches. Accepted for a rung-2 backstop behind the [`AgentPersistError`]
+/// type guard — no parser dependency or semantic proof is intended.
+#[test]
+fn persist_agent_create_and_workspace_create_carry_no_input_validation_after_the_plan() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let agent_ops = blank_rust_non_code(
+        &std::fs::read_to_string(src.join("agent_ops.rs")).expect("read agent_ops.rs"),
+    );
+    let (start, body) = fn_body("agent_ops.rs", &agent_ops, "async fn persist_agent_create(");
+    for token in PERSIST_FORBIDDEN.iter().chain(&["plan_agent_create("]) {
+        if let Some(hit) = body.find(token) {
+            panic!(
+                "agent_ops.rs:{}: persist_agent_create must not reach `{token}` — it belongs to the plan half",
+                line_of(&agent_ops, start + hit)
+            );
+        }
+    }
+
+    let lib =
+        blank_rust_non_code(&std::fs::read_to_string(src.join("lib.rs")).expect("read lib.rs"));
+    let (start, body) = fn_body("lib.rs", &lib, "fn create_workspace(");
+    let at = |needle: &str| {
+        body.find(needle).unwrap_or_else(|| {
+            panic!(
+                "lib.rs:{}: create_workspace must call `{needle}`",
+                line_of(&lib, start)
+            )
+        })
+    };
+    let plan = at(".plan_agent_create(");
+    let insert = at(".insert_workspace_with_auto_commit(");
+    let persist = at(".persist_agent_create(");
+    if let Some(dup) = body[insert + 1..].find(".insert_workspace_with_auto_commit(") {
+        panic!(
+            "lib.rs:{}: second row insert — create_workspace must insert its row exactly once (first at lib.rs:{})",
+            line_of(&lib, start + insert + 1 + dup),
+            line_of(&lib, start + insert)
+        );
+    }
+    assert!(
+        plan < insert,
+        "lib.rs:{}: plan_agent_create must run before the row insert (lib.rs:{})",
+        line_of(&lib, start + plan),
+        line_of(&lib, start + insert)
+    );
+    assert!(
+        insert < persist,
+        "lib.rs:{}: persist_agent_create must run after the row insert (lib.rs:{})",
+        line_of(&lib, start + persist),
+        line_of(&lib, start + insert)
+    );
+    let after_insert = &body[insert..];
+    for token in PERSIST_FORBIDDEN.iter().chain(&[".plan_agent_create("]) {
+        if let Some(hit) = after_insert.find(token) {
+            panic!(
+                "lib.rs:{}: `{token}` after the row insert — an initialAgent rejection here would strand the workspace row",
+                line_of(&lib, start + insert + hit)
+            );
+        }
+    }
+}
+
+/// Lexical table for [`blank_rust_non_code`]: every case keeps the char count
+/// and every newline in place, replaces chars only with `' '` (never shifts
+/// them), and leaves exactly `kept` (the non-space chars) standing — so
+/// braces and forbidden names inside comments, escaped / raw strings and
+/// char literals are invisible to the guard's brace matching and token
+/// scans, while lifetimes and Unicode code survive.
+#[test]
+fn blank_rust_non_code_blanks_comments_and_literals_only() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("nested block comment", "a /* x /* y */ z */ b", "ab"),
+        (
+            "nested block comment hiding braces and a forbidden name",
+            "f(); /* { InvalidParams( /* } */ */ g();",
+            "f();g();",
+        ),
+        (
+            "line comment hiding a forbidden name, newline kept",
+            "x // agent_create_op( {\ny",
+            "x\ny",
+        ),
+        (
+            "escaped string with braces and a forbidden name",
+            r#"let s = "{ \" InvalidParams( } \\";"#,
+            "lets=;",
+        ),
+        (
+            "raw string with hashes, an inner quote-hash and a forbidden name",
+            r###"let s = r##"} "# agent_create_op( {"##;"###,
+            "lets=;",
+        ),
+        (
+            "char literals blanked, lifetimes kept",
+            r"let c = '{'; let q = '\''; let e = '\n'; fn f<'a>(s: &'a str) -> &'a str { s }",
+            "letc=;letq=;lete=;fnf<'a>(s:&'astr)->&'astr{s}",
+        ),
+        (
+            "unicode in a literal and a comment, unicode code kept",
+            "let grüße = \"héllo { ✓ }\"; // wörld }\nfn f() {}",
+            "letgrüße=;\nfnf(){}",
+        ),
+    ];
+    for (name, src, kept) in cases {
+        let blanked = blank_rust_non_code(src);
+        assert_eq!(
+            blanked.chars().count(),
+            src.chars().count(),
+            "{name}: char count changed"
+        );
+        for (i, (s, b)) in src.chars().zip(blanked.chars()).enumerate() {
+            assert!(
+                b == s || b == ' ',
+                "{name}: char {i} shifted or replaced with {b:?} (was {s:?})"
+            );
+            assert_eq!(
+                b == '\n',
+                s == '\n',
+                "{name}: newline at char {i} not preserved"
+            );
+        }
+        let visible: String = blanked.chars().filter(|c| *c != ' ').collect();
+        assert_eq!(visible, *kept, "{name}: blanked to {blanked:?}");
+    }
+}
+
+/// [`fn_body`] returns the text strictly between the fn's outer braces —
+/// nested blocks included, the closing brace of a blanked `"}"` literal
+/// ignored, the following fn excluded — with `body_start` pointing just past
+/// the opening brace; `line_of` on an offset inside the body reports the
+/// source line even when multi-byte Unicode precedes it.
+#[test]
+fn fn_body_isolates_the_target_body_and_line_numbers_survive_unicode() {
+    let src = "\
+/// Grüße — “smart quotes” ✓
+const GREETING: &str = \"héllo { world }\";
+fn target(x: u32) -> u32 {
+    let s = \"}\";
+    if x > 0 { { x } } else { 0 }
+    needle(
+}
+fn other() { needle( }
+";
+    let blanked = blank_rust_non_code(src);
+    let (start, body) = fn_body("x.rs", &blanked, "fn target(");
+    assert_eq!(
+        &blanked[start - 1..start],
+        "{",
+        "body_start is just past the opening brace"
+    );
+    assert_eq!(line_of(&blanked, start), 3);
+    assert!(!body.contains('"'), "literals are blanked: {body:?}");
+    assert!(
+        body.contains("if x > 0 { { x } } else { 0 }"),
+        "nested blocks kept: {body:?}"
+    );
+    assert!(!body.contains("fn other"), "next fn excluded: {body:?}");
+    assert_eq!(body.matches("needle(").count(), 1, "{body:?}");
+    let hit = body.find("needle(").unwrap();
+    assert_eq!(line_of(&blanked, start + hit), 6);
+    assert_eq!(
+        body.matches('{').count(),
+        body.matches('}').count(),
+        "body is brace-balanced: {body:?}"
+    );
+}
+
+/// Every [`fn_body`] failure panics naming `file:line`: a vanished
+/// signature anchors at `file:1`, a signature without a body and an
+/// unbalanced body at the signature's line.
+#[test]
+fn fn_body_panics_name_file_and_line() {
+    let cases: &[(&str, &str, &str, &str)] = &[
+        (
+            "missing signature",
+            "fn a() {}\n",
+            "fn missing(",
+            "x.rs:1: signature not found: `fn missing(`",
+        ),
+        (
+            "signature without a body",
+            "\n\nfn decl();\n",
+            "fn decl(",
+            "x.rs:3: no body after `fn decl(`",
+        ),
+        (
+            "unbalanced body",
+            "\nfn open() {\n    {\n",
+            "fn open(",
+            "x.rs:2: unbalanced body for `fn open(`",
+        ),
+    ];
+    for (name, src, signature, expected) in cases {
+        let blanked = blank_rust_non_code(src);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fn_body("x.rs", &blanked, signature).0
+        }));
+        let payload = outcome.expect_err(name);
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(ToString::to_string))
+            .unwrap_or_else(|| panic!("{name}: non-string panic payload"));
+        assert_eq!(message, *expected, "{name}");
+    }
+}
+
 /// v10.0: a legacy inline file block already persisted on a user row (no
 /// `attachmentId`) is served as a `text` block naming the file — with no
 /// `data` key — on `agent.getConversation` in both projections and on
