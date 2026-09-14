@@ -197,12 +197,13 @@ pub use agent_manager::{
 pub use agent_session::SuspendOverlapQuery;
 // Re-export the permission types the composition root (`INTENTD_PERMISSION_POLICY`)
 // and the transport router (`agent.respondPermission` outcome parsing) need.
-// The individual watcher families are constructed only by `WatcherRegistry`
-// (they now take the crate-private shared-stream hub), so only the registry and
-// the bus/refresher surface leave the crate.
+// The individual watcher families are constructed only by `WatcherRegistry`,
+// so only the registry, the shared-stream hub it and `ConfigWatcher` ride
+// (created by the composition root; intent-hq/intent#4953), and the
+// bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, Subscription, SubscriptionFilter, WatchHealth,
-    WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, GitStatusRefresher, SharedWatchHub, Subscription, SubscriptionFilter,
+    WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -1873,6 +1874,19 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.script_parks.supervise = Some(park);
+        self
+    }
+
+    /// Test seam (monorepo#4952): park `mark_running` after its eligibility
+    /// check, before the `was_running` marker write and the in-memory flip to
+    /// `running`, so persist-before-observable ordering is testable.
+    /// Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_script_mark_running_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.mark_running_persist = Some(park);
         self
     }
 
@@ -11928,6 +11942,227 @@ fn validate_context_links(links: Option<&[intent_core::ContextLink]>) -> Result<
     Ok(())
 }
 
+impl Services {
+    /// Every `-32602` (`InvalidParams`) producer for `workspace.create`, in one
+    /// place. `create_workspace` calls this once at the top of its idempotency
+    /// closure — BEFORE the first store write, worktree provisioning, or event
+    /// publish — so a rejected request never leaves a workspace row, spec
+    /// note, or `workspace:created` event behind. Owns every `initialAgent`
+    /// and `contextLinks` check:
+    /// - compound `initialAgent.model` (`reject_compound_model`, PROTOCOL §5.5);
+    /// - `fileBlocks` / `imageBlocks` shape and attachment references
+    ///   (PROTOCOL §5.5, monorepo#3338) — same harvest as `agent_create_op`
+    ///   (top-level param wins over the `metadata.*Blocks` copy, `null`
+    ///   reads as absent);
+    /// - unknown `initialAgent.specialist` (monorepo#3497), canonicalized the
+    ///   way `agent_create_op` does — against the bundled + user tiers, plus
+    ///   the project tier of the tilde-expanded `repositoryPath` when it is an
+    ///   existing local directory (the same client-supplied path the create
+    ///   already trusts enough to provision a worktree from). No workspace
+    ///   row or worktree exists yet, so this is the only project tier
+    ///   available; `agent_create_op` later reads the new worktree at
+    ///   `baseRef`, so a project-tier-only specialist present in the checkout
+    ///   but absent at `baseRef` still fails late, and one present only at
+    ///   `baseRef` fails early here;
+    /// - provider / model / reasoning-effort resolution via the shared
+    ///   [`Self::resolve_create_model_and_effort`] chain (known provider →
+    ///   default present → enabled → authenticated → client-supplied bare
+    ///   model owned by the effective provider → specialist-derived effort
+    ///   supported by the resolved model), with the same project-tier hint;
+    /// - `contextLinks` (PROTOCOL §5.1);
+    /// - the explicit `executionEnvironment` selection (PROTOCOL §5.1):
+    ///   `skipIsolation` conflict, the `worktree` local-copy flow rule, the
+    ///   enabled-profile gate, and host availability (`cow` needs the
+    ///   workspaces-root `CoW` probe; `microvm` needs the platform / helper
+    ///   check AND the `CoW` probe) — the structured
+    ///   `execution-environment-unavailable` errors (§9) live here too.
+    ///
+    /// `agent_create_op` re-runs its own checks unchanged when the initial
+    /// agent is created — harmless, since this preflight already accepted the
+    /// same input. The `workspace_create_rejects_every_invalid_input_before_side_effects`
+    /// test guards the ordering arm by arm.
+    pub(crate) async fn preflight_workspace_create(&self, input: &WorkspaceCreate) -> Result<()> {
+        // Execution-environment selection (§5.1): validate the explicit
+        // choice against enabled profiles + host availability. `direct` and
+        // `worktree` need only be enabled; `cow` additionally requires the
+        // workspaces-root CoW probe; `microvm` requires the platform check
+        // AND the CoW probe.
+        if let Some(env) = input.execution_environment {
+            if input.skip_isolation == Some(true) && env != intent_core::SandboxType::Direct {
+                return Err(Error::InvalidParams(format!(
+                    "skipIsolation conflicts with executionEnvironment '{}'; omit one",
+                    env.as_str()
+                )));
+            }
+            // Flow rule (§5.1): `worktree` is only offerable for local
+            // repository copies — a linked worktree needs an existing
+            // local checkout to link against. "Pick a repo" (`githubUrl`)
+            // and "New repo" (`isNewRepo`) creates provision a standalone
+            // checkout (or none), so they take `direct`, `cow`, or
+            // `microvm` — never `worktree`.
+            if env == intent_core::SandboxType::Worktree {
+                let has_github_url = input
+                    .github_url
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty());
+                if has_github_url {
+                    return Err(Error::ExecutionEnvironmentUnavailable {
+                        environment: env.as_str().to_string(),
+                        reason: "worktree checkouts require a local repository copy; \
+                                 GitHub-URL creates provision a standalone checkout — \
+                                 use direct, cow, or microvm"
+                            .to_string(),
+                    });
+                }
+                if input.is_new_repo == Some(true) {
+                    return Err(Error::ExecutionEnvironmentUnavailable {
+                        environment: env.as_str().to_string(),
+                        reason: "worktree checkouts require a local repository copy; \
+                                 new-repo creates work directly in the initialized \
+                                 repository — use direct, cow, or microvm"
+                            .to_string(),
+                    });
+                }
+            }
+            let sandbox = self.effective_settings().sandbox;
+            if !sandbox_type_enabled(&sandbox, env.as_str()) {
+                return Err(Error::ExecutionEnvironmentUnavailable {
+                    environment: env.as_str().to_string(),
+                    reason: format!(
+                        "the '{}' execution environment is disabled in settings",
+                        env.as_str()
+                    ),
+                });
+            }
+            match env {
+                intent_core::SandboxType::Cow => {
+                    if self.compute_cow_supported().await != Some(true) {
+                        // Temporarily locked to macOS: name the platform
+                        // lock on other OSes instead of blaming the
+                        // filesystem (the choke point never probed).
+                        let reason = if cfg!(not(target_os = "macos")) {
+                            "CoW sandboxes are temporarily locked to macOS".to_string()
+                        } else {
+                            "the workspaces root filesystem does not support \
+                             copy-on-write clones"
+                                .to_string()
+                        };
+                        return Err(Error::ExecutionEnvironmentUnavailable {
+                            environment: env.as_str().to_string(),
+                            reason,
+                        });
+                    }
+                }
+                intent_core::SandboxType::Microvm => {
+                    // Platform lock, then helper/libkrun loadability
+                    // (same gate as `sandbox.options`), then CoW.
+                    if let Some(reason) = self.microvm_host_unavailable_reason().await {
+                        return Err(Error::ExecutionEnvironmentUnavailable {
+                            environment: env.as_str().to_string(),
+                            reason,
+                        });
+                    }
+                    if self.compute_cow_supported().await != Some(true) {
+                        return Err(Error::ExecutionEnvironmentUnavailable {
+                            environment: env.as_str().to_string(),
+                            reason: "microVM sandboxes require copy-on-write clone \
+                                     support, and the workspaces root filesystem does \
+                                     not support copy-on-write clones"
+                                .to_string(),
+                        });
+                    }
+                    // Enabled and available: the workspace provisions a
+                    // CoW checkout (same arm as `cow`), and agents spawn
+                    // inside per-agent microVMs (EE-5, monorepo#1120).
+                }
+                _ => {}
+            }
+        }
+        if let Some(agent) = input.initial_agent.as_ref() {
+            if let Some(model) = agent.model.as_deref() {
+                reject_compound_model("initialAgent.model", model)?;
+            }
+            let effective_file_blocks = agent
+                .file_blocks
+                .clone()
+                .filter(|v| !v.is_null())
+                .or_else(|| {
+                    agent
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("fileBlocks").cloned())
+                })
+                .filter(|v| !v.is_null());
+            crate::agent_ops::validate_file_blocks(
+                "workspace.create",
+                effective_file_blocks.as_ref(),
+            )?;
+            let effective_image_blocks = agent
+                .image_blocks
+                .clone()
+                .filter(|v| !v.is_null())
+                .or_else(|| {
+                    agent
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("imageBlocks").cloned())
+                })
+                .filter(|v| !v.is_null());
+            crate::agent_ops::validate_image_blocks(
+                "workspace.create",
+                effective_image_blocks.as_ref(),
+            )?;
+            self.validate_image_block_refs("workspace.create", effective_image_blocks.as_ref())
+                .await?;
+
+            // Project-tier hint for the specialist lookups: the repository
+            // checkout, only when it is an existing local directory.
+            let spec_wp = input
+                .repository_path
+                .as_deref()
+                .map(intent_core::expand_tilde_string)
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir());
+            let specialist = match nonempty_owned(agent.specialist.clone()) {
+                Some(spec_id) => {
+                    // Canonicalization walks the specialist tier directories —
+                    // blocking pool (monorepo#4148).
+                    let services = self.clone();
+                    let wp = spec_wp.clone();
+                    Some(
+                        tokio::task::spawn_blocking(move || {
+                            services
+                                .specialists_service()
+                                .canonical_id_or_err(&spec_id, wp.as_deref())
+                        })
+                        .await
+                        .map_err(|e| {
+                            Error::Internal(format!(
+                                "workspace.create specialist resolution task failed: {e}"
+                            ))
+                        })??,
+                    )
+                }
+                None => None,
+            };
+            // Provider / model / effort gates — the same chain
+            // `agent_create_op` runs (which receives the same
+            // `nonempty_owned` values and no caller-decided effort).
+            self.resolve_create_model_and_effort(
+                "workspace.create",
+                nonempty_owned(agent.model.clone()),
+                specialist.as_deref(),
+                nonempty_owned(agent.provider.clone()).as_deref(),
+                None,
+                spec_wp.as_deref(),
+            )
+            .await?;
+        }
+        validate_context_links(input.context_links.as_deref())
+    }
+}
+
 /// Locked phase of the blocking `workspace.delete` cleanup (ports the TS
 /// `removeGitWorktree` body). Runs under the per-repo worktree lock, so it
 /// does git-metadata work only: capture the checked-out branch, detach the
@@ -18372,15 +18607,6 @@ impl WorkspaceApi for Services {
         input: WorkspaceCreate,
         idempotency_key: Option<String>,
     ) -> BoxFuture<'_, Result<WorkspaceCreateResult>> {
-        if let Some(model) = input
-            .initial_agent
-            .as_ref()
-            .and_then(|a| a.model.as_deref())
-        {
-            if let Err(e) = reject_compound_model("initialAgent.model", model) {
-                return Box::pin(async move { Err(e) });
-            }
-        }
         let store = self.store.clone();
         let worktree_locks = self.worktree_locks.clone();
         let workspaces_root = self.workspaces_root.clone();
@@ -18404,107 +18630,6 @@ impl WorkspaceApi for Services {
             // Clone fields for logging (input moves into the closure below).
             let log_repo_path = input.repository_path.clone();
             let log_branch = input.branch.clone();
-
-            // Execution-environment selection (§5.1): validate the explicit
-            // choice against enabled profiles + host availability up front,
-            // before the idempotent op body runs. `direct` and `worktree`
-            // need only be enabled; `cow` additionally requires the
-            // workspaces-root CoW probe; `microvm` requires the platform
-            // check AND the CoW probe, and — being not implemented yet —
-            // then returns a structured NOT_IMPLEMENTED error.
-            if let Some(env) = input.execution_environment {
-                if input.skip_isolation == Some(true) && env != intent_core::SandboxType::Direct {
-                    return Err(Error::InvalidParams(format!(
-                        "skipIsolation conflicts with executionEnvironment '{}'; omit one",
-                        env.as_str()
-                    )));
-                }
-                // Flow rule (§5.1): `worktree` is only offerable for local
-                // repository copies — a linked worktree needs an existing
-                // local checkout to link against. "Pick a repo" (`githubUrl`)
-                // and "New repo" (`isNewRepo`) creates provision a standalone
-                // checkout (or none), so they take `direct`, `cow`, or
-                // `microvm` — never `worktree`.
-                if env == intent_core::SandboxType::Worktree {
-                    let has_github_url = input
-                        .github_url
-                        .as_deref()
-                        .map(str::trim)
-                        .is_some_and(|s| !s.is_empty());
-                    if has_github_url {
-                        return Err(Error::ExecutionEnvironmentUnavailable {
-                            environment: env.as_str().to_string(),
-                            reason: "worktree checkouts require a local repository copy; \
-                                     GitHub-URL creates provision a standalone checkout — \
-                                     use direct, cow, or microvm"
-                                .to_string(),
-                        });
-                    }
-                    if input.is_new_repo == Some(true) {
-                        return Err(Error::ExecutionEnvironmentUnavailable {
-                            environment: env.as_str().to_string(),
-                            reason: "worktree checkouts require a local repository copy; \
-                                     new-repo creates work directly in the initialized \
-                                     repository — use direct, cow, or microvm"
-                                .to_string(),
-                        });
-                    }
-                }
-                let sandbox = services.effective_settings().sandbox;
-                if !sandbox_type_enabled(&sandbox, env.as_str()) {
-                    return Err(Error::ExecutionEnvironmentUnavailable {
-                        environment: env.as_str().to_string(),
-                        reason: format!(
-                            "the '{}' execution environment is disabled in settings",
-                            env.as_str()
-                        ),
-                    });
-                }
-                match env {
-                    intent_core::SandboxType::Cow => {
-                        if services.compute_cow_supported().await != Some(true) {
-                            // Temporarily locked to macOS: name the platform
-                            // lock on other OSes instead of blaming the
-                            // filesystem (the choke point never probed).
-                            let reason = if cfg!(not(target_os = "macos")) {
-                                "CoW sandboxes are temporarily locked to macOS".to_string()
-                            } else {
-                                "the workspaces root filesystem does not support \
-                                 copy-on-write clones"
-                                    .to_string()
-                            };
-                            return Err(Error::ExecutionEnvironmentUnavailable {
-                                environment: env.as_str().to_string(),
-                                reason,
-                            });
-                        }
-                    }
-                    intent_core::SandboxType::Microvm => {
-                        // Platform lock, then helper/libkrun loadability
-                        // (same gate as `sandbox.options`), then CoW.
-                        if let Some(reason) = services.microvm_host_unavailable_reason().await {
-                            return Err(Error::ExecutionEnvironmentUnavailable {
-                                environment: env.as_str().to_string(),
-                                reason,
-                            });
-                        }
-                        if services.compute_cow_supported().await != Some(true) {
-                            return Err(Error::ExecutionEnvironmentUnavailable {
-                                environment: env.as_str().to_string(),
-                                reason: "microVM sandboxes require copy-on-write clone \
-                                         support, and the workspaces root filesystem does \
-                                         not support copy-on-write clones"
-                                    .to_string(),
-                            });
-                        }
-                        // Enabled and available: the workspace provisions a
-                        // CoW checkout below (same arm as `cow`), and agents
-                        // spawn inside per-agent microVMs (EE-5,
-                        // monorepo#1120).
-                    }
-                    _ => {}
-                }
-            }
 
             // workspace.create carries no workspaceId → "" sentinel scope (§5.1).
             let op_store = store.clone();
@@ -18540,10 +18665,18 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    // Every request-validation `-32602` runs here, BEFORE
+                    // any state change (row / metadata file / event / spec
+                    // note / initial agent): `initialAgent` model, blocks,
+                    // attachment references and provider gates, `contextLinks`,
+                    // and the explicit `executionEnvironment` selection
+                    // (enabled profile + host availability). See
+                    // `preflight_workspace_create`.
+                    services.preflight_workspace_create(&input).await?;
                     // Explicit execution-environment selection (§5.1),
-                    // validated above. `direct` opts out of isolation (same
-                    // as `skipIsolation`); `worktree`/`cow` force the
-                    // checkout mode below regardless of the legacy
+                    // validated by the preflight above. `direct` opts out of
+                    // isolation (same as `skipIsolation`); `worktree`/`cow`
+                    // force the checkout mode below regardless of the legacy
                     // `workspace.cowIsolation` setting; `microvm` provisions
                     // a CoW checkout (validated CoW-capable above) that each
                     // agent VM mounts its own reflink clone of (EE-5).
@@ -18564,56 +18697,6 @@ impl WorkspaceApi for Services {
                         Some(_) => false,
                         None => cow_isolation,
                     };
-                    // Attachment-reference validation (PROTOCOL §5.5,
-                    // monorepo#3338), hoisted BEFORE any state change so a
-                    // bad `initialAgent.fileBlocks` / `imageBlocks` entry
-                    // rejects `-32602` without leaving a partially created
-                    // workspace (row/metadata/event/spec note) behind. Same
-                    // harvest as `agent_create_op` (top-level param wins over
-                    // the `metadata.*Blocks` copy); the create op re-runs the
-                    // same checks harmlessly.
-                    if let Some(agent) = input.initial_agent.as_ref() {
-                        let effective_file_blocks = agent
-                            .file_blocks
-                            .clone()
-                            .or_else(|| {
-                                agent
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("fileBlocks").cloned())
-                            })
-                            .filter(|v| !v.is_null());
-                        crate::agent_ops::validate_file_blocks(
-                            "workspace.create",
-                            effective_file_blocks.as_ref(),
-                        )?;
-                        let effective_image_blocks = agent
-                            .image_blocks
-                            .clone()
-                            .or_else(|| {
-                                agent
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("imageBlocks").cloned())
-                            })
-                            .filter(|v| !v.is_null());
-                        crate::agent_ops::validate_image_blocks(
-                            "workspace.create",
-                            effective_image_blocks.as_ref(),
-                        )?;
-                        services
-                            .validate_image_block_refs(
-                                "workspace.create",
-                                effective_image_blocks.as_ref(),
-                            )
-                            .await?;
-                    }
-                    // Context-links validation (PROTOCOL §5.1), also hoisted
-                    // BEFORE any state change: a malformed `contextLinks`
-                    // rejects `-32602` without leaving a partially created
-                    // workspace behind. Bounded list, non-empty string
-                    // fields, positive PR/issue number.
-                    validate_context_links(input.context_links.as_deref())?;
                     // Caller-supplied paths may carry a leading `~` (the FE
                     // onboarding default is `~/Developer`); expand to `$HOME`
                     // before the existing-repo check, clone targeting, and
