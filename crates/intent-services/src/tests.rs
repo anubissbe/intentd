@@ -1531,6 +1531,488 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
     assert!(stored.pull_requests.is_none(), "merge must not persist");
 }
 
+/// Every surface that derives `displayStatus` folds the PRs persisted on
+/// the workspace's secondary git roots into the PR rungs: a workspace with
+/// no PR linkage of its own whose only PR is a MERGED git-root record reads
+/// `pr_merged` on `workspace.list`, the lite list (subscribe seq-0), and
+/// `workspace.get` alike — list paths from the one bulk read, `get` from the
+/// scoped per-workspace read — while a workspace with no roots keeps the
+/// exact row it produced before (same bytes across all three surfaces, no
+/// `pullRequests` materialized).
+#[tokio::test]
+async fn display_status_folds_git_root_prs_on_every_read_surface() {
+    use intent_core::{
+        PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceGitRoot,
+        WorkspaceGitRootId, WorkspaceGitRootSource,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    let git_root = |ws: &WorkspaceId, path: &str, status: PullRequestStatus| {
+        let ts = now_iso();
+        WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: ws.clone(),
+            path: path.to_string(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: Some("o".into()),
+            repo_name: Some("r".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: Some(vec![PullRequestInfo {
+                id: "1".into(),
+                number: 1,
+                url: "https://github.com/o/r/pull/1".into(),
+                title: "Root PR".into(),
+                status,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-02T00:00:00Z".into(),
+                base_ref: None,
+                head_ref: None,
+                head_sha: None,
+                author: None,
+                mergeable: None,
+                mergeable_state: None,
+                is_draft: None,
+            }]),
+            created_at: ts.clone(),
+            updated_at: ts,
+        }
+    };
+
+    // merged_ws: no workspace PR linkage; one merged git-root PR.
+    let merged_ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&merged_ws))
+        .await
+        .expect("merged ws");
+    store
+        .upsert_workspace_git_root(&git_root(
+            &merged_ws,
+            "/tmp/root-merged",
+            PullRequestStatus::Merged,
+        ))
+        .await
+        .expect("merged root");
+    // open_ws: same shape with an OPEN git-root PR — the PR-open rung.
+    let open_ws = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&open_ws))
+        .await
+        .expect("open ws");
+    store
+        .upsert_workspace_git_root(&git_root(
+            &open_ws,
+            "/tmp/root-open",
+            PullRequestStatus::Open,
+        ))
+        .await
+        .expect("open root");
+    // control: no roots at all.
+    let control = WorkspaceId::new();
+    store
+        .insert_workspace(&workspace(&control))
+        .await
+        .expect("control ws");
+
+    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+
+    let full = svc.list_workspaces(false).await.expect("full list");
+    let lite = svc.list_workspaces_lite(false).await.expect("lite list");
+    let row = |list: &[Workspace], id: &WorkspaceId| {
+        list.iter()
+            .find(|w| &w.id == id)
+            .cloned()
+            .expect("row in list")
+    };
+    for (ws, expected) in [
+        (&merged_ws, WorkspaceDisplayStatus::PrMerged),
+        (&open_ws, WorkspaceDisplayStatus::PrOpen),
+        (&control, WorkspaceDisplayStatus::Idle),
+    ] {
+        assert_eq!(
+            row(&full, ws).display_status,
+            Some(expected),
+            "workspace.list: {ws}"
+        );
+        assert_eq!(
+            row(&lite, ws).display_status,
+            Some(expected),
+            "lite list: {ws}"
+        );
+        let got = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+        assert_eq!(got.display_status, Some(expected), "workspace.get: {ws}");
+    }
+
+    // The control row is untouched by the fold on every surface: no
+    // `pullRequests` appears on the full list, the lite list, or `get`.
+    // Cross-surface consistency guard (not a golden): the full-list row
+    // serializes byte-identically to the enriched `get` row once the
+    // list-only slimming (`tokenUsage`) is accounted for. Both operands run
+    // through the same enrichment, so this pins list/get agreement for a
+    // root-less workspace, not equality with a pre-fold payload — the
+    // empty-root rollup path is the unchanged `rollup_over_pr_pool` call in
+    // `compute_base_display_status`.
+    let control_get = svc
+        .get_workspace(control.clone())
+        .await
+        .expect("control get");
+    assert!(control_get.pull_requests.is_none());
+    assert!(row(&full, &control).pull_requests.is_none());
+    assert!(row(&lite, &control).pull_requests.is_none());
+    let mut control_get_as_list_row = control_get;
+    control_get_as_list_row.token_usage = None;
+    assert_eq!(
+        serde_json::to_vec(&row(&full, &control)).unwrap(),
+        serde_json::to_vec(&control_get_as_list_row).unwrap(),
+        "a workspace with no roots serializes identically on workspace.list and workspace.get"
+    );
+
+    // Emit-path only: the fold persists nothing on the workspace row.
+    let stored = store.get_workspace(&merged_ws).await.expect("stored");
+    assert!(stored.pull_requests.is_none());
+    assert!(stored.active_pull_request.is_none());
+}
+
+/// The served `activePullRequest` and `pullRequests` carry the same
+/// same-URL lifecycle the `displayStatus` derivation selected — on
+/// `workspace.list`, the lite list (subscribe seq-0) and `workspace.get`
+/// alike, independent of git-root order. Two regressions (intentd#1884
+/// review): a linked `activePullRequest` still `open` beside a merged
+/// git-root copy must be served `merged` next to `pr_merged` (never
+/// `activePullRequest: open` + `displayStatus: pr_merged`), and an older
+/// `draft` pooled copy beside a newer clean `open` root copy must be served
+/// as that open/clean snapshot next to `pr_ready` (never `draft` +
+/// `pr_ready`). Identity fields stay the workspace's; the lifecycle fields
+/// (`status`, `updatedAt`, `isDraft`, `mergeable`, `mergeableState`) move
+/// together; every copy of the URL agrees on every surface. Two more for
+/// equal (rank, `updatedAt`) copies, which resolve by readiness rather
+/// than root order: a root-only blocked/clean pair read at one instant
+/// (repro C) and a linked `open(blocked)` + pooled `open(clean)` at one
+/// instant beside an older root copy (repro D) both serve the clean
+/// snapshot next to `pr_ready` in either root order.
+#[tokio::test]
+async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
+    use intent_core::{
+        PullRequestInfo, PullRequestStatus, WorkspaceDisplayStatus, WorkspaceGitRoot,
+        WorkspaceGitRootId, WorkspaceGitRootSource,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let root = WorkspacesRoot::new();
+
+    let pr = |title: &str, status: PullRequestStatus, updated_at: &str| PullRequestInfo {
+        id: "9".into(),
+        number: 9,
+        url: "https://github.com/o/r/pull/9".into(),
+        title: title.to_string(),
+        status,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: updated_at.into(),
+        base_ref: None,
+        head_ref: None,
+        head_sha: None,
+        author: None,
+        mergeable: None,
+        mergeable_state: None,
+        is_draft: None,
+    };
+    let ready = |title: &str, mergeable_state: &str, updated_at: &str, is_draft: bool| {
+        let mut info = pr(
+            title,
+            if is_draft {
+                PullRequestStatus::Draft
+            } else {
+                PullRequestStatus::Open
+            },
+            updated_at,
+        );
+        info.mergeable = Some(true);
+        info.mergeable_state = Some(mergeable_state.to_string());
+        info.is_draft = Some(is_draft);
+        info
+    };
+    // Roots are read in registration (`created_at`) order; `nth` pins it.
+    let git_root = |ws: &WorkspaceId, nth: u8, info: PullRequestInfo| WorkspaceGitRoot {
+        id: WorkspaceGitRootId::new(),
+        workspace_id: ws.clone(),
+        path: format!("/tmp/root-{nth}"),
+        source: WorkspaceGitRootSource::Agent,
+        repo_owner: Some("o".into()),
+        repo_name: Some("r".into()),
+        registered_by_agent_ids: vec![],
+        registered_commit_sha: None,
+        pr_number: None,
+        pr_url: None,
+        pr_status: None,
+        pull_requests: Some(vec![info]),
+        created_at: format!("2026-02-0{nth}T00:00:00Z"),
+        updated_at: format!("2026-02-0{nth}T00:00:00Z"),
+    };
+    let lifecycle = |p: &PullRequestInfo| {
+        (
+            p.status,
+            p.updated_at.clone(),
+            p.is_draft,
+            p.mergeable,
+            p.mergeable_state.clone(),
+        )
+    };
+
+    // Repro A, both root orders: linked + pooled stale `open` copy of the
+    // URL; one root still `open` (newer than the workspace copy), one root
+    // `merged`. Canonical = the merged root snapshot.
+    let stale_linked = pr(
+        "Workspace copy",
+        PullRequestStatus::Open,
+        "2026-01-01T00:00:00Z",
+    );
+    let root_open = pr("Root open", PullRequestStatus::Open, "2026-01-02T00:00:00Z");
+    let root_merged = pr(
+        "Root merged",
+        PullRequestStatus::Merged,
+        "2026-01-03T00:00:00Z",
+    );
+    let merged_canonical = lifecycle(&root_merged);
+    let mut repro_a = Vec::new();
+    for (label, first, second) in [
+        ("merged root first", &root_merged, &root_open),
+        ("open root first", &root_open, &root_merged),
+    ] {
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        row.active_pull_request = Some(stale_linked.clone());
+        row.pull_requests = Some(vec![stale_linked.clone()]);
+        store.insert_workspace(&row).await.expect("repro A ws");
+        for (nth, info) in [(1, first), (2, second)] {
+            store
+                .upsert_workspace_git_root(&git_root(&ws, nth, info.clone()))
+                .await
+                .expect("repro A root");
+        }
+        repro_a.push((label, ws));
+    }
+
+    // Repro B, both root orders: an older `draft` pooled copy (blocked); one
+    // root `open` but still blocked (Jan 2), one root `open` and clean
+    // (Jan 3). Canonical = the newest open/clean snapshot.
+    let stale_draft = ready("Workspace copy", "blocked", "2026-01-01T00:00:00Z", true);
+    let root_blocked = ready("Root blocked", "blocked", "2026-01-02T00:00:00Z", false);
+    let root_clean = ready("Root clean", "clean", "2026-01-03T00:00:00Z", false);
+    let clean_canonical = lifecycle(&root_clean);
+    let mut repro_b = Vec::new();
+    for (label, first, second) in [
+        ("clean root first", &root_clean, &root_blocked),
+        ("blocked root first", &root_blocked, &root_clean),
+    ] {
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        row.pull_requests = Some(vec![stale_draft.clone()]);
+        store.insert_workspace(&row).await.expect("repro B ws");
+        for (nth, info) in [(1, first), (2, second)] {
+            store
+                .upsert_workspace_git_root(&git_root(&ws, nth, info.clone()))
+                .await
+                .expect("repro B root");
+        }
+        repro_b.push((label, ws));
+    }
+
+    // Repro C, both root orders: no workspace copy; two roots read the
+    // open PR at the SAME instant, one blocked and one clean. Canonical =
+    // the clean snapshot (readiness breaks the tie), never the first root.
+    let tied_at = "2026-01-02T00:00:00Z";
+    let tied_blocked = ready("Root blocked", "blocked", tied_at, false);
+    let tied_clean = ready("Root clean", "clean", tied_at, false);
+    let tied_canonical = lifecycle(&tied_clean);
+    let mut repro_c = Vec::new();
+    for (label, first, second) in [
+        ("blocked root first", &tied_blocked, &tied_clean),
+        ("clean root first", &tied_clean, &tied_blocked),
+    ] {
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&ws))
+            .await
+            .expect("repro C ws");
+        for (nth, info) in [(1, first), (2, second)] {
+            store
+                .upsert_workspace_git_root(&git_root(&ws, nth, info.clone()))
+                .await
+                .expect("repro C root");
+        }
+        repro_c.push((label, ws));
+    }
+
+    // Repro D, both root orders: the linked copy is `open(blocked)` and the
+    // pooled copy `open(clean)`, both at the same instant; one root is an
+    // older blocked copy, one a same-instant blocked copy. Canonical = the
+    // pooled clean snapshot, applied to the linked copy too.
+    let linked_blocked = ready("Workspace linked", "blocked", tied_at, false);
+    let pooled_clean = ready("Workspace pooled", "clean", tied_at, false);
+    let older_root = ready("Root older", "blocked", "2026-01-01T00:00:00Z", false);
+    let pooled_canonical = lifecycle(&pooled_clean);
+    let mut repro_d = Vec::new();
+    for (label, first, second) in [
+        ("older root first", &older_root, &tied_blocked),
+        ("same-time root first", &tied_blocked, &older_root),
+    ] {
+        let ws = WorkspaceId::new();
+        let mut row = workspace(&ws);
+        row.active_pull_request = Some(linked_blocked.clone());
+        row.pull_requests = Some(vec![pooled_clean.clone()]);
+        store.insert_workspace(&row).await.expect("repro D ws");
+        for (nth, info) in [(1, first), (2, second)] {
+            store
+                .upsert_workspace_git_root(&git_root(&ws, nth, info.clone()))
+                .await
+                .expect("repro D root");
+        }
+        repro_d.push((label, ws));
+    }
+
+    let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
+    let full = svc.list_workspaces(false).await.expect("full list");
+    let lite = svc.list_workspaces_lite(false).await.expect("lite list");
+    let row = |list: &[Workspace], id: &WorkspaceId| {
+        list.iter()
+            .find(|w| &w.id == id)
+            .cloned()
+            .expect("row in list")
+    };
+
+    for (label, ws) in &repro_a {
+        let got = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+        for (surface, ws) in [
+            ("workspace.list", row(&full, ws)),
+            ("lite list", row(&lite, ws)),
+            ("workspace.get", got),
+        ] {
+            let ctx = format!("repro A ({label}) on {surface}");
+            assert_eq!(
+                ws.display_status,
+                Some(WorkspaceDisplayStatus::PrMerged),
+                "{ctx}"
+            );
+            let active = ws.active_pull_request.as_ref().expect("linked PR");
+            assert_eq!(active.title, "Workspace copy", "{ctx}: identity kept");
+            assert_eq!(
+                lifecycle(active),
+                merged_canonical,
+                "{ctx}: activePullRequest"
+            );
+            let prs = ws.pull_requests.as_ref().expect("pullRequests");
+            assert_eq!(
+                prs.len(),
+                1,
+                "{ctx}: root copies dedupe into the pooled copy"
+            );
+            assert_eq!(prs[0].title, "Workspace copy", "{ctx}: identity kept");
+            assert_eq!(lifecycle(&prs[0]), merged_canonical, "{ctx}: pullRequests");
+        }
+    }
+
+    for (label, ws) in &repro_b {
+        let got = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+        for (surface, ws) in [
+            ("workspace.list", row(&full, ws)),
+            ("lite list", row(&lite, ws)),
+            ("workspace.get", got),
+        ] {
+            let ctx = format!("repro B ({label}) on {surface}");
+            assert_eq!(
+                ws.display_status,
+                Some(WorkspaceDisplayStatus::PrReady),
+                "{ctx}"
+            );
+            assert!(ws.active_pull_request.is_none(), "{ctx}");
+            let prs = ws.pull_requests.as_ref().expect("pullRequests");
+            assert_eq!(
+                prs.len(),
+                1,
+                "{ctx}: root copies dedupe into the pooled copy"
+            );
+            assert_eq!(prs[0].title, "Workspace copy", "{ctx}: identity kept");
+            assert_eq!(lifecycle(&prs[0]), clean_canonical, "{ctx}: pullRequests");
+        }
+    }
+
+    for (label, ws) in &repro_c {
+        let got = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+        for (surface, ws) in [
+            ("workspace.list", row(&full, ws)),
+            ("lite list", row(&lite, ws)),
+            ("workspace.get", got),
+        ] {
+            let ctx = format!("repro C ({label}) on {surface}");
+            assert_eq!(
+                ws.display_status,
+                Some(WorkspaceDisplayStatus::PrReady),
+                "{ctx}"
+            );
+            assert!(ws.active_pull_request.is_none(), "{ctx}");
+            // Root-only URLs are appended by the list paths' external merge
+            // only; `workspace.get` has no workspace-owned copy to serve.
+            if surface == "workspace.get" {
+                assert!(ws.pull_requests.is_none(), "{ctx}");
+                continue;
+            }
+            let prs = ws.pull_requests.as_ref().expect("pullRequests");
+            assert_eq!(prs.len(), 1, "{ctx}: root copies dedupe into one entry");
+            assert_eq!(lifecycle(&prs[0]), tied_canonical, "{ctx}: pullRequests");
+        }
+    }
+
+    for (label, ws) in &repro_d {
+        let got = svc.get_workspace(ws.clone()).await.expect("workspace.get");
+        for (surface, ws) in [
+            ("workspace.list", row(&full, ws)),
+            ("lite list", row(&lite, ws)),
+            ("workspace.get", got),
+        ] {
+            let ctx = format!("repro D ({label}) on {surface}");
+            assert_eq!(
+                ws.display_status,
+                Some(WorkspaceDisplayStatus::PrReady),
+                "{ctx}"
+            );
+            let active = ws.active_pull_request.as_ref().expect("linked PR");
+            assert_eq!(active.title, "Workspace linked", "{ctx}: identity kept");
+            assert_eq!(
+                lifecycle(active),
+                pooled_canonical,
+                "{ctx}: activePullRequest"
+            );
+            let prs = ws.pull_requests.as_ref().expect("pullRequests");
+            assert_eq!(
+                prs.len(),
+                1,
+                "{ctx}: root copies dedupe into the pooled copy"
+            );
+            assert_eq!(prs[0].title, "Workspace pooled", "{ctx}: identity kept");
+            assert_eq!(lifecycle(&prs[0]), pooled_canonical, "{ctx}: pullRequests");
+            assert_eq!(
+                lifecycle(active),
+                lifecycle(&prs[0]),
+                "{ctx}: linked and pooled copies agree"
+            );
+        }
+    }
+
+    // Emit-path only: nothing is persisted back onto the workspace row.
+    let stored = store.get_workspace(&repro_a[0].1).await.expect("stored");
+    assert_eq!(
+        stored.active_pull_request.map(|p| p.status),
+        Some(PullRequestStatus::Open)
+    );
+}
+
 /// The emit-path PR merge moves a stale entry's status up the lifecycle
 /// ladder (open/draft < closed < merged) when a lower-priority duplicate
 /// ranks higher: a git-root entry still reading `open`/`draft`/`closed`
@@ -18079,6 +18561,151 @@ mod pr {
         let merged = list.iter().find(|p| p.number == 42).expect("merged kept");
         assert_eq!(merged.status, intent_core::PullRequestStatus::Merged);
         assert!(list.iter().any(|p| p.number == 77));
+    }
+
+    /// A spec-child task note in `status`, so it counts into the workspace's
+    /// `taskStats` for the displayStatus derivation.
+    fn sweep_task_note(ws_id: &WorkspaceId, status: intent_core::TaskStatus) -> intent_core::Note {
+        let ts = now_iso();
+        intent_core::Note {
+            id: intent_core::NoteId::from("t1"),
+            workspace_id: ws_id.clone(),
+            title: "Task".into(),
+            content: String::new(),
+            content_type: intent_core::ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: Some(intent_core::NoteId::from("spec")),
+            visibility: intent_core::NoteVisibility::Workspace,
+            metadata: intent_core::NoteMetadata {
+                task: Some(intent_core::TaskMetadata {
+                    status,
+                    ..Default::default()
+                }),
+            },
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        }
+    }
+
+    /// Persisted `workspace:displayStatus-changed` payloads for `ws_id`, in
+    /// emission order (`events_by_type` returns newest-first).
+    async fn display_status_events(svc: &Services, ws_id: &WorkspaceId) -> Vec<serde_json::Value> {
+        svc.store()
+            .events_by_type(ws_id, "workspace:displayStatus-changed", 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .rev()
+            .map(|e| e.data["displayStatus"].clone())
+            .collect()
+    }
+
+    /// The git-root PR sweep routes through the displayStatus recompute: with
+    /// every task complete (baseline `complete` seeded by a `workspace.list`
+    /// read), the root's linked PR being fetched as merged persists the
+    /// status delta and emits exactly one
+    /// `workspace:displayStatus-changed { displayStatus: "pr_merged" }`; an
+    /// identical re-sweep persists nothing and emits nothing.
+    #[tokio::test]
+    async fn root_refresh_merged_pr_emits_display_status_changed() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let wsroot = super::WorkspacesRoot::new();
+        let svc = svc.with_workspaces_root(wsroot.path().to_path_buf());
+        svc.store()
+            .insert_note(&sweep_task_note(&ws.id, intent_core::TaskStatus::Complete))
+            .await
+            .unwrap();
+
+        // Seed the last-observed baseline at `complete` via a list read (a
+        // seed never emits).
+        let list = svc.list_workspaces(false).await.unwrap();
+        let row = list.iter().find(|w| w.id == ws.id).expect("row");
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::Complete)
+        );
+        assert!(display_status_events(&svc, &ws.id).await.is_empty());
+
+        // The root's open linked PR lands via the store (not the service),
+        // so nothing recomputes until the sweep persists the merge.
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        root.pr_number = Some(42);
+        root.pr_url = Some("https://github.com/o/r/pull/42".into());
+        root.pr_status = Some(intent_core::PullRequestStatus::Open);
+        let mut open_info = crate::pr_ops::build_pr_info(&sample_pr());
+        open_info.status = intent_core::PullRequestStatus::Open;
+        root.pull_requests = Some(vec![open_info]);
+        svc.store().upsert_workspace_git_root(&root).await.unwrap();
+        assert!(display_status_events(&svc, &ws.id).await.is_empty());
+
+        let sc: Arc<dyn SourceControl> = Arc::new(StubForge {
+            merged_linked: true,
+            ..Default::default()
+        });
+        let outcome = svc.refresh_git_root_pr(root.clone(), &sc).await.unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Updated);
+        assert_eq!(
+            display_status_events(&svc, &ws.id).await,
+            vec![json!("pr_merged")],
+            "one transition to pr_merged"
+        );
+
+        // Identical forge state: no persist, no event.
+        let roots = svc.store().list_workspace_git_roots(&ws.id).await.unwrap();
+        let outcome = svc
+            .refresh_git_root_pr(roots[0].clone(), &sc)
+            .await
+            .unwrap();
+        assert_eq!(outcome, crate::PrRefreshOutcome::Unchanged);
+        assert_eq!(display_status_events(&svc, &ws.id).await.len(), 1);
+    }
+
+    /// Registering a root that already carries a merged PR promotes the
+    /// rollup (`complete` → `pr_merged`) and unregistering the PR-bearing
+    /// root lapses it back (`pr_merged` → `complete`); each transition emits
+    /// exactly once.
+    #[tokio::test]
+    async fn git_root_register_unregister_recompute_display_status() {
+        let primary = SweepRepo::init("main", None);
+        let secondary = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+        let (_t, svc, ws) = sweep_setup(&primary.dir).await;
+        let wsroot = super::WorkspacesRoot::new();
+        let svc = svc.with_workspaces_root(wsroot.path().to_path_buf());
+        svc.store()
+            .insert_note(&sweep_task_note(&ws.id, intent_core::TaskStatus::Complete))
+            .await
+            .unwrap();
+
+        // Seed the baseline at `complete` via a list read (never emits).
+        let list = svc.list_workspaces(false).await.unwrap();
+        let row = list.iter().find(|w| w.id == ws.id).expect("row");
+        assert_eq!(
+            row.display_status,
+            Some(intent_core::WorkspaceDisplayStatus::Complete)
+        );
+        assert!(display_status_events(&svc, &ws.id).await.is_empty());
+
+        let mut root = sweep_root(&ws.id, &secondary.dir, Some(("o", "r")));
+        let mut merged_pr = sample_pr();
+        merged_pr.state = PrState::Merged;
+        root.pull_requests = Some(vec![crate::pr_ops::build_pr_info(&merged_pr)]);
+        let stored = svc.register_git_root(&root).await.unwrap();
+        assert_eq!(
+            display_status_events(&svc, &ws.id).await,
+            vec![json!("pr_merged")]
+        );
+
+        svc.unregister_git_root(&stored.id).await.unwrap();
+        assert_eq!(
+            display_status_events(&svc, &ws.id).await,
+            vec![json!("pr_merged"), json!("complete")]
+        );
     }
 
     /// Build a persisted `pull_requests` entry shaped exactly like

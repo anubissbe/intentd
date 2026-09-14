@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
@@ -452,6 +452,96 @@ pub(crate) enum DefaultModelSource {
 pub(crate) struct CreateModelAndEffort {
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
+}
+
+/// Output of [`Services::plan_agent_create`]: every value the persist half
+/// ([`Services::persist_agent_create`]) needs that was derived from a
+/// *failing* check — the delegation-depth guard, specialist canonicalization,
+/// display-name derivation, attachment-block validation, and the provider /
+/// model / reasoning-effort chain. Once a plan exists, the agent create has
+/// no input / derived-config rejection (`-32602`) left to raise: persisting
+/// it can only fail on infrastructure ([`AgentPersistError`]). The guarantee
+/// covers the create seam only — a caller's own calls between plan and
+/// persist keep their own errors (e.g. `workspace.create`'s `ensure_spec_note`
+/// can still hit `NotFound` on a concurrent delete).
+///
+/// Two fields are post-plan inputs that `workspace.create`'s `initialAgent`
+/// stamps on the plan between planning and persisting; neither is a
+/// validation. `skip_auto_commit` depends on the new workspace's effective
+/// auto-commit, known only once the workspace row exists. `workspace_id` is
+/// a pure passthrough: the planner forwards it untouched, no check consults
+/// it, and `workspace.create` plans with an empty placeholder and stamps
+/// the derived id before persist (see the field doc).
+#[derive(Debug, Clone)]
+pub(crate) struct AgentCreatePlan {
+    /// Error-label method (`agent.create` / `workspace.create`) for the
+    /// persist half's infrastructure failures.
+    pub(crate) method: &'static str,
+    /// Workspace the session row belongs to. Passthrough/stamping invariant:
+    /// [`Services::plan_agent_create`] only forwards this field — none of its
+    /// checks read it — so `workspace.create` passes an empty placeholder
+    /// (the id is derived only after the plan, from the initial prompt) and
+    /// stamps the derived id here before [`Services::persist_agent_create`].
+    /// Store-backed seams (`agent.create` & co.) pass the real id up front.
+    /// A future API could drop workspace identity from the plan and take the
+    /// `WorkspaceId` as a persist argument instead, removing the placeholder
+    /// without changing `agent_create_op`'s signature (note only; not done).
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) parent_agent_id: Option<AgentId>,
+    pub(crate) task_note_id: Option<NoteId>,
+    pub(crate) skip_auto_commit: bool,
+    pub(crate) name: String,
+    pub(crate) name_explicitly_set: bool,
+    /// Canonical specialist id (alias already rewritten).
+    pub(crate) specialist: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) metadata: Option<Value>,
+    pub(crate) delegation_depth: Option<i64>,
+    pub(crate) initial_message: Option<String>,
+    pub(crate) context_references: Option<Value>,
+    pub(crate) image_blocks: Option<Value>,
+    pub(crate) file_blocks: Option<Value>,
+    pub(crate) is_background: bool,
+}
+
+/// Why [`Services::persist_agent_create`] could not persist a planned session.
+/// Deliberately narrow — infrastructure only — so the persist half cannot
+/// express an input rejection: every variant maps to `-32603` via
+/// [`From<AgentPersistError> for Error`], and there is no `From<Error>` in the
+/// other direction, so a `?` on an [`Error`]-typed result does not compile
+/// inside the persist half.
+#[derive(Debug)]
+pub(crate) enum AgentPersistError {
+    /// The session insert failed.
+    Store(String),
+    /// Encoding the harness snapshot failed.
+    Internal(String),
+    /// The specialist-snapshot blocking task panicked or was cancelled.
+    Join(tokio::task::JoinError),
+}
+
+impl AgentPersistError {
+    fn store(e: Error) -> Self {
+        match e {
+            Error::Internal(msg) => AgentPersistError::Store(msg),
+            other => AgentPersistError::Store(other.to_string()),
+        }
+    }
+}
+
+impl From<AgentPersistError> for Error {
+    fn from(e: AgentPersistError) -> Self {
+        match e {
+            AgentPersistError::Store(msg) | AgentPersistError::Internal(msg) => {
+                Error::Internal(msg)
+            }
+            AgentPersistError::Join(e) => {
+                Error::Internal(format!("specialist snapshot task failed: {e}"))
+            }
+        }
+    }
 }
 
 /// Single daemon-side default-model resolver (spec "New resolution policy").
@@ -965,6 +1055,35 @@ fn ensure_provider_runnable(
         )));
     }
     Ok(())
+}
+
+/// Result of [`Services::claim_parked_recovery_send`] (intent-hq/intent#4962).
+pub(crate) enum RecoverySendClaim {
+    /// The marked entry was queued and ready: it is popped (listed as
+    /// draining until the guard drops) and the marker is retired.
+    Drained(Box<(QueuedMessage, DrainingGuard)>),
+    /// The marker stands but its entry cannot be dispatched right now: it
+    /// is under edit, or it was popped provisionally (an
+    /// `agent.sendQueuedMessageNow` / worker raced pop that has not yet won
+    /// the slot and may hand it back). Nothing changes; a later probe — the
+    /// slot holder's exit, the next recovery send — retries.
+    Deferred,
+    /// No marker, or the marked entry is gone from both the queue and the
+    /// draining overlay (removed, or re-minted under a new id): the stale
+    /// marker is dropped.
+    Absent,
+}
+
+/// Whether a [`Services::pop_draining`] pop commits the popped entries'
+/// delivery (intent-hq/intent#4962): a pop made under a held in-flight slot
+/// does, and retires the parked recovery-send marker on the spot; a pop made
+/// BEFORE the slot claim (`agent.sendQueuedMessageNow`, the worker's raced
+/// pop) is provisional — it may hand the entry back on a lost claim — and
+/// the caller commits once its claim succeeds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PopCommit {
+    Delivery,
+    Provisional,
 }
 
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
@@ -3590,11 +3709,11 @@ impl Services {
     }
 
     /// The creation-time provider / model / reasoning-effort chain, in one
-    /// place (no persistence, no event): [`Self::agent_create_op`] runs it
-    /// before the session insert and [`Services::preflight_workspace_create`]
-    /// runs the same chain for `workspace.create`'s `initialAgent` before the
-    /// workspace row exists, so every `-32602` it can produce fires ahead of
-    /// any side effect on both seams. In order:
+    /// place (no persistence, no event): [`Self::plan_agent_create`] runs it
+    /// on every create seam — before the session insert for `agent.create` /
+    /// delegate / wake, and before the workspace row exists for
+    /// `workspace.create`'s `initialAgent` — so every `-32602` it can produce
+    /// fires ahead of any side effect. In order:
     /// 1. Default-model resolution when the caller supplied no `model`
     ///    ([`resolve_agent_default_model_with_source`]: specialist pin →
     ///    settings chain → catalog default → CLI default), on the blocking
@@ -3799,6 +3918,18 @@ impl Services {
     /// `agent.delegate` so the auto-commit-on-idle subscriber (LNI-1) can
     /// resolve the `Linked-Note-Id:` trailer and honor the opt-out.
     ///
+    /// Two typed phases: [`Self::plan_agent_create`] owns every `-32602`
+    /// producer and yields an [`AgentCreatePlan`]; [`Self::persist_agent_create`]
+    /// turns the plan into a session row and, by its
+    /// [`AgentPersistError`] return type, cannot raise an input rejection.
+    /// This op is the thin `plan → persist` wrapper for the store-backed
+    /// seams (`agent.create`, `agent.delegate`, `agent.wakeOrCreate`);
+    /// `workspace.create` calls the two phases directly — plan right after
+    /// its request-shape preflight (before the workspaces root is resolved or
+    /// the workspace row is inserted; the plan's `workspace_id` is stamped
+    /// once the id is derived), persist after the insert (see the
+    /// `create_workspace` closure in `lib.rs`).
+    ///
     /// Agent ids are server-assigned: the op always mints a fresh
     /// `agent-{uuid}` id (client-supplied ids are rejected `-32602` at the
     /// transport boundary before this op runs).
@@ -3830,6 +3961,70 @@ impl Services {
         skip_auto_commit: bool,
         extra: AgentCreateExtra,
     ) -> Result<Value> {
+        // SECURITY: the project tier resolves against the stored workspace
+        // record's path, never a client-supplied one (review thread
+        // PRRT_kwDOS9Wxuc6SIhDc — a malicious client could supply a spoofed
+        // `workspacePath` and read specialist files from other workspaces).
+        // Use worktree_path if available, otherwise repository_path. Read once
+        // and only when a specialist tier is actually consulted (specialist
+        // canonicalization / display name, model resolution, the specialist
+        // reasoning-effort rungs, and/or the specialist prompt snapshot).
+        let spec_wp = if model.is_none() || specialist.is_some() {
+            self.store
+                .get_workspace(&workspace_id)
+                .await
+                .ok()
+                .and_then(|w| crate::git_ops::worktree_path(&w))
+        } else {
+            None
+        };
+        let plan = self
+            .plan_agent_create(
+                "agent.create",
+                workspace_id,
+                name,
+                model,
+                specialist,
+                parent_agent_id,
+                task_note_id,
+                skip_auto_commit,
+                extra,
+                spec_wp.clone(),
+            )
+            .await?;
+        Ok(self.persist_agent_create(plan, spec_wp).await?)
+    }
+
+    /// Plan half of an agent create: runs, in order, every `-32602` producer
+    /// of the create seam and returns the [`AgentCreatePlan`] the persist half
+    /// consumes — the delegation-depth guard, specialist canonicalization,
+    /// display-name derivation, attachment-block harvest + validation, and the
+    /// provider / model / reasoning-effort chain
+    /// ([`Self::resolve_create_model_and_effort`]). Pure with respect to the
+    /// store: nothing is written, so a rejection here is side-effect free on
+    /// every seam — which is what lets a caller such as `workspace.create`
+    /// run it BEFORE its workspace row is inserted.
+    ///
+    /// `method` labels the errors (`agent.create` / `workspace.create`).
+    /// `spec_wp` is the single project-tier root for the plan's *failing*
+    /// specialist reads (canonical id, display name, model / effort).
+    /// SECURITY: callers pass the stored workspace's worktree path (never a
+    /// client-supplied one) or, for `workspace.create`, the `repositoryPath`
+    /// checkout being adopted.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn plan_agent_create(
+        &self,
+        method: &'static str,
+        workspace_id: WorkspaceId,
+        name: Option<String>,
+        model: Option<String>,
+        specialist: Option<String>,
+        parent_agent_id: Option<AgentId>,
+        task_note_id: Option<NoteId>,
+        skip_auto_commit: bool,
+        extra: AgentCreateExtra,
+        spec_wp: Option<PathBuf>,
+    ) -> Result<AgentCreatePlan> {
         // Depth guard at the service layer (LC-1): mirror the MCP `create_agent`
         // front-door check so every path that spawns a child for a parent
         // already at `MAX_DELEGATION_DEPTH` is refused — including RPC/service
@@ -3862,17 +4057,11 @@ impl Services {
         // `create_agent`/`ws.agent.create` tools, `agent.delegate`,
         // `agent.wakeOrCreate`'s create branch, `workspace.create`'s
         // `initialAgent`), so the validation covers them all.
-        // SECURITY: the project tier resolves against the stored workspace
-        // record's path, never a client-supplied one (same rationale as the
-        // model resolution below).
+        // The project tier resolves against `spec_wp` (see the doc comment:
+        // never a client-supplied path).
         let specialist = match specialist {
             Some(spec_id) => {
-                let wp = self
-                    .store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .ok()
-                    .and_then(|w| crate::git_ops::worktree_path(&w));
+                let wp = spec_wp.clone();
                 // Canonicalization walks the specialist tier directories —
                 // blocking pool (monorepo#4148).
                 let services = self.clone();
@@ -3884,15 +4073,12 @@ impl Services {
                     })
                     .await
                     .map_err(|e| {
-                        Error::Internal(format!(
-                            "agent.create specialist resolution task failed: {e}"
-                        ))
+                        Error::Internal(format!("{method} specialist resolution task failed: {e}"))
                     })??,
                 )
             }
             None => None,
         };
-        let now = now_iso();
         // Derive an omitted name from the specialist's resolved display name
         // (frontmatter `name`, 3-tier project > user > bundled — the same
         // workspace-path-aware seam the model resolution below uses) so a
@@ -3903,15 +4089,7 @@ impl Services {
         // still applies.
         let specialist_display_name = match (&name, specialist.as_deref()) {
             (None, Some(spec_id)) => {
-                // SECURITY: derive workspace_path from the stored workspace
-                // record, never the client-supplied value (same rationale as
-                // the model resolution below).
-                let wp = self
-                    .store
-                    .get_workspace(&workspace_id)
-                    .await
-                    .ok()
-                    .and_then(|w| crate::git_ops::worktree_path(&w));
+                let wp = spec_wp.clone();
                 // Display-name resolution walks the specialist tiers —
                 // blocking pool (monorepo#4148); a JoinError degrades to the
                 // generic name fallback, never failing the create.
@@ -3944,19 +4122,18 @@ impl Services {
         let name = name
             .or(specialist_display_name)
             .unwrap_or_else(|| format!("Agent {}", &Uuid::new_v4().simple().to_string()[..6]));
-        let id = AgentId(format!("agent-{}", Uuid::new_v4()));
         // `metadata` is persisted (C1d-10a, closes the metadata half of the
         // P2-12a deferral) so `agent.wakeOrCreate` chains can read back the
         // parent's `delegationDepth`/`createdByAgentId`/`taskNoteId`/
         // `isBackground`/`source`/`skipAutoCommit` without a follow-up round-trip.
-        // `workspace_path` is now used for project-tier specialist resolution;
-        // `agent_type` and `workspace_context` remain deferred.
+        // Project-tier specialist resolution reads the trusted `spec_wp`, not
+        // `workspace_path`; `agent_type` and `workspace_context` remain deferred.
         let AgentCreateExtra {
             provider,
             reasoning_effort,
             agent_type: _,
-            mut metadata,
-            workspace_path: _, // Ignored; derived from workspace record for security
+            metadata,
+            workspace_path: _, // Ignored; `spec_wp` comes from the caller's trusted root
             workspace_context: _,
             context_references,
             image_blocks,
@@ -3987,9 +4164,9 @@ impl Services {
         // image references must name registered attachments in this
         // workspace (monorepo#3338). Runs before any side effect so a
         // `-32602` rejection persists nothing.
-        validate_file_blocks("agent.create", file_blocks.as_ref())?;
-        validate_image_blocks("agent.create", image_blocks.as_ref())?;
-        self.validate_image_block_refs("agent.create", image_blocks.as_ref())
+        validate_file_blocks(method, file_blocks.as_ref())?;
+        validate_image_blocks(method, image_blocks.as_ref())?;
+        self.validate_image_block_refs(method, image_blocks.as_ref())
             .await?;
         let is_background = is_background
             .or_else(|| meta_get("isBackground").and_then(|v| v.as_bool()))
@@ -4000,33 +4177,14 @@ impl Services {
         // `resolve_agent_default_model`). The resolved model is persisted to
         // session.model, pinning it for the agent's lifetime. Settings changes
         // only affect new agents created afterwards; existing agents change
-        // model only via explicit agent.setModel.
-        // SECURITY: derive workspace_path from the stored workspace record
-        // rather than trusting the client-supplied value (review thread
-        // PRRT_kwDOS9Wxuc6SIhDc). A malicious client could supply a spoofed
-        // workspacePath and read specialist files from other workspaces.
-        // Use worktree_path if available, otherwise repository_path. Read once
-        // and only when a specialist tier is actually consulted (model
-        // resolution, the specialist reasoning-effort rungs, and/or the
-        // specialist prompt snapshot below).
-        let spec_wp = if model.is_none() || specialist.is_some() {
-            self.store
-                .get_workspace(&workspace_id)
-                .await
-                .ok()
-                .and_then(|w| crate::git_ops::worktree_path(&w))
-        } else {
-            None
-        };
-        // The provider / model / reasoning-effort chain (shared with the
-        // `workspace.create` preflight): every `-32602` it can raise fires
-        // here, before the session is persisted.
+        // model only via explicit agent.setModel. The provider / model /
+        // reasoning-effort chain is the last `-32602` producer of the plan.
         let CreateModelAndEffort {
             model: resolved_model,
             reasoning_effort,
         } = self
             .resolve_create_model_and_effort(
-                "agent.create",
+                method,
                 model,
                 specialist.as_deref(),
                 provider.as_deref(),
@@ -4034,6 +4192,69 @@ impl Services {
                 spec_wp.as_deref(),
             )
             .await?;
+        Ok(AgentCreatePlan {
+            method,
+            workspace_id,
+            parent_agent_id,
+            task_note_id,
+            skip_auto_commit,
+            name,
+            name_explicitly_set,
+            specialist,
+            model: resolved_model,
+            provider,
+            reasoning_effort,
+            metadata,
+            delegation_depth,
+            initial_message,
+            context_references,
+            image_blocks,
+            file_blocks,
+            is_background,
+        })
+    }
+
+    /// Persist half of an agent create: turns an [`AgentCreatePlan`] into a
+    /// session row and emits `agent:created`. Everything here is either
+    /// non-failing (the specialist prompt / orchestrator snapshot, usage
+    /// stats) or infrastructure ([`AgentPersistError`]) — by construction it
+    /// cannot raise an input / derived-config rejection (`-32602`), so a
+    /// caller such as `workspace.create` can run it AFTER its workspace row
+    /// is inserted without such a rejection stranding that row (store /
+    /// internal / join failures remain possible and map to `-32603`; what the
+    /// caller itself does between insert and persist is outside this claim).
+    ///
+    /// `snapshot_wp` is the project-tier root for the *non-failing* specialist
+    /// snapshot (`resolve_prompt_injection` / `resolve_is_orchestrator`): the
+    /// stored workspace's worktree for the store-backed seams, the freshly
+    /// provisioned worktree at `baseRef` for `workspace.create`.
+    pub(crate) async fn persist_agent_create(
+        &self,
+        plan: AgentCreatePlan,
+        snapshot_wp: Option<PathBuf>,
+    ) -> std::result::Result<Value, AgentPersistError> {
+        let AgentCreatePlan {
+            method,
+            workspace_id,
+            parent_agent_id,
+            task_note_id,
+            skip_auto_commit,
+            name,
+            name_explicitly_set,
+            specialist,
+            model: resolved_model,
+            provider,
+            reasoning_effort,
+            mut metadata,
+            delegation_depth,
+            initial_message,
+            context_references,
+            image_blocks,
+            file_blocks,
+            is_background,
+        } = plan;
+        let now = now_iso();
+        let id = AgentId(format!("agent-{}", Uuid::new_v4()));
         // Specialist prompt snapshot: freeze the resolved specialist injection
         // for the session's lifetime by persisting it into the metadata JSON,
         // so later edits/deletes of user/project-tier specialist files never
@@ -4052,7 +4273,7 @@ impl Services {
             // directories — blocking pool (monorepo#4148).
             let services = self.clone();
             let spec_id_owned = spec_id.to_string();
-            let wp = spec_wp.clone();
+            let wp = snapshot_wp.clone();
             let (injection, frozen_is_orchestrator) = tokio::task::spawn_blocking(move || {
                 (
                     services
@@ -4064,9 +4285,7 @@ impl Services {
                 )
             })
             .await
-            .map_err(|e| {
-                Error::Internal(format!("agent.create specialist snapshot task failed: {e}"))
-            })?;
+            .map_err(AgentPersistError::Join)?;
             if let Some((body, spec_name, reminder)) = injection {
                 let meta_value =
                     metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
@@ -4121,8 +4340,11 @@ impl Services {
         // wakeOrCreate children funnel through this op and mint the latest
         // version, never inheriting the parent's pinned one.
         let settings = self.effective_settings();
-        let harness_features = serde_json::to_value(&settings.agent_features)
-            .map_err(|e| Error::Internal(format!("encode agentFeatures snapshot failed: {e}")))?;
+        let harness_features = serde_json::to_value(&settings.agent_features).map_err(|e| {
+            AgentPersistError::Internal(format!(
+                "{method}: encode agentFeatures snapshot failed: {e}"
+            ))
+        })?;
         let session = AgentSession {
             id,
             workspace_id,
@@ -4193,7 +4415,8 @@ impl Services {
         let task_graph_enabled = settings.agent_features.task_graph;
         self.store
             .insert_agent_session_with_task_graph(&session, task_graph_enabled)
-            .await?;
+            .await
+            .map_err(AgentPersistError::store)?;
         self.invalidate_agent_list_cache(&session.workspace_id);
         // Global usage-stats (D2): count this session start in the current UTC
         // hour bucket under the session's stats model key (normalized model,
@@ -5817,6 +6040,10 @@ impl Services {
     /// editing) we additionally fire `try_drain_queue` so the message
     /// self-drains as if it had just been enqueued — honouring the user's
     /// "re-queued on save, which self-drains" semantics (PROTOCOL §5.5/§6.5).
+    /// A parked recovery send (intent-hq/intent#4962) whose redrive deferred
+    /// while it was under edit is probed first: its marker lifts the STAB-52
+    /// `Error` gate for that entry alone, and an unmarked entry still meets
+    /// the ordinary gate.
     pub(crate) async fn agent_edit_queued_message_op(
         &self,
         agent_id: AgentId,
@@ -5849,6 +6076,9 @@ impl Services {
         if was_editing && !now_editing {
             if let Some(manager) = self.agent_manager() {
                 if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                    manager
+                        .redrive_parked_recovery_send(&agent_id, &session.workspace_id)
+                        .await;
                     manager
                         .try_drain_queue(agent_id, session.workspace_id)
                         .await;
@@ -13096,6 +13326,49 @@ impl Services {
         (queued, position)
     }
 
+    /// [`Services::enqueue_message_with_id`] for an `agent.sendMessage` into
+    /// an `Error` session that lost the in-flight slot (intent-hq/intent#4962):
+    /// queues the entry AND records it as the agent's parked recovery send
+    /// in one critical section under the draining lock — the lock every
+    /// committed pop ([`Services::pop_draining`]) holds while it retires the
+    /// marker. A pop therefore either precedes the enqueue (and finds no
+    /// entry) or follows the marker (and retires it); it can never slip
+    /// between the two and leave a marker authorizing an entry a competing
+    /// drain has already dispatched (and then requeued under its ORIGINAL
+    /// id on a context-size failure). Replaces any earlier marker: the newer
+    /// send is the authorization that stands.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_recovery_send(
+        &self,
+        agent_id: &AgentId,
+        message_id: String,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        origin: MessageOrigin,
+    ) -> (QueuedMessage, usize) {
+        let _draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let (queued, position) = self.enqueue_message_with_id(
+            agent_id,
+            Some(message_id),
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            origin,
+        );
+        self.mark_parked_recovery_send(agent_id, queued.id.clone());
+        (queued, position)
+    }
+
     /// Enqueue (or refresh) a **held** entry on an agent's queue: the entry
     /// carries a `(hold_kind, hold_until, child_agent_id)` debounce-hold
     /// marker, is excluded from every drain path until released, persists
@@ -13788,6 +14061,131 @@ impl Services {
             .is_some_and(|q| q.iter().any(QueuedMessage::ready_to_send))
     }
 
+    /// `true` iff the agent's queue still holds a ready-to-send entry with
+    /// this exact `id` — the test-side view of what
+    /// [`Self::claim_parked_recovery_send`] would pop.
+    #[cfg(test)]
+    pub(crate) fn is_message_queued(&self, agent_id: &AgentId, message_id: &str) -> bool {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .is_some_and(|q| q.iter().any(|m| m.id == message_id && m.ready_to_send()))
+    }
+
+    /// Record a user send parked by the busy race as the agent's pending
+    /// recovery send (intent-hq/intent#4962); see `Services::parked_recovery_sends`.
+    /// Production records it through [`Self::enqueue_recovery_send`], atomically
+    /// with the enqueue; tests seed markers directly. Replaces any earlier
+    /// marker: the newer send is the authorization that stands.
+    pub(crate) fn mark_parked_recovery_send(&self, agent_id: &AgentId, message_id: String) {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .insert(agent_id.clone(), message_id);
+    }
+
+    /// The agent's pending recovery-send marker, if any — a cheap peek so a
+    /// probe skips the drain's store reads when nothing is parked. Never
+    /// authority: only [`Self::claim_parked_recovery_send`], under the slot
+    /// claim, hands the entry out.
+    pub(crate) fn parked_recovery_send(&self, agent_id: &AgentId) -> Option<String> {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .get(agent_id)
+            .cloned()
+    }
+
+    /// Dispatch the agent's parked recovery send (intent-hq/intent#4962):
+    /// read the marker, pop exactly that entry iff it is queued and
+    /// `ready_to_send`, and retire the marker — one critical section under
+    /// the draining lock, the same lock every committed pop holds while it
+    /// retires the marker, so no delivery can interleave with the decision.
+    /// The redrive calls this INSIDE its in-flight slot claim
+    /// (`AgentManager::claim_slot_sync`): the slot is taken only together
+    /// with the entry, so there is never an authorization living outside
+    /// this registry — no local id to go stale across gate awaits, nothing
+    /// to hand back on a lost claim, and no turn-start side effect (the
+    /// `Active` persist, `stop_reason` clear) unless a delivery follows.
+    ///
+    /// A marker whose entry is under edit, or was popped provisionally by a
+    /// path that has not yet won the slot (`agent.sendQueuedMessageNow`, the
+    /// worker's raced pop), is left standing ([`RecoverySendClaim::Deferred`])
+    /// — the provisional holder either commits the delivery, retiring it,
+    /// or hands the entry back for a later probe. A marker whose entry is in
+    /// neither the queue nor the draining overlay is stale (removed, or
+    /// re-minted under a new id by a terminal-failure requeue) and dropped.
+    pub(crate) fn claim_parked_recovery_send(&self, agent_id: &AgentId) -> RecoverySendClaim {
+        let mut draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let Some(message_id) = self.parked_recovery_send(agent_id) else {
+            return RecoverySendClaim::Absent;
+        };
+        let (popped, queued) = {
+            let mut queues = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            match queues.get_mut(agent_id) {
+                Some(queue) => match queue.iter().position(|m| m.id == message_id) {
+                    Some(idx) if queue[idx].ready_to_send() => (Some(queue.remove(idx)), true),
+                    Some(_) => (None, true),
+                    None => (None, false),
+                },
+                None => (None, false),
+            }
+        };
+        if let Some(entry) = popped {
+            self.parked_recovery_sends
+                .lock()
+                .expect("parked recovery send registry poisoned")
+                .remove(agent_id);
+            let guard =
+                self.register_draining(&mut draining, agent_id, std::slice::from_ref(&entry));
+            return RecoverySendClaim::Drained(Box::new((entry, guard)));
+        }
+        let popped_provisionally = draining
+            .get(agent_id)
+            .is_some_and(|d| d.iter().any(|m| m.id == message_id));
+        if queued || popped_provisionally {
+            return RecoverySendClaim::Deferred;
+        }
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .remove(agent_id);
+        RecoverySendClaim::Absent
+    }
+
+    /// Retire the parked recovery-send marker (intent-hq/intent#4962) when a
+    /// delivery of its entry is committed: the send it authorized is now in
+    /// flight, so a later requeue of the same entry — a context-size requeue
+    /// keeps the ORIGINAL id — must not re-validate it and lift the STAB-52
+    /// gate. Pops made under a held slot commit inside
+    /// [`Self::pop_draining`]; a provisional pop (`agent.sendQueuedMessageNow`,
+    /// the worker's raced pop — both pop BEFORE claiming the slot and hand
+    /// the entry back on a lost claim) calls this once its claim succeeds,
+    /// so an undelivered hand-back never strands the recovery send.
+    pub(crate) fn commit_recovery_send_delivery(
+        &self,
+        agent_id: &AgentId,
+        entries: &[QueuedMessage],
+    ) {
+        let mut parked = self
+            .parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned");
+        if parked
+            .get(agent_id)
+            .is_some_and(|id| entries.iter().any(|m| m.id == *id))
+        {
+            parked.remove(agent_id);
+        }
+    }
+
     /// `true` iff at least one ready-to-send queued entry is user-origin:
     /// the archived-drain exemption's legacy-row fallback (no `archivedAt`)
     /// uses this to decide whether a drain may proceed for the user entry.
@@ -13891,7 +14289,8 @@ impl Services {
     /// Pop the next ready-to-send entry ([`Services::dequeue_message`]) and,
     /// atomically with respect to [`Services::queue_snapshot`], keep it
     /// listed as draining until the returned [`DrainingGuard`] is dropped
-    /// (§6.5 drain ordering).
+    /// (§6.5 drain ordering). The caller holds the in-flight slot: the pop
+    /// commits the delivery ([`PopCommit::Delivery`]).
     pub(crate) fn dequeue_message_draining(
         &self,
         agent_id: &AgentId,
@@ -13900,6 +14299,24 @@ impl Services {
             agent_id,
             |s| s.dequeue_message(agent_id),
             std::slice::from_ref,
+            PopCommit::Delivery,
+        )
+    }
+
+    /// [`Services::dequeue_message_draining`] for the worker's end-of-turn
+    /// raced pop, which pops BEFORE re-claiming the slot and hands the entry
+    /// back on a lost claim: the pop is provisional
+    /// ([`PopCommit::Provisional`]) and the caller commits with
+    /// [`Services::commit_recovery_send_delivery`] once its claim succeeds.
+    pub(crate) fn dequeue_message_draining_provisional(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<(QueuedMessage, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_message(agent_id),
+            std::slice::from_ref,
+            PopCommit::Provisional,
         )
     }
 
@@ -13913,6 +14330,7 @@ impl Services {
             agent_id,
             |s| s.dequeue_user_origin_message(agent_id),
             std::slice::from_ref,
+            PopCommit::Delivery,
         )
     }
 
@@ -13929,6 +14347,7 @@ impl Services {
             agent_id,
             |s| s.dequeue_flush_batch(agent_id, mode, require_user_origin, min_ready),
             Vec::as_slice,
+            PopCommit::Delivery,
         )
     }
 
@@ -13944,6 +14363,7 @@ impl Services {
             agent_id,
             |s| s.dequeue_ready_batch(agent_id, require_user_origin, min_ready),
             Vec::as_slice,
+            PopCommit::Delivery,
         )
     }
 
@@ -13958,11 +14378,16 @@ impl Services {
             agent_id,
             |s| s.dequeue_system_only_batch(agent_id, min_ready),
             Vec::as_slice,
+            PopCommit::Delivery,
         )
     }
 
     /// [`Services::take_queued_message`] with the same draining registration
     /// as [`Services::dequeue_message_draining`] (`agent.sendQueuedMessageNow`).
+    /// The caller pops BEFORE claiming the slot and hands the entry back on
+    /// a lost claim, so the pop is provisional ([`PopCommit::Provisional`]);
+    /// it commits with [`Services::commit_recovery_send_delivery`] once the
+    /// claim succeeds.
     pub(crate) fn take_queued_message_draining(
         &self,
         agent_id: &AgentId,
@@ -13972,6 +14397,7 @@ impl Services {
             agent_id,
             |s| s.take_queued_message(agent_id, message_id),
             std::slice::from_ref,
+            PopCommit::Provisional,
         )
     }
 
@@ -13994,19 +14420,26 @@ impl Services {
     /// BEFORE `agent_queues`, the order [`Services::queue_snapshot`] uses), so
     /// no snapshot can observe the popped entries in neither place; the popped
     /// entries are recorded as draining and the returned [`DrainingGuard`]
-    /// retires them.
+    /// retires them. A [`PopCommit::Delivery`] pop also retires the parked
+    /// recovery-send marker under the same lock
+    /// ([`Services::commit_recovery_send_delivery`]).
     fn pop_draining<T>(
         &self,
         agent_id: &AgentId,
         pop: impl FnOnce(&Self) -> Option<T>,
         entries: impl FnOnce(&T) -> &[QueuedMessage],
+        commit: PopCommit,
     ) -> Option<(T, DrainingGuard)> {
         let mut draining = self
             .draining_queue_entries
             .lock()
             .expect("draining queue registry poisoned");
         let popped = pop(self)?;
-        let guard = self.register_draining(&mut draining, agent_id, entries(&popped));
+        let entries = entries(&popped);
+        if commit == PopCommit::Delivery {
+            self.commit_recovery_send_delivery(agent_id, entries);
+        }
+        let guard = self.register_draining(&mut draining, agent_id, entries);
         Some((popped, guard))
     }
 

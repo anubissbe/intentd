@@ -341,6 +341,12 @@ struct WorkspaceAggregateSnapshot {
     active_hooks: HashSet<WorkspaceId>,
     active_pr_monitors: HashSet<WorkspaceId>,
     monitor_pr_signals: HashMap<WorkspaceId, workspace_status::MonitorPrSignals>,
+    /// PRs persisted on each workspace's secondary git roots
+    /// (`workspace_git_root.pull_requests`): the list's ONE bulk git-root
+    /// read, fed to the displayStatus PR rungs during enrichment and then
+    /// handed to [`Services::merge_external_pull_requests`] for the wire
+    /// `pullRequests` merge. Empty lists are never inserted.
+    git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>>,
     legacy_question_holds: HashSet<AgentId>,
     cow_supported: Option<bool>,
 }
@@ -378,6 +384,30 @@ pub struct Services {
     /// never shows the entry gone before its row exists. Never persisted.
     /// Lock order: this mutex is taken BEFORE `agent_queues`, never after.
     draining_queue_entries: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Queue-entry id of an `agent.sendMessage` into an `Error` session that
+    /// lost the in-flight slot to a worker still holding it
+    /// (intent-hq/intent#4962). The documented recovery for an `Error`
+    /// session is a fresh send, but a send landing between the
+    /// terminal-failure handler's `Error` persist and its slot release is
+    /// parked in the queue — where the STAB-52 gate refuses to redrive it
+    /// and the exiting worker never drains. A send parked behind a
+    /// still-`Active` turn is never recorded: it is an ordinary mid-turn
+    /// queue entry and stays behind the gate if that turn fails. Recorded
+    /// atomically with the enqueue ([`agent_ops::Services::enqueue_recovery_send`]);
+    /// the releasing worker's exit and the send side's post-enqueue probe
+    /// both redrive THAT entry through
+    /// [`agent_ops::Services::claim_parked_recovery_send`], which pops the
+    /// entry and retires the marker INSIDE the in-flight slot claim — the
+    /// marker is the only authorization, never a copy held across awaits.
+    /// Retired by every committed delivery of the entry
+    /// ([`agent_ops::Services::commit_recovery_send_delivery`]) so a marker
+    /// never outlives its send: a context-size requeue restores entries
+    /// under their ORIGINAL ids, and without the clear a marker left by an
+    /// already-delivered send would lift the gate with no fresh send. Lock
+    /// order: `draining_queue_entries` → `agent_queues` → this mutex, all
+    /// nested inside the `AgentManager` `busy` lock when taken from the slot
+    /// claim. Never persisted.
+    parked_recovery_sends: Arc<Mutex<HashMap<AgentId, String>>>,
     /// Serializes [`agent_ops`] queue write-through persists. Each persist
     /// snapshots the live queue *inside* this async lock, so the last write to
     /// the `agent_queue` table always reflects the newest in-memory state — an
@@ -1168,6 +1198,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
+            parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
@@ -2555,9 +2586,12 @@ impl Services {
 
     /// Load every store-backed list aggregate in a constant number of
     /// statements, then pre-fold the PR and legacy-question projections.
+    /// `include_archived` mirrors the list call's flag so the git-root PR
+    /// bulk read never pays for archived workspaces the list won't return.
     async fn workspace_aggregate_snapshot(
         &self,
         workspace_ids: &[WorkspaceId],
+        include_archived: bool,
     ) -> WorkspaceAggregateSnapshot {
         let (max_note_updated_at, task_stats, sessions, unread, cow_supported) = tokio::join!(
             self.store.max_note_updated_at_by_workspace(workspace_ids),
@@ -2568,12 +2602,14 @@ impl Services {
                 .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
             self.compute_cow_supported(),
         );
-        let (active_hooks, monitors, legacy_question_tails) = tokio::join!(
+        let (active_hooks, monitors, legacy_question_tails, git_roots) = tokio::join!(
             self.store.workspaces_with_active_hooks(workspace_ids),
             self.store
                 .list_display_status_pr_monitors_by_workspaces(workspace_ids),
             self.store
                 .list_legacy_question_tail_candidates_by_workspace(workspace_ids),
+            self.store
+                .list_workspace_git_roots_with_prs(include_archived),
         );
 
         let task_stats = match task_stats {
@@ -2644,6 +2680,25 @@ impl Services {
             .into_iter()
             .map(|(id, monitors)| (id, pr_monitor::fold_monitor_pr_signals(&monitors)))
             .collect();
+        // A read failure degrades to no git-root PRs (the pre-fold
+        // derivation) rather than failing the list.
+        let mut git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>> = HashMap::new();
+        match git_roots {
+            Ok(roots) => {
+                for root in roots {
+                    if let Some(prs) = root.pull_requests.filter(|prs| !prs.is_empty()) {
+                        git_root_prs
+                            .entry(root.workspace_id)
+                            .or_default()
+                            .extend(prs);
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "batch git-root PR read failed; displayStatus derives without git-root PRs"
+            ),
+        }
 
         let sessions_by_agent: HashMap<&AgentId, &AgentSession> = sessions
             .iter()
@@ -2694,6 +2749,7 @@ impl Services {
             active_hooks: active_hooks.unwrap_or_default(),
             active_pr_monitors,
             monitor_pr_signals,
+            git_root_prs,
             legacy_question_holds,
             cow_supported,
         }
@@ -2766,6 +2822,11 @@ impl Services {
                     .get(&ws.id)
                     .copied()
                     .unwrap_or_default(),
+                git_root_prs: snapshot
+                    .git_root_prs
+                    .get(&ws.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
                 legacy_question_holds: &snapshot.legacy_question_holds,
             }),
         )
@@ -2793,45 +2854,54 @@ impl Services {
     /// pool the FE builds after opening a workspace, PROTOCOL §6.9). Purely
     /// an emit-path merge: nothing is persisted, `workspace.pull_requests`
     /// stays daemon-owned, and no forge calls are made (rung 1 of the
-    /// derived-field ladder: two SQL-filtered bulk reads + in-memory merge,
-    /// O(PR-bearing rows) regardless of workspace count; the monitor read is
-    /// the narrow [`intent_store::PrMonitorListEntry`] projection — snapshot
-    /// blobs never hydrate on this path, intent-hq/monorepo#3878). Dedup is by PR
+    /// derived-field ladder: one SQL-filtered monitor bulk read + the
+    /// git-root PRs the caller's aggregate snapshot already bulk-read —
+    /// `git_root_prs`, keyed by workspace, the list's single git-root
+    /// statement — + in-memory merge, O(PR-bearing rows) regardless of
+    /// workspace count; the monitor read is the narrow
+    /// [`intent_store::PrMonitorListEntry`] projection — snapshot blobs
+    /// never hydrate on this path, intent-hq/monorepo#3878). Dedup is by PR
     /// `url` — the one field every source carries that stays unambiguous
     /// across repos — first-wins in source-priority order: workspace's own
-    /// PRs, then git-root PRs, then monitor-derived entries. One exception
-    /// to first-wins: a lower-priority duplicate whose status sits higher
-    /// on the lifecycle ladder (open/draft < closed < merged) upgrades the
-    /// present entry's `status` + `updatedAt` + `isDraft` in place, so a
-    /// stale git-root/workspace entry can never shadow a monitor that
-    /// already saw the PR merge (intent-hq/monorepo#3127). Status only ever
-    /// moves up the ladder: `merged` is irreversible so it wins over
-    /// everything (including a stale `closed`), while `closed` — the
-    /// snapshotless completed-monitor fallback among others — never
-    /// downgrades a `merged` verdict, and reopened-after-close is left to
-    /// the sweep re-fetch. A row with nothing to merge is left untouched (a `None`
+    /// PRs, then git-root PRs, then monitor-derived entries. Identity
+    /// fields always keep the higher-priority entry; the lifecycle fields
+    /// of a duplicate follow the source:
+    /// - a git-root duplicate takes the SAME same-URL rule the
+    ///   `displayStatus` derivation folds git-root PRs with
+    ///   ([`workspace_status::canonicalize_pr_url_copies`]): the copy with
+    ///   the highest (lifecycle rank, `updatedAt`) wins `status` +
+    ///   `updatedAt` + `isDraft` + `mergeable` + `mergeableState` as one
+    ///   coherent snapshot, for the pooled entry AND the linked
+    ///   `activePullRequest`, so the served PR fields can never disagree
+    ///   with `displayStatus` (a merged root copy lifts a stale open linked
+    ///   copy beside `pr_merged`; a newer clean root copy lifts an older
+    ///   draft pooled copy beside `pr_ready`; the result is independent of
+    ///   git-root order). The read-path enrichment already applied this to
+    ///   the workspace-owned copies; re-applying here is idempotent and
+    ///   also covers root-only URLs carried by several roots.
+    /// - a monitor-derived duplicate upgrades only on a strictly higher
+    ///   lifecycle rank (open/draft < closed < merged) — `status` +
+    ///   `updatedAt` + `isDraft` ([`workspace_status::upgrade_pr_lifecycle`]),
+    ///   so a stale git-root/workspace entry can never shadow a monitor that
+    ///   already saw the PR merge (intent-hq/monorepo#3127). Status only
+    ///   ever moves up the ladder: `merged` is irreversible so it wins over
+    ///   everything (including a stale `closed`), while `closed` — the
+    ///   snapshotless completed-monitor fallback among others — never
+    ///   downgrades a `merged` verdict, and reopened-after-close is left to
+    ///   the sweep re-fetch.
+    ///
+    /// A row with nothing to merge is left untouched (a `None`
     /// stays omitted on the wire, and an empty git-root list contributes
     /// nothing rather than materializing `[]`); a store read failure
     /// degrades to serving the base rows. `include_archived` mirrors the
-    /// list call's flag so the bulk reads never pay for archived workspaces
-    /// the list won't return.
+    /// list call's flag so the monitor bulk read never pays for archived
+    /// workspaces the list won't return.
     pub(crate) async fn merge_external_pull_requests(
         &self,
         list: &mut [Workspace],
         include_archived: bool,
+        git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>>,
     ) {
-        use std::collections::HashMap;
-        let roots = match self
-            .store
-            .list_workspace_git_roots_with_prs(include_archived)
-            .await
-        {
-            Ok(roots) => roots,
-            Err(e) => {
-                tracing::warn!(error = %e, "workspace.list: git-root PR read failed; skipping");
-                Vec::new()
-            }
-        };
         let monitors = match self
             .store
             .load_non_cancelled_pr_monitor_list_entries(include_archived)
@@ -2843,59 +2913,48 @@ impl Services {
                 Vec::new()
             }
         };
-        if roots.is_empty() && monitors.is_empty() {
+        if git_root_prs.is_empty() && monitors.is_empty() {
             return;
         }
-        // Group externally sourced PRs per workspace, git-root entries before
-        // monitor-derived ones so the first-wins dedup below encodes the
-        // source priority. Empty lists are skipped so they can't flip an
-        // omitted workspace `pullRequests` into `[]`.
-        let mut extras: HashMap<String, Vec<PullRequestInfo>> = HashMap::new();
-        for root in &roots {
-            if let Some(prs) = &root.pull_requests {
-                if prs.is_empty() {
-                    continue;
-                }
-                extras
-                    .entry(root.workspace_id.0.clone())
-                    .or_default()
-                    .extend(prs.iter().cloned());
-            }
-        }
+        // Group monitor-derived PRs per workspace; they merge after the
+        // git-root entries so the first-wins dedup below encodes the source
+        // priority. The snapshot never carries an empty git-root list, so no
+        // entry here can flip an omitted workspace `pullRequests` into `[]`.
+        let mut git_root_prs = git_root_prs;
+        let mut monitor_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>> = HashMap::new();
         for monitor in &monitors {
-            extras
-                .entry(monitor.workspace_id.0.clone())
+            monitor_prs
+                .entry(monitor.workspace_id.clone())
                 .or_default()
                 .push(pr_monitor::pr_monitor_pr_info(monitor));
         }
-        // Lifecycle-ladder rank: status only ever moves up (open/draft <
-        // closed < merged) — merged is irreversible, closed must never
-        // overwrite it (see the doc comment).
-        let status_rank = |s: intent_core::PullRequestStatus| match s {
-            intent_core::PullRequestStatus::Merged => 2,
-            intent_core::PullRequestStatus::Closed => 1,
-            intent_core::PullRequestStatus::Open | intent_core::PullRequestStatus::Draft => 0,
-        };
         for ws in list.iter_mut() {
-            let Some(candidates) = extras.remove(ws.id.as_str()) else {
+            let roots = git_root_prs.remove(&ws.id).unwrap_or_default();
+            let monitored = monitor_prs.remove(&ws.id).unwrap_or_default();
+            if roots.is_empty() && monitored.is_empty() {
                 continue;
-            };
+            }
             let merged = ws.pull_requests.get_or_insert_with(Vec::new);
-            for info in candidates {
+            for mut info in roots {
+                // The derivation's same-URL step: the linked and pooled
+                // copies of this URL move to the canonical snapshot; a URL
+                // the pool does not carry is appended, itself canonicalized
+                // (it may duplicate the linked `activePullRequest`, and a
+                // URL's copies always agree).
+                let copies = workspace_status::canonicalize_pr_url_copies(
+                    ws.active_pull_request.as_mut(),
+                    merged,
+                    &info,
+                );
+                if !copies.pooled {
+                    workspace_status::canonicalize_pr_lifecycle(&mut info, &copies.canonical);
+                    merged.push(info);
+                }
+            }
+            for info in monitored {
                 match merged.iter_mut().find(|p| p.url == info.url) {
                     None => merged.push(info),
-                    // Status-ladder upgrade: identity/fields keep the
-                    // higher-priority entry, but a lower-priority source
-                    // whose status ranks higher wins the lifecycle fields —
-                    // `isDraft` moves with `status` so an upgraded entry
-                    // never reads merged/closed while still claiming draft.
-                    Some(present) => {
-                        if status_rank(info.status) > status_rank(present.status) {
-                            present.status = info.status;
-                            present.updated_at = info.updated_at;
-                            present.is_draft = info.is_draft;
-                        }
-                    }
+                    Some(present) => workspace_status::upgrade_pr_lifecycle(present, &info),
                 }
             }
         }
@@ -4155,7 +4214,10 @@ impl Services {
     /// persisted as supplied; on merge the existing value is always retained
     /// (the store upsert never touches the column). Returns the stored row.
     /// Callers (the `ws.git.registerRoot` MCP binding, submodule
-    /// auto-detection) validate the path before reaching this.
+    /// auto-detection) validate the path before reaching this. A fresh
+    /// insert that already carries PR data feeds the displayStatus
+    /// derivation, so it routes through the transition-only recompute
+    /// (a merge never touches the PR columns, so it cannot move the rung).
     pub(crate) async fn register_git_root(
         &self,
         root: &intent_core::WorkspaceGitRoot,
@@ -4171,12 +4233,18 @@ impl Services {
             git_root_changed_event(event_type, &stored),
         )
         .await;
+        if inserted && git_root_carries_pr_data(&stored) {
+            self.maybe_emit_display_status_changed(&stored.workspace_id)
+                .await;
+        }
         Ok(stored)
     }
 
     /// Delete a workspace git root and emit `gitRoot:unregistered`
     /// (monorepo#2053). `NotFound` when the id is unknown. Used by the
     /// `ws.git.unregisterRoot` MCP binding and the auto-prune sweep.
+    /// Removing a PR-bearing root can lapse the displayStatus PR rung, so
+    /// that case routes through the transition-only recompute.
     pub(crate) async fn unregister_git_root(&self, git_root_id: &WorkspaceGitRootId) -> Result<()> {
         let root = self.store.get_workspace_git_root(git_root_id).await?;
         self.store.delete_workspace_git_root(git_root_id).await?;
@@ -4185,6 +4253,10 @@ impl Services {
             git_root_unregistered_event(&root.workspace_id, &root.id, &root.path),
         )
         .await;
+        if git_root_carries_pr_data(&root) {
+            self.maybe_emit_display_status_changed(&root.workspace_id)
+                .await;
+        }
         Ok(())
     }
 
@@ -4473,7 +4545,10 @@ impl Services {
     /// [`PR_REFRESH_FETCH_TIMEOUT`] wrap, never RPC-time.
     ///
     /// Persists via the scoped `update_workspace_git_root_pr` and emits
-    /// `gitRoot:updated` once, only on change.
+    /// `gitRoot:updated` once, only on change. A persisted change also routes
+    /// through the transition-only displayStatus recompute, so a root PR
+    /// merging (or opening) regroups the sidebar live instead of waiting for
+    /// the next `workspace.list`.
     async fn refresh_git_root_pr(
         &self,
         mut root: intent_core::WorkspaceGitRoot,
@@ -4648,6 +4723,8 @@ impl Services {
                 git_root_changed_event(GIT_ROOT_UPDATED, &root),
             )
             .await;
+            self.maybe_emit_display_status_changed(&root.workspace_id)
+                .await;
         }
         // A relink discovery or heal re-fetch that hit the forge quota
         // surfaces AFTER the delta persist (the paid-for snapshots land)
@@ -11595,13 +11672,10 @@ fn assert_hermetic_root_absent() {
 /// workspace's agent streams and file paths with the new one's).
 async fn derive_workspace_id(
     store: &Store,
-    input: &WorkspaceCreate,
+    initial_prompt: Option<&str>,
     workspaces_root: &Path,
 ) -> WorkspaceId {
-    let base = input
-        .initial_agent
-        .as_ref()
-        .and_then(|a| a.prompt.as_deref())
+    let base = initial_prompt
         .and_then(intent_core::slug::extract_local_slug)
         .unwrap_or_else(intent_core::slug::generate_workspace_slug);
     let candidate = WorkspaceId::from_string(base.clone());
@@ -11943,45 +12017,41 @@ fn validate_context_links(links: Option<&[intent_core::ContextLink]>) -> Result<
 }
 
 impl Services {
-    /// Every `-32602` (`InvalidParams`) producer for `workspace.create`, in one
-    /// place. `create_workspace` calls this once at the top of its idempotency
-    /// closure — BEFORE the first store write, worktree provisioning, or event
-    /// publish — so a rejected request never leaves a workspace row, spec
-    /// note, or `workspace:created` event behind. Owns every `initialAgent`
-    /// and `contextLinks` check:
-    /// - compound `initialAgent.model` (`reject_compound_model`, PROTOCOL §5.5);
-    /// - `fileBlocks` / `imageBlocks` shape and attachment references
-    ///   (PROTOCOL §5.5, monorepo#3338) — same harvest as `agent_create_op`
-    ///   (top-level param wins over the `metadata.*Blocks` copy, `null`
-    ///   reads as absent);
-    /// - unknown `initialAgent.specialist` (monorepo#3497), canonicalized the
-    ///   way `agent_create_op` does — against the bundled + user tiers, plus
-    ///   the project tier of the tilde-expanded `repositoryPath` when it is an
-    ///   existing local directory (the same client-supplied path the create
-    ///   already trusts enough to provision a worktree from). No workspace
-    ///   row or worktree exists yet, so this is the only project tier
-    ///   available; `agent_create_op` later reads the new worktree at
-    ///   `baseRef`, so a project-tier-only specialist present in the checkout
-    ///   but absent at `baseRef` still fails late, and one present only at
-    ///   `baseRef` fails early here;
-    /// - provider / model / reasoning-effort resolution via the shared
-    ///   [`Self::resolve_create_model_and_effort`] chain (known provider →
-    ///   default present → enabled → authenticated → client-supplied bare
-    ///   model owned by the effective provider → specialist-derived effort
-    ///   supported by the resolved model), with the same project-tier hint;
+    /// The request-shape `-32602` (`InvalidParams`) producers of
+    /// `workspace.create` that are not agent-create planning. `create_workspace`
+    /// calls this once at the top of its idempotency closure — BEFORE the
+    /// first store write, worktree provisioning, or event publish:
+    /// - compound `initialAgent.model` (`reject_compound_model`, PROTOCOL §5.5
+    ///   — the wire-boundary guard the RPC layer applies to `agent.create`);
     /// - `contextLinks` (PROTOCOL §5.1);
     /// - the explicit `executionEnvironment` selection (PROTOCOL §5.1):
     ///   `skipIsolation` conflict, the `worktree` local-copy flow rule, the
     ///   enabled-profile gate, and host availability (`cow` needs the
     ///   workspaces-root `CoW` probe; `microvm` needs the platform / helper
     ///   check AND the `CoW` probe) — the structured
-    ///   `execution-environment-unavailable` errors (§9) live here too.
+    ///   `execution-environment-unavailable` errors (§9) live here too. This
+    ///   group needs `&self` (enabled profiles, `CoW` probe, host probe cache),
+    ///   which is why the preflight is an async method.
     ///
-    /// `agent_create_op` re-runs its own checks unchanged when the initial
-    /// agent is created — harmless, since this preflight already accepted the
-    /// same input. The `workspace_create_rejects_every_invalid_input_before_side_effects`
+    /// Every other `initialAgent` check — blocks shape and attachment
+    /// references, specialist canonicalization, the provider / model /
+    /// reasoning-effort chain — is owned by [`Self::plan_agent_create`], which
+    /// the closure runs right after this preflight, still before the
+    /// workspaces-root resolution or any other state change; the plan is
+    /// then persisted after the row insert via
+    /// [`Self::persist_agent_create`], whose return type cannot express an
+    /// input rejection. The
+    /// `workspace_create_rejects_every_invalid_input_before_side_effects`
     /// test guards the ordering arm by arm.
     pub(crate) async fn preflight_workspace_create(&self, input: &WorkspaceCreate) -> Result<()> {
+        if let Some(model) = input
+            .initial_agent
+            .as_ref()
+            .and_then(|agent| agent.model.as_deref())
+        {
+            reject_compound_model("initialAgent.model", model)?;
+        }
+        validate_context_links(input.context_links.as_deref())?;
         // Execution-environment selection (§5.1): validate the explicit
         // choice against enabled profiles + host availability. `direct` and
         // `worktree` need only be enabled; `cow` additionally requires the
@@ -12079,87 +12149,7 @@ impl Services {
                 _ => {}
             }
         }
-        if let Some(agent) = input.initial_agent.as_ref() {
-            if let Some(model) = agent.model.as_deref() {
-                reject_compound_model("initialAgent.model", model)?;
-            }
-            let effective_file_blocks = agent
-                .file_blocks
-                .clone()
-                .filter(|v| !v.is_null())
-                .or_else(|| {
-                    agent
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("fileBlocks").cloned())
-                })
-                .filter(|v| !v.is_null());
-            crate::agent_ops::validate_file_blocks(
-                "workspace.create",
-                effective_file_blocks.as_ref(),
-            )?;
-            let effective_image_blocks = agent
-                .image_blocks
-                .clone()
-                .filter(|v| !v.is_null())
-                .or_else(|| {
-                    agent
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.get("imageBlocks").cloned())
-                })
-                .filter(|v| !v.is_null());
-            crate::agent_ops::validate_image_blocks(
-                "workspace.create",
-                effective_image_blocks.as_ref(),
-            )?;
-            self.validate_image_block_refs("workspace.create", effective_image_blocks.as_ref())
-                .await?;
-
-            // Project-tier hint for the specialist lookups: the repository
-            // checkout, only when it is an existing local directory.
-            let spec_wp = input
-                .repository_path
-                .as_deref()
-                .map(intent_core::expand_tilde_string)
-                .map(PathBuf::from)
-                .filter(|p| p.is_dir());
-            let specialist = match nonempty_owned(agent.specialist.clone()) {
-                Some(spec_id) => {
-                    // Canonicalization walks the specialist tier directories —
-                    // blocking pool (monorepo#4148).
-                    let services = self.clone();
-                    let wp = spec_wp.clone();
-                    Some(
-                        tokio::task::spawn_blocking(move || {
-                            services
-                                .specialists_service()
-                                .canonical_id_or_err(&spec_id, wp.as_deref())
-                        })
-                        .await
-                        .map_err(|e| {
-                            Error::Internal(format!(
-                                "workspace.create specialist resolution task failed: {e}"
-                            ))
-                        })??,
-                    )
-                }
-                None => None,
-            };
-            // Provider / model / effort gates — the same chain
-            // `agent_create_op` runs (which receives the same
-            // `nonempty_owned` values and no caller-decided effort).
-            self.resolve_create_model_and_effort(
-                "workspace.create",
-                nonempty_owned(agent.model.clone()),
-                specialist.as_deref(),
-                nonempty_owned(agent.provider.clone()).as_deref(),
-                None,
-                spec_wp.as_deref(),
-            )
-            .await?;
-        }
-        validate_context_links(input.context_links.as_deref())
+        Ok(())
     }
 }
 
@@ -13768,6 +13758,18 @@ pub(crate) fn git_root_changed_event(
             "gitRoot": root,
         }),
     }
+}
+
+/// Whether a git-root row carries any PR input the displayStatus derivation
+/// reads (a linked PR or a non-empty persisted pool), i.e. whether inserting
+/// or deleting the row can move the PR rung.
+fn git_root_carries_pr_data(root: &intent_core::WorkspaceGitRoot) -> bool {
+    root.pr_number.is_some()
+        || root.pr_status.is_some()
+        || root
+            .pull_requests
+            .as_deref()
+            .is_some_and(|items| !items.is_empty())
 }
 
 /// Serialize persisted [`intent_core::WorkspaceGitRoot`] rows into their wire
@@ -18420,7 +18422,9 @@ impl WorkspaceApi for Services {
             let started = std::time::Instant::now();
             let count = list.len();
             let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
+            let snapshot = this
+                .workspace_aggregate_snapshot(&workspace_ids, include_archived)
+                .await;
             for ws in &mut list {
                 this.enrich_workspace_from_snapshot(ws, &snapshot, true)
                     .await;
@@ -18452,9 +18456,15 @@ impl WorkspaceApi for Services {
                 "workspace.list: aggregate enrichment"
             );
             // Emit-path PR merge: fold git-root + monitor PRs into each
-            // row's `pullRequests` (after enrichment so displayStatus
-            // derivation still sees only the persisted workspace PRs).
-            this.merge_external_pull_requests(&mut list, include_archived)
+            // row's `pullRequests`. Runs after enrichment: the displayStatus
+            // derivation already folded the git-root PRs and the monitor
+            // signals with the same per-URL priority (and canonicalized the
+            // row's own `activePullRequest` / `pullRequests` copies to the
+            // same lifecycle), so it must not see them a second time via the
+            // merged `pullRequests`. The git-root PRs move out of the
+            // snapshot — the list's one bulk git-root read serves both the
+            // derivation and the wire merge.
+            this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
             Ok(list)
         })
@@ -18478,7 +18488,9 @@ impl WorkspaceApi for Services {
             // `cowSupported` (lifetime-cached probe, effectively free).
             let mut list = store.list_workspaces(include_archived).await?;
             let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
-            let snapshot = this.workspace_aggregate_snapshot(&workspace_ids).await;
+            let snapshot = this
+                .workspace_aggregate_snapshot(&workspace_ids, include_archived)
+                .await;
             for ws in &mut list {
                 this.enrich_workspace_from_snapshot(ws, &snapshot, false)
                     .await;
@@ -18488,8 +18500,10 @@ impl WorkspaceApi for Services {
             }
             // Emit-path PR merge, same as the full list path: the seq-0
             // snapshot must carry the same `pullRequests` a later
-            // `workspace.list` would.
-            this.merge_external_pull_requests(&mut list, include_archived)
+            // `workspace.list` would (and, like there, the displayStatus
+            // above already folded the git-root PRs, whose one bulk read
+            // now moves out of the snapshot into the merge).
+            this.merge_external_pull_requests(&mut list, include_archived, snapshot.git_root_prs)
                 .await;
             Ok(list)
         })
@@ -18665,13 +18679,14 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
-                    // Every request-validation `-32602` runs here, BEFORE
-                    // any state change (row / metadata file / event / spec
-                    // note / initial agent): `initialAgent` model, blocks,
-                    // attachment references and provider gates, `contextLinks`,
-                    // and the explicit `executionEnvironment` selection
-                    // (enabled profile + host availability). See
-                    // `preflight_workspace_create`.
+                    // Request-shape `-32602`s run here, BEFORE any state
+                    // change (row / metadata file / event / spec note /
+                    // initial agent): compound `initialAgent.model`,
+                    // `contextLinks`, and the explicit `executionEnvironment`
+                    // selection (enabled profile + host availability) — see
+                    // `preflight_workspace_create`. The remaining
+                    // `initialAgent` checks are the agent-create plan right
+                    // below, still ahead of the first side effect.
                     services.preflight_workspace_create(&input).await?;
                     // Explicit execution-environment selection (§5.1),
                     // validated by the preflight above. `direct` opts out of
@@ -18721,6 +18736,135 @@ impl WorkspaceApi for Services {
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
+                    // Initial-agent plan (§5.1): every remaining `-32602`
+                    // producer of the create — blocks shape and attachment
+                    // references, specialist canonicalization, the provider /
+                    // model / reasoning-effort chain — runs HERE, pure with
+                    // respect to the store and the filesystem, before the
+                    // workspaces-root resolution (which may create the
+                    // configured `worktreesLocation`), the first progress
+                    // frame, the clone, the row insert, or any other side
+                    // effect. The typed plan is carried across provisioning
+                    // and persisted after the insert by
+                    // `persist_agent_create`, which cannot raise an input
+                    // rejection, so a rejected `initialAgent` can never strand
+                    // a workspace row. The inputs are shaped to their final
+                    // form first so the plan sees exactly what is persisted;
+                    // the trimmed prompt and effective image blocks ride along
+                    // for id / branch naming and the first turn. The plan's
+                    // `workspace_id` is a passthrough the planner never reads,
+                    // so it is stamped once the id is derived below.
+                    let planned_initial_agent = match input.initial_agent.take() {
+                        Some(agent) => {
+                            let prompt = agent
+                                .prompt
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string);
+                            // Persist the prompt (when present) as
+                            // `AgentSession.initial_message` via the
+                            // `metadata.initialMessage` harvest key (delegate
+                            // parity: a wake-up can resume from it) and stamp the
+                            // reference-parity
+                            // `isInitialAgent`/`isFirstWorkspaceAgent` flags the
+                            // FE surface (`agent-backend-handler.service.ts`,
+                            // `instruction-service.ts` prompt-cache `':initial'`
+                            // suffix, `agent-persistence.ts`) uses to classify the
+                            // workspace's coordinator. Both flags are persisted on
+                            // the raw `AgentSession.metadata` JSON; the strict
+                            // `AgentLite.metadata` projection surfaces
+                            // `isInitialAgent` (presence-detected, `true`-only —
+                            // PROTOCOL §5.5). The caller's metadata object is
+                            // forwarded as-is; like agent.create, only the
+                            // harvested gap fields persist today (P2-12a) —
+                            // `behaviorPrompt` has no session column and the
+                            // behavior derives from the persisted `specialist`.
+                            let mut metadata = match agent.metadata {
+                                Some(serde_json::Value::Object(m)) => m,
+                                _ => serde_json::Map::new(),
+                            };
+                            metadata.insert("isInitialAgent".to_string(), serde_json::json!(true));
+                            metadata.insert(
+                                "isFirstWorkspaceAgent".to_string(),
+                                serde_json::json!(true),
+                            );
+                            // Own the initial-message invariant on the
+                            // `metadata.initialMessage` harvest key: when
+                            // the daemon has a non-empty prompt, stamp it (delegate
+                            // parity — a wake-up can resume from it); otherwise
+                            // drop any caller-supplied `initialMessage` so the
+                            // plan's metadata harvest cannot persist a stale
+                            // prompt for a no-prompt workspace.
+                            if let Some(ref p) = prompt {
+                                metadata.insert(
+                                    "initialMessage".to_string(),
+                                    serde_json::json!(p.clone()),
+                                );
+                            } else {
+                                metadata.remove("initialMessage");
+                            }
+                            // The effective session-level image blocks, mirroring
+                            // the plan's harvest (top-level param wins over the
+                            // `metadata.imageBlocks` fallback). Captured here
+                            // because the created `AgentLite` no longer serves
+                            // `imageBlocks` (list-projection cost contract) and
+                            // the first-turn threading below still needs them.
+                            let image_blocks = agent
+                                .image_blocks
+                                .or_else(|| metadata.get("imageBlocks").cloned())
+                                .filter(|v| !v.is_null());
+                            let extra = intent_core::AgentCreateExtra {
+                                provider: nonempty_owned(agent.provider),
+                                agent_type: nonempty_owned(agent.agent_type),
+                                metadata: Some(serde_json::Value::Object(metadata)),
+                                context_references: agent
+                                    .context_references
+                                    .filter(|v| !v.is_null()),
+                                image_blocks: image_blocks.clone(),
+                                file_blocks: agent.file_blocks.filter(|v| !v.is_null()),
+                                // The initial agent is the workspace's
+                                // foreground agent (top-level wins over any
+                                // metadata.isBackground copy).
+                                is_background: Some(false),
+                                ..Default::default()
+                            };
+                            // Project-tier root for the plan's failing
+                            // specialist reads: the (tilde-expanded)
+                            // repository checkout, only when it is an existing
+                            // local directory — the same client-supplied path
+                            // the create already trusts enough to provision a
+                            // worktree from. No worktree exists yet; the
+                            // non-failing prompt snapshot reads it at `baseRef`
+                            // in the persist half.
+                            let spec_wp = input
+                                .repository_path
+                                .as_deref()
+                                .map(PathBuf::from)
+                                .filter(|p| p.is_dir());
+                            // Post-plan inputs, stamped on the plan later:
+                            // `workspace_id` once the id is derived (right
+                            // below) and `skip_auto_commit`, which depends on
+                            // the workspace's effective auto-commit seeded by
+                            // the insert, right before persist.
+                            let plan = services
+                                .plan_agent_create(
+                                    "workspace.create",
+                                    WorkspaceId::from_string(String::new()),
+                                    nonempty_owned(agent.name),
+                                    nonempty_owned(agent.model),
+                                    nonempty_owned(agent.specialist),
+                                    None,
+                                    None,
+                                    false,
+                                    extra,
+                                    spec_wp,
+                                )
+                                .await?;
+                            Some((plan, prompt, image_blocks))
+                        }
+                        None => None,
+                    };
                     // Kept alongside the resolved parent below: the known-repo
                     // registration hook checks BOTH roots (a configured
                     // `worktreesLocation` may differ from the boot root, and a
@@ -18740,7 +18884,18 @@ impl WorkspaceApi for Services {
                     // tombstone, or leftover directory) so the on-disk
                     // directory reflects intent and deleted ids are never
                     // recycled.
-                    let id = derive_workspace_id(&store, &input, &workspaces_root).await;
+                    let id = derive_workspace_id(
+                        &store,
+                        planned_initial_agent
+                            .as_ref()
+                            .and_then(|(_, prompt, _)| prompt.as_deref()),
+                        &workspaces_root,
+                    )
+                    .await;
+                    let planned_initial_agent = planned_initial_agent.map(|(mut plan, prompt, image_blocks)| {
+                        plan.workspace_id = id.clone();
+                        (plan, prompt, image_blocks)
+                    });
                     let progress = progress_id.and_then(|pid| {
                         bus.clone().map(|b| {
                             std::sync::Arc::new(create_progress::CreateProgress::new(
@@ -19336,10 +19491,9 @@ impl WorkspaceApi for Services {
                     let branch_auto_generated =
                         input.branch.as_deref().is_none_or(str::is_empty);
                     let branch = if let Some(explicit) = input.branch.clone().filter(|b| !b.is_empty()) { explicit } else {
-                        let slug = input
-                            .initial_agent
+                        let slug = planned_initial_agent
                             .as_ref()
-                            .and_then(|a| a.prompt.as_deref())
+                            .and_then(|(_, prompt, _)| prompt.as_deref())
                             .and_then(intent_core::slug::extract_local_slug)
                             .unwrap_or_else(intent_core::slug::generate_workspace_slug);
                         // Branch prefix fallback: repo config > global setting
@@ -20359,7 +20513,8 @@ impl WorkspaceApi for Services {
                     // row (reference parity: `workspace.service.ts` persists the
                     // session whenever `initialAgent` is present — the turn only
                     // starts when a prompt exists). The agent is parentless,
-                    // non-background (delegate parity: `agent_create_op`). When
+                    // non-background (delegate parity: `agent_create_op`),
+                    // persisted from the plan derived above. When
                     // the prompt is non-empty it is stored as
                     // `AgentSession.initial_message` (harvested from the
                     // `metadata.initialMessage` create param; served by
@@ -20369,98 +20524,23 @@ impl WorkspaceApi for Services {
                     // prompt persists the row without a message; the FE first
                     // send starts the turn.
                     let mut initial_agent = None;
-                    if let Some(agent) = input.initial_agent {
-                        let prompt = agent
-                            .prompt
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string);
-                        // Persist the prompt (when present) as
-                        // `AgentSession.initial_message` via the
-                        // `metadata.initialMessage` harvest key (delegate
-                        // parity: a wake-up can resume from it) and stamp the
-                        // reference-parity
-                        // `isInitialAgent`/`isFirstWorkspaceAgent` flags the
-                        // FE surface (`agent-backend-handler.service.ts`,
-                        // `instruction-service.ts` prompt-cache `':initial'`
-                        // suffix, `agent-persistence.ts`) uses to classify the
-                        // workspace's coordinator. Both flags are persisted on
-                        // the raw `AgentSession.metadata` JSON; the strict
-                        // `AgentLite.metadata` projection surfaces
-                        // `isInitialAgent` (presence-detected, `true`-only —
-                        // PROTOCOL §5.5). The caller's metadata object is
-                        // forwarded as-is; like agent.create, only the
-                        // harvested gap fields persist today (P2-12a) —
-                        // `behaviorPrompt` has no session column and the
-                        // behavior derives from the persisted `specialist`.
-                        let mut metadata = match agent.metadata {
-                            Some(serde_json::Value::Object(m)) => m,
-                            _ => serde_json::Map::new(),
-                        };
-                        metadata.insert("isInitialAgent".to_string(), serde_json::json!(true));
-                        metadata.insert(
-                            "isFirstWorkspaceAgent".to_string(),
-                            serde_json::json!(true),
-                        );
-                        // Own the initial-message invariant on the
-                        // `metadata.initialMessage` harvest key: when
-                        // the daemon has a non-empty prompt, stamp it (delegate
-                        // parity — a wake-up can resume from it); otherwise
-                        // drop any caller-supplied `initialMessage` so
-                        // `agent_create_op`'s metadata harvest cannot persist
-                        // a stale prompt for a no-prompt workspace.
-                        if let Some(ref p) = prompt {
-                            metadata.insert(
-                                "initialMessage".to_string(),
-                                serde_json::json!(p.clone()),
-                            );
-                        } else {
-                            metadata.remove("initialMessage");
-                        }
-                        // The effective session-level image blocks, mirroring
-                        // the `agent_create_op` harvest (top-level param wins
-                        // over the `metadata.imageBlocks` fallback). Captured
-                        // here because the created `AgentLite` no longer
-                        // serves `imageBlocks` (list-projection cost contract)
-                        // and the first-turn threading below still needs them.
-                        let image_blocks = agent
-                            .image_blocks
-                            .or_else(|| metadata.get("imageBlocks").cloned())
-                            .filter(|v| !v.is_null());
-                        let extra = intent_core::AgentCreateExtra {
-                            provider: nonempty_owned(agent.provider),
-                            agent_type: nonempty_owned(agent.agent_type),
-                            metadata: Some(serde_json::Value::Object(metadata)),
-                            context_references: agent
-                                .context_references
-                                .filter(|v| !v.is_null()),
-                            image_blocks: image_blocks.clone(),
-                            file_blocks: agent.file_blocks.filter(|v| !v.is_null()),
-                            // The initial agent is the workspace's
-                            // foreground agent (top-level wins over any
-                            // metadata.isBackground copy).
-                            is_background: Some(false),
-                            ..Default::default()
-                        };
+                    if let Some((mut plan, prompt, image_blocks)) = planned_initial_agent {
                         // Harness-owned commits: same derivation as
                         // `agent.create` — the initial agent opts out of the
                         // idle subscriber when the workspace's effective
-                        // auto-commit (just seeded above) is off.
-                        let skip_auto_commit =
+                        // auto-commit (just seeded above) is off. The one
+                        // post-plan input (see `AgentCreatePlan`).
+                        plan.skip_auto_commit =
                             !services.effective_auto_commit(&ws.id).await;
-                        let created = services
-                            .agent_create_op(
-                                ws.id.clone(),
-                                nonempty_owned(agent.name),
-                                nonempty_owned(agent.model),
-                                nonempty_owned(agent.specialist),
-                                None,
-                                None,
-                                skip_auto_commit,
-                                extra,
-                            )
-                            .await?;
+                        // Persist half: the plan was validated before the
+                        // first side effect, so this can only fail on
+                        // infrastructure (`AgentPersistError` → `-32603`) —
+                        // never on input. The non-failing specialist prompt
+                        // snapshot reads the freshly provisioned worktree at
+                        // `baseRef` (agent.create parity: worktree, else the
+                        // repository path).
+                        let snapshot_wp = crate::git_ops::worktree_path(&ws);
+                        let created = services.persist_agent_create(plan, snapshot_wp).await?;
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
