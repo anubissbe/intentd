@@ -7,6 +7,10 @@
 //! `com.apple.security.hypervisor` entitlement — see
 //! `scripts/sign-microvm-helper.sh`). On all other platforms the same CLI
 //! parses and validates, then exits `EXIT_UNAVAILABLE` (69).
+//!
+//! `--probe` runs the boot path's dylib resolution + dlopen + symbol lookup
+//! without creating a VM and exits 0 when libkrun is loadable; intentd uses
+//! it to decide `system.capabilities.microvmSupported`.
 
 mod cli;
 #[cfg(target_os = "macos")]
@@ -23,8 +27,8 @@ pub const EXIT_UNAVAILABLE: i32 = 69;
 pub const EXIT_KRUN_API: i32 = 70;
 
 fn main() {
-    let plan = match cli::Cli::parse().into_plan() {
-        Ok(plan) => plan,
+    let mode = match cli::Cli::parse().into_mode() {
+        Ok(mode) => mode,
         Err(msg) => {
             eprintln!("intentd-microvm-helper: {msg}");
             std::process::exit(EXIT_USAGE);
@@ -33,16 +37,22 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     {
-        // On success krun_start_enter never returns: the process becomes the
-        // VM and later exits with the guest command's exit status.
-        let err = krun::boot(&plan);
+        let err = match mode {
+            cli::Mode::Probe(plan) => match krun::probe(&plan) {
+                Ok(()) => std::process::exit(0),
+                Err(err) => err,
+            },
+            // On success krun_start_enter never returns: the process becomes
+            // the VM and later exits with the guest command's exit status.
+            cli::Mode::Boot(plan) => krun::boot(&plan),
+        };
         eprintln!("intentd-microvm-helper: {}", err.message);
         std::process::exit(err.exit_code);
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = &plan;
+        let _ = &mode;
         eprintln!(
             "intentd-microvm-helper: microVM execution is only supported on macOS \
              (Apple Silicon) in v1; this platform has no libkrun backend"

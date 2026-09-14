@@ -15,6 +15,8 @@
 //! - [`auth`] — credential staging into the guest home, rotation watcher,
 //!   teardown scrub (the per-VM directory removal deletes every staged copy)
 //! - [`orchestrator`] — helper boot, guest setup, provider exec, teardown
+//! - [`host_probe`] — cached `intentd-microvm-helper --probe` run behind
+//!   `microvmSupported` / the `sandbox.options` `microvm` row
 //!
 //! The backend is unix-only (macOS Apple Silicon + Linux/KVM). On other
 //! targets the submodules are compiled out and [`orchestrator`] is a stub
@@ -26,6 +28,7 @@
 pub mod auth;
 #[cfg(unix)]
 pub mod exec;
+pub mod host_probe;
 #[cfg(unix)]
 pub mod orchestrator;
 #[cfg(unix)]

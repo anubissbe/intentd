@@ -1751,6 +1751,10 @@ async fn cmd_serve(mode: Option<&str>, insecure: bool, resume_all: bool) -> anyh
     // process-wide probe warms intent-git's low-level result; this detached
     // handoff makes workspace/list capability reads cache-only.
     services.prewarm_cow_supported();
+    // Same for the microVM host probe (`intentd-microvm-helper --probe`):
+    // one bounded helper run at startup so `microvmSupported` /
+    // `sandbox.options` never spawn on the read path.
+    services.prewarm_microvm_supported();
     // The AgentManager multiplexes spawned agent processes over the ACP client
     // (§6.8). Its concrete EventSink bridges the client-served fs/permission
     // events (M3.5) onto the same bus, and `run_turn` drives the streaming

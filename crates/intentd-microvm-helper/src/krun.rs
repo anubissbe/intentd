@@ -20,7 +20,7 @@
 use std::ffi::{c_char, c_void, CString};
 use std::path::{Path, PathBuf};
 
-use crate::cli::BootPlan;
+use crate::cli::{BootPlan, ProbePlan};
 use crate::{EXIT_KRUN_API, EXIT_UNAVAILABLE};
 
 const LIBKRUN_NAMES: [&str; 2] = ["libkrun.dylib", "libkrun.1.dylib"];
@@ -56,6 +56,44 @@ type FnSetExec =
     unsafe extern "C" fn(u32, *const c_char, *const *const c_char, *const *const c_char) -> i32;
 type FnStartEnter = unsafe extern "C" fn(u32) -> i32;
 
+/// The libkrun entry points every boot needs, resolved up front so a missing
+/// symbol fails before any VM state exists. `--probe` resolves exactly this
+/// set, so the probe cannot drift from the boot path; optional symbols
+/// (`krun_add_vsock_port2`, `krun_set_workdir`, `krun_set_console_output`)
+/// stay lazy in [`try_boot`].
+struct KrunApi {
+    lib: *mut c_void,
+    set_log_level: FnSetLogLevel,
+    create_ctx: FnCreateCtx,
+    set_vm_config: FnSetVmConfig,
+    set_root: FnSetPath,
+    add_virtiofs: FnAddVirtiofs,
+    set_exec: FnSetExec,
+    start_enter: FnStartEnter,
+}
+
+impl KrunApi {
+    /// Resolves the dylib directory (honouring `libkrun_dir`, then
+    /// `$INTENTD_LIBKRUN_DIR`, then the helper-relative and Homebrew
+    /// fallbacks), chdirs into it, dlopens libkrun and resolves the required
+    /// symbols. Shared by boot and probe.
+    fn load(libkrun_dir: Option<&Path>) -> Result<Self, BootError> {
+        let dir = resolve_libkrun_dir(libkrun_dir)?;
+        enter_dylib_dir(&dir)?;
+        let lib = load_libkrun(&dir)?;
+        Ok(Self {
+            lib,
+            set_log_level: sym(lib, "krun_set_log_level")?,
+            create_ctx: sym(lib, "krun_create_ctx")?,
+            set_vm_config: sym(lib, "krun_set_vm_config")?,
+            set_root: sym(lib, "krun_set_root")?,
+            add_virtiofs: sym(lib, "krun_add_virtiofs")?,
+            set_exec: sym(lib, "krun_set_exec")?,
+            start_enter: sym(lib, "krun_start_enter")?,
+        })
+    }
+}
+
 /// Configures and enters the microVM. Only returns on failure.
 pub fn boot(plan: &BootPlan) -> BootError {
     match try_boot(plan) {
@@ -64,22 +102,35 @@ pub fn boot(plan: &BootPlan) -> BootError {
     }
 }
 
+/// `--probe`: loads libkrun exactly as boot would (same directory
+/// resolution, same dlopen, same required symbols) without creating a VM
+/// context. `Ok` means a boot on this host would get past dylib loading.
+pub fn probe(plan: &ProbePlan) -> Result<(), BootError> {
+    let libkrun_dir = plan
+        .libkrun_dir
+        .as_deref()
+        .map(absolutize_path)
+        .transpose()?;
+    KrunApi::load(libkrun_dir.as_deref()).map(|_| ())
+}
+
 enum Never {}
 
 fn try_boot(plan: &BootPlan) -> Result<Never, BootError> {
     let plan = absolutize_plan(plan)?;
     let plan = &plan;
-    let dir = resolve_libkrun_dir(plan)?;
-    enter_dylib_dir(&dir)?;
-    let lib = load_libkrun(&dir)?;
-
-    let set_log_level: FnSetLogLevel = sym(lib, "krun_set_log_level")?;
-    let create_ctx: FnCreateCtx = sym(lib, "krun_create_ctx")?;
-    let set_vm_config: FnSetVmConfig = sym(lib, "krun_set_vm_config")?;
-    let set_root: FnSetPath = sym(lib, "krun_set_root")?;
-    let add_virtiofs: FnAddVirtiofs = sym(lib, "krun_add_virtiofs")?;
-    let set_exec: FnSetExec = sym(lib, "krun_set_exec")?;
-    let start_enter: FnStartEnter = sym(lib, "krun_start_enter")?;
+    let api = KrunApi::load(plan.libkrun_dir.as_deref())?;
+    let lib = api.lib;
+    let KrunApi {
+        set_log_level,
+        create_ctx,
+        set_vm_config,
+        set_root,
+        add_virtiofs,
+        set_exec,
+        start_enter,
+        ..
+    } = api;
 
     unsafe {
         // Best-effort; RUST_LOG-style env can override inside libkrun.
@@ -173,10 +224,10 @@ fn try_boot(plan: &BootPlan) -> Result<Never, BootError> {
 }
 
 /// Picks the first candidate directory that contains a libkrun dylib.
-fn resolve_libkrun_dir(plan: &BootPlan) -> Result<PathBuf, BootError> {
+fn resolve_libkrun_dir(libkrun_dir: Option<&Path>) -> Result<PathBuf, BootError> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(dir) = &plan.libkrun_dir {
-        candidates.push(dir.clone());
+    if let Some(dir) = libkrun_dir {
+        candidates.push(dir.to_path_buf());
     }
     if let Ok(dir) = std::env::var("INTENTD_LIBKRUN_DIR") {
         if !dir.is_empty() {
@@ -206,11 +257,25 @@ fn resolve_libkrun_dir(plan: &BootPlan) -> Result<PathBuf, BootError> {
     )))
 }
 
+fn current_dir() -> Result<PathBuf, BootError> {
+    std::env::current_dir()
+        .map_err(|e| unavailable(format!("cannot resolve current directory: {e}")))
+}
+
+/// Absolute form of one host path (relative paths resolve against the cwd
+/// before the boot/probe path chdirs into the dylib directory).
+fn absolutize_path(p: &Path) -> Result<PathBuf, BootError> {
+    if p.is_absolute() {
+        Ok(p.to_path_buf())
+    } else {
+        Ok(current_dir()?.join(p))
+    }
+}
+
 /// Rewrites every host path in the plan to an absolute path so the process
 /// can chdir into the dylib directory without breaking them.
 fn absolutize_plan(plan: &BootPlan) -> Result<BootPlan, BootError> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| unavailable(format!("cannot resolve current directory: {e}")))?;
+    let cwd = current_dir()?;
     let abs = |p: &Path| -> PathBuf {
         if p.is_absolute() {
             p.to_path_buf()

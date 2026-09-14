@@ -43,17 +43,27 @@ pub const MAX_SOCKET_PATH_BYTES: usize = 103;
                   token is the executable path inside the guest, the rest are its \
                   arguments. Exec path, args and env ride the kernel cmdline (ASCII-only, \
                   length-limited) — deliver real workloads as a script file over virtio-fs, \
-                  e.g. `-- /bin/sh /ctl/run.sh`.\n\nEXIT CODES\n  0-255 guest command exit \
-                  status (VM booted and ran to completion)\n  2     CLI parse error\n  64    \
+                  e.g. `-- /bin/sh /ctl/run.sh`.\n\nPROBE MODE\n  `--probe` resolves the \
+                  libkrun directory, dlopens libkrun and resolves the symbols the boot path \
+                  needs, then exits 0 without creating a VM. It takes no --root-fs and no \
+                  guest command; --libkrun-dir / $INTENTD_LIBKRUN_DIR are honoured exactly \
+                  as at boot.\n\nEXIT CODES\n  0-255 guest command exit \
+                  status (VM booted and ran to completion); 0 also means the --probe \
+                  succeeded\n  2     CLI parse error\n  64    \
                   invalid configuration (validation failed before boot)\n  69    microVM \
                   unavailable (unsupported platform, or libkrun/libkrunfw dylibs not \
-                  found/loadable)\n  70    libkrun API error while configuring or starting \
-                  the VM"
+                  found/loadable — also reported by --probe)\n  70    libkrun API error \
+                  while configuring or starting the VM"
 )]
 pub struct Cli {
+    /// Check that libkrun can be loaded on this host and exit without booting
+    /// a VM (0 = loadable; 69/70 with the same diagnostics as boot).
+    #[arg(long, conflicts_with_all = ["root_fs", "guest_command"])]
+    pub probe: bool,
+
     /// Host directory exposed as the guest root filesystem (virtio-fs).
-    #[arg(long, value_name = "DIR")]
-    pub root_fs: PathBuf,
+    #[arg(long, value_name = "DIR", required_unless_present = "probe")]
+    pub root_fs: Option<PathBuf>,
 
     /// Number of vCPUs for the guest.
     #[arg(long, default_value_t = 2, value_name = "N")]
@@ -110,8 +120,26 @@ pub struct Cli {
     pub krun_log_level: u32,
 
     /// Guest command: executable path followed by its arguments.
-    #[arg(last = true, required = true, value_name = "EXEC [ARGS]...")]
+    #[arg(
+        last = true,
+        required_unless_present = "probe",
+        value_name = "EXEC [ARGS]..."
+    )]
     pub guest_command: Vec<String>,
+}
+
+/// What the helper was asked to do: boot a VM, or only probe libkrun
+/// loadability.
+#[derive(Debug, PartialEq)]
+pub enum Mode {
+    Boot(Box<BootPlan>),
+    Probe(ProbePlan),
+}
+
+/// `--probe` configuration: only the dylib directory override matters.
+#[derive(Debug, PartialEq)]
+pub struct ProbePlan {
+    pub libkrun_dir: Option<PathBuf>,
 }
 
 /// Fully validated boot configuration handed to the libkrun boot path.
@@ -143,10 +171,22 @@ pub struct VsockPort {
 }
 
 impl Cli {
+    /// Dispatches on `--probe`: a [`ProbePlan`] carrying only the dylib
+    /// directory override, else the fully validated [`BootPlan`].
+    pub fn into_mode(self) -> Result<Mode, String> {
+        if self.probe {
+            return Ok(Mode::Probe(ProbePlan {
+                libkrun_dir: self.libkrun_dir,
+            }));
+        }
+        self.into_plan().map(|plan| Mode::Boot(Box::new(plan)))
+    }
+
     /// Validates the parsed arguments into a [`BootPlan`], enforcing the
     /// kernel-cmdline and env-allowlist constraints. Filesystem existence
     /// checks live here too so the boot path can assume a sane plan.
     pub fn into_plan(self) -> Result<BootPlan, String> {
+        let root_fs = self.root_fs.ok_or("--root-fs is required")?;
         if self.vcpus == 0 || self.vcpus > MAX_VCPUS {
             return Err(format!(
                 "--vcpus must be 1..={MAX_VCPUS}, got {}",
@@ -159,10 +199,10 @@ impl Cli {
                 self.mem_mib
             ));
         }
-        if !self.root_fs.is_dir() {
+        if !root_fs.is_dir() {
             return Err(format!(
                 "--root-fs is not a directory: {}",
-                self.root_fs.display()
+                root_fs.display()
             ));
         }
 
@@ -248,7 +288,7 @@ impl Cli {
         }
 
         Ok(BootPlan {
-            root_fs: self.root_fs,
+            root_fs,
             vcpus: self.vcpus,
             mem_mib: self.mem_mib,
             virtiofs,
@@ -391,6 +431,50 @@ mod tests {
             &root.path().display().to_string(),
         ]);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn probe_needs_no_root_fs_or_guest_command() {
+        let mode = parse(&["--probe"]).into_mode().unwrap();
+        assert_eq!(mode, Mode::Probe(ProbePlan { libkrun_dir: None }));
+
+        let mode = parse(&["--probe", "--libkrun-dir", "/opt/krun/lib"])
+            .into_mode()
+            .unwrap();
+        assert_eq!(
+            mode,
+            Mode::Probe(ProbePlan {
+                libkrun_dir: Some(PathBuf::from("/opt/krun/lib")),
+            })
+        );
+    }
+
+    #[test]
+    fn probe_rejects_boot_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let root_arg = root.path().display().to_string();
+        // A guest command and --root-fs conflict with --probe at parse time.
+        assert!(
+            Cli::try_parse_from(["intentd-microvm-helper", "--probe", "--", "/bin/sh"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["intentd-microvm-helper", "--probe", "--root-fs", &root_arg])
+                .is_err()
+        );
+        // Without --probe the boot arguments are still mandatory.
+        assert!(Cli::try_parse_from(["intentd-microvm-helper", "--", "/bin/sh"]).is_err());
+        assert!(Cli::try_parse_from(["intentd-microvm-helper", "--root-fs", &root_arg]).is_err());
+    }
+
+    #[test]
+    fn boot_mode_still_yields_a_plan() {
+        let root = tempfile::tempdir().unwrap();
+        let args = base_args(root.path());
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        match parse(&refs).into_mode().unwrap() {
+            Mode::Boot(plan) => assert_eq!(plan.root_fs, root.path()),
+            Mode::Probe(_) => panic!("boot arguments must not select probe mode"),
+        }
     }
 
     #[test]

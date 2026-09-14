@@ -908,6 +908,11 @@ pub struct Services {
     /// frequency list/get emit path; the cache is invalidated from file/git
     /// events so an on-demand compute stays coherent. Shared across clones.
     workspace_aggregates: Arc<workspace_aggregates::WorkspaceAggregateCache>,
+    /// Cached `intentd-microvm-helper --probe` outcome (helper presence and
+    /// libkrun loadability) behind `microvmSupported` and the
+    /// `sandbox.options` `microvm` row. Single-flight; never spawns on a
+    /// cache hit. Shared across clones.
+    microvm_host_probe: Arc<microvm::host_probe::HostProbeCache>,
     /// Per-workspace disk-usage cache backing the on-demand
     /// `workspace.diskUsage` method (§5.1) — never the list/get emit path:
     /// TTL'd stale-while-revalidate entries whose walks run detached on the
@@ -1236,6 +1241,7 @@ impl Services {
             github_auth_flow: Arc::new(tokio::sync::Mutex::new(None)),
             github_login_base_uri: None,
             workspace_aggregates: Arc::new(workspace_aggregates::WorkspaceAggregateCache::new()),
+            microvm_host_probe: Arc::new(microvm::host_probe::HostProbeCache::new()),
             disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
@@ -3020,17 +3026,62 @@ impl Services {
 
     /// Whether the host can run microVM agent sandboxes
     /// (`system.capabilities.microvmSupported`, §5.7): the platform check
-    /// (macOS ARM64 / Linux with `/dev/kvm`) `ANDed` with the `CoW` probe —
-    /// microVM requires `CoW` because each agent VM virtio-fs-mounts its own
-    /// reflink clone. `Some(false)` on an incapable platform regardless of
-    /// the `CoW` probe; on a capable platform this mirrors
-    /// [`Self::compute_cow_supported`] (`None` when the probe cannot run).
+    /// (macOS ARM64 / Linux with `/dev/kvm`) `ANDed` with the host
+    /// loadability probe (`intentd-microvm-helper --probe`: helper present
+    /// next to intentd and libkrun + its transitive dylibs dlopen) `ANDed`
+    /// with the `CoW` probe — microVM requires `CoW` because each agent VM
+    /// virtio-fs-mounts its own reflink clone. `Some(false)` on an incapable
+    /// platform or a failed host probe regardless of the `CoW` probe; on a
+    /// capable, loadable host this mirrors [`Self::compute_cow_supported`]
+    /// (`None` when the `CoW` probe cannot run).
     async fn compute_microvm_supported(&self) -> Option<bool> {
-        let (platform_ok, _) = microvm_platform_supported();
-        if !platform_ok {
+        if self.microvm_host_unavailable_reason().await.is_some() {
             return Some(false);
         }
         self.compute_cow_supported().await
+    }
+
+    /// Why microVM is unavailable on this host before the `CoW` requirement
+    /// is considered: the platform reason from [`microvm_platform_supported`],
+    /// else the cached host-probe failure (missing helper, or libkrun
+    /// installed but unloadable — the reason carries the helper's dlopen
+    /// diagnostic). `None` when the platform is capable and the helper
+    /// loaded libkrun. The probe never runs on an incapable platform.
+    async fn microvm_host_unavailable_reason(&self) -> Option<String> {
+        let (platform_ok, platform_reason) = microvm_platform_supported();
+        if !platform_ok {
+            return Some(
+                platform_reason
+                    .unwrap_or("microVM sandboxes are not supported on this host")
+                    .to_string(),
+            );
+        }
+        self.microvm_host_probe.result().await.err()
+    }
+
+    /// Prewarm the host loadability probe off the RPC read path (alongside
+    /// [`Self::prewarm_cow_supported`]). No-op on incapable platforms, where
+    /// the helper is never consulted.
+    pub fn prewarm_microvm_supported(&self) {
+        let (platform_ok, _) = microvm_platform_supported();
+        if !platform_ok {
+            return;
+        }
+        let probe = Arc::clone(&self.microvm_host_probe);
+        tokio::spawn(async move {
+            if let Err(reason) = probe.result().await {
+                tracing::info!(%reason, "microVM unavailable on this host");
+            }
+        });
+    }
+
+    /// Test seam: pin the host loadability probe outcome so tests never spawn
+    /// the real `intentd-microvm-helper` (`Ok(())` = helper present and
+    /// libkrun loadable; `Err(reason)` = the reason surfaced to clients).
+    #[must_use]
+    pub fn with_microvm_host_probe(self, result: microvm::host_probe::HostProbeResult) -> Self {
+        self.microvm_host_probe.seed(result);
+        self
     }
 
     /// Non-panicking CoW-capability hint for per-bridge description gating
@@ -16371,11 +16422,11 @@ impl WorkspaceApi for Services {
                 ),
                 None => Some("CoW filesystem support could not be determined".to_string()),
             };
-            let (platform_ok, platform_reason) = microvm_platform_supported();
-            let microvm_reason = if platform_ok {
-                cow_reason.clone()
-            } else {
-                platform_reason.map(str::to_string)
+            // microVM: platform lock, then helper/libkrun loadability (the
+            // probe's dlopen diagnostic rides the reason), then CoW.
+            let microvm_reason = match self.microvm_host_unavailable_reason().await {
+                Some(reason) => Some(reason),
+                None => cow_reason.clone(),
             };
             let mut options = Vec::with_capacity(SANDBOX_TYPES.len());
             for &ty in SANDBOX_TYPES {
@@ -18294,13 +18345,12 @@ impl WorkspaceApi for Services {
                         }
                     }
                     intent_core::SandboxType::Microvm => {
-                        let (platform_ok, platform_reason) = microvm_platform_supported();
-                        if !platform_ok {
+                        // Platform lock, then helper/libkrun loadability
+                        // (same gate as `sandbox.options`), then CoW.
+                        if let Some(reason) = services.microvm_host_unavailable_reason().await {
                             return Err(Error::ExecutionEnvironmentUnavailable {
                                 environment: env.as_str().to_string(),
-                                reason: platform_reason
-                                    .unwrap_or("microVM sandboxes are not supported on this host")
-                                    .to_string(),
+                                reason,
                             });
                         }
                         if services.compute_cow_supported().await != Some(true) {

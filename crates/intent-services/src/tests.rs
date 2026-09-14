@@ -27281,16 +27281,19 @@ mod worktree_provisioning {
     }
 
     /// `system.capabilities.microvmSupported` (§5.7): platform check `ANDed`
-    /// with the `CoW` probe. On a capable platform (macOS arm64 / Linux with
-    /// /dev/kvm) it mirrors `cowSupported`; on an incapable platform it is
-    /// `false` regardless.
+    /// with the host loadability probe `ANDed` with the `CoW` probe. With the
+    /// probe seeded as loadable, a capable platform (macOS arm64 / Linux with
+    /// /dev/kvm) mirrors `cowSupported`; an incapable platform is `false`
+    /// regardless.
     #[tokio::test]
     async fn system_capabilities_reports_microvm_supported() {
         use intent_core::WorkspaceApi;
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-syscap-mvm-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_microvm_host_probe(Ok(()));
 
         let caps = svc.system_capabilities().await.expect("capabilities");
         let obj = caps.as_object().expect("result is an object");
@@ -27306,6 +27309,62 @@ mod worktree_provisioning {
         } else {
             assert_eq!(microvm, Some(false), "incapable platform is always false");
         }
+    }
+
+    /// `system.capabilities.microvmSupported` + `sandbox.options` (§5.7 /
+    /// §5.5b): when the host probe fails — helper missing next to intentd,
+    /// or libkrun installed but unloadable (missing transitive dylib) —
+    /// microVM is `false` / `available: false` on every platform, the
+    /// `microvm` reason carries the probe's dlopen diagnostic, and `cow`
+    /// availability is unaffected.
+    #[tokio::test]
+    async fn microvm_unavailable_with_reason_when_host_probe_fails() {
+        use intent_core::WorkspaceApi;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = unique_dir("intentd-syscap-mvmprobe-root");
+        let reason = "libkrun cannot be loaded on this host: failed to load \
+                      /opt/homebrew/lib/libkrun.dylib: Library not loaded: \
+                      /opt/homebrew/opt/libepoxy/lib/libepoxy.0.dylib";
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_microvm_host_probe(Err(reason.to_string()));
+
+        let caps = svc.system_capabilities().await.expect("capabilities");
+        assert_eq!(
+            caps.get("microvmSupported")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "failed host probe forces microvmSupported=false: {caps}"
+        );
+        let cow_supported = svc.compute_cow_supported().await;
+        assert_eq!(
+            caps.get("cowSupported")
+                .and_then(serde_json::Value::as_bool),
+            cow_supported,
+            "cowSupported is independent of the microVM host probe"
+        );
+
+        let result = svc.sandbox_options().await.expect("options");
+        let options = result["options"].as_array().expect("options array");
+        assert_eq!(options[3]["type"], "microvm");
+        assert_eq!(options[3]["available"], false);
+        let platform_capable = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+        let row_reason = options[3]["reason"].as_str().expect("reason present");
+        if platform_capable {
+            assert_eq!(row_reason, reason, "probe diagnostic rides the reason");
+        } else {
+            assert!(
+                !row_reason.contains("libepoxy"),
+                "incapable platform names the platform lock, not the probe: {row_reason}"
+            );
+        }
+        assert_eq!(options[2]["type"], "cow");
+        assert_eq!(
+            options[2]["available"].as_bool(),
+            Some(cow_supported == Some(true)),
+            "cow row unaffected by the microVM host probe"
+        );
     }
 
     /// `sandbox.profiles.list` (§5.5b): the default settings yield one row
@@ -27478,7 +27537,9 @@ mod worktree_provisioning {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let root = unique_dir("intentd-sbopt-root");
-        let svc = Services::new(store).with_workspaces_root(root.0.clone());
+        let svc = Services::new(store)
+            .with_workspaces_root(root.0.clone())
+            .with_microvm_host_probe(Ok(()));
 
         let cow_supported = svc.compute_cow_supported().await;
         let result = svc.sandbox_options().await.expect("options");
@@ -27504,9 +27565,9 @@ mod worktree_provisioning {
             options[2]["available"].as_bool(),
             Some(cow_supported == Some(true))
         );
-        // microvm is available only on a capable platform with CoW.
-        // microVM is temporarily locked to macOS (Apple Silicon only); the
-        // Linux/KVM arm is disabled.
+        // microvm is available only on a capable platform with CoW (the host
+        // probe is seeded loadable above). microVM is temporarily locked to
+        // macOS (Apple Silicon only); the Linux/KVM arm is disabled.
         let platform_capable = cfg!(all(target_os = "macos", target_arch = "aarch64"));
         assert_eq!(
             options[3]["available"].as_bool(),
@@ -28033,10 +28094,47 @@ mod worktree_provisioning {
             "got: {err}"
         );
 
+        // Enabled but the host probe fails (helper missing / libkrun
+        // unloadable) → structured unavailable carrying the probe reason,
+        // before the CoW requirement is consulted. Platform-stable: on an
+        // incapable platform the platform reason wins instead.
+        let (svc, _config) = services_with_settings(
+            store.clone(),
+            root.0.clone(),
+            &[("sandbox.microvm.enabled", serde_json::json!(true))],
+        );
+        let svc = svc.with_microvm_host_probe(Err(
+            "libkrun cannot be loaded on this host: Library not loaded: libepoxy.0.dylib".into(),
+        ));
+        let err = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch.clone()),
+                    execution_environment: Some(intent_core::SandboxType::Microvm),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect_err("unloadable libkrun must be rejected");
+        let (platform_ok, _) = crate::microvm_platform_supported();
+        match &err {
+            Error::ExecutionEnvironmentUnavailable {
+                environment,
+                reason,
+            } if environment == "microvm" => {
+                if platform_ok {
+                    assert!(reason.contains("libepoxy.0.dylib"), "got: {reason}");
+                }
+            }
+            other => panic!("got: {other}"),
+        }
+
         // Enabled on a capable host → creates the workspace with a CoW
         // checkout and the persisted microvm selection (EE-5). Gated on the
-        // same platform + CoW conjunction the daemon validates.
-        let (platform_ok, _) = crate::microvm_platform_supported();
+        // same platform + CoW conjunction the daemon validates; the host
+        // probe is seeded loadable so the test never spawns the helper.
         if !platform_ok
             || intent_git::cow_probe(&root.0, &root.0)
                 .unwrap_or(intent_git::CowSupport::Unsupported)
@@ -28050,6 +28148,7 @@ mod worktree_provisioning {
             root.0.clone(),
             &[("sandbox.microvm.enabled", serde_json::json!(true))],
         );
+        let svc = svc.with_microvm_host_probe(Ok(()));
         let ws = svc
             .create_workspace(
                 WorkspaceCreate {
