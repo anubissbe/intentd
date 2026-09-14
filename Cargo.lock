@@ -2488,7 +2488,7 @@ dependencies = [
 
 [[package]]
 name = "intentd-microvm-helper"
-version = "0.1.0"
+version = "0.9.55"
 dependencies = [
  "clap",
  "libc",
