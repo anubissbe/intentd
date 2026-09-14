@@ -30144,6 +30144,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.note_presence_update_op(&connection_id, workspace_id, note_id, &cursor)
+                .await
         })
     }
 
