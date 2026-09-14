@@ -17349,9 +17349,10 @@ impl WorkspaceApi for Services {
                     // a workspace row. The inputs are shaped to their final
                     // form first so the plan sees exactly what is persisted;
                     // the trimmed prompt and effective image blocks ride along
-                    // for id / branch naming and the first turn. The plan's
-                    // `workspace_id` is a passthrough the planner never reads,
-                    // so it is stamped once the id is derived below.
+                    // for id / branch naming and the first turn. The plan
+                    // carries no workspace identity — the planner never reads
+                    // it — so the id derived below goes straight to the
+                    // persist half as an argument.
                     let planned_initial_agent = match input.initial_agent.take() {
                         Some(agent) => {
                             let prompt = agent
@@ -17440,15 +17441,15 @@ impl WorkspaceApi for Services {
                                 .as_deref()
                                 .map(PathBuf::from)
                                 .filter(|p| p.is_dir());
-                            // Post-plan inputs, stamped on the plan later:
-                            // `workspace_id` once the id is derived (right
-                            // below) and `skip_auto_commit`, which depends on
-                            // the workspace's effective auto-commit seeded by
-                            // the insert, right before persist.
+                            // Post-plan input, stamped on the plan later:
+                            // `skip_auto_commit`, which depends on the
+                            // workspace's effective auto-commit seeded by
+                            // the insert, right before persist. The workspace
+                            // id is derived after the plan and handed to the
+                            // persist half directly.
                             let plan = services
                                 .plan_agent_create(
                                     "workspace.create",
-                                    WorkspaceId::from_string(String::new()),
                                     nonempty_owned(agent.name),
                                     nonempty_owned(agent.model),
                                     nonempty_owned(agent.specialist),
@@ -17490,10 +17491,6 @@ impl WorkspaceApi for Services {
                         &workspaces_root,
                     )
                     .await;
-                    let planned_initial_agent = planned_initial_agent.map(|(mut plan, prompt, image_blocks)| {
-                        plan.workspace_id = id.clone();
-                        (plan, prompt, image_blocks)
-                    });
                     let progress = progress_id.and_then(|pid| {
                         bus.clone().map(|b| {
                             std::sync::Arc::new(create_progress::CreateProgress::new(
@@ -18989,7 +18986,9 @@ impl WorkspaceApi for Services {
                         // `baseRef` (agent.create parity: worktree, else the
                         // repository path).
                         let snapshot_wp = crate::git_ops::worktree_path(&ws);
-                        let created = services.persist_agent_create(plan, snapshot_wp).await?;
+                        let created = services
+                            .persist_agent_create(plan, ws.id.clone(), snapshot_wp)
+                            .await?;
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
