@@ -382,6 +382,30 @@ pub struct Services {
     /// never shows the entry gone before its row exists. Never persisted.
     /// Lock order: this mutex is taken BEFORE `agent_queues`, never after.
     draining_queue_entries: Arc<Mutex<HashMap<AgentId, Vec<agent_ops::QueuedMessage>>>>,
+    /// Queue-entry id of an `agent.sendMessage` into an `Error` session that
+    /// lost the in-flight slot to a worker still holding it
+    /// (intent-hq/intent#4962). The documented recovery for an `Error`
+    /// session is a fresh send, but a send landing between the
+    /// terminal-failure handler's `Error` persist and its slot release is
+    /// parked in the queue — where the STAB-52 gate refuses to redrive it
+    /// and the exiting worker never drains. A send parked behind a
+    /// still-`Active` turn is never recorded: it is an ordinary mid-turn
+    /// queue entry and stays behind the gate if that turn fails. Recorded
+    /// atomically with the enqueue ([`agent_ops::Services::enqueue_recovery_send`]);
+    /// the releasing worker's exit and the send side's post-enqueue probe
+    /// both redrive THAT entry through
+    /// [`agent_ops::Services::claim_parked_recovery_send`], which pops the
+    /// entry and retires the marker INSIDE the in-flight slot claim — the
+    /// marker is the only authorization, never a copy held across awaits.
+    /// Retired by every committed delivery of the entry
+    /// ([`agent_ops::Services::commit_recovery_send_delivery`]) so a marker
+    /// never outlives its send: a context-size requeue restores entries
+    /// under their ORIGINAL ids, and without the clear a marker left by an
+    /// already-delivered send would lift the gate with no fresh send. Lock
+    /// order: `draining_queue_entries` → `agent_queues` → this mutex, all
+    /// nested inside the `AgentManager` `busy` lock when taken from the slot
+    /// claim. Never persisted.
+    parked_recovery_sends: Arc<Mutex<HashMap<AgentId, String>>>,
     /// Serializes [`agent_ops`] queue write-through persists. Each persist
     /// snapshots the live queue *inside* this async lock, so the last write to
     /// the `agent_queue` table always reflects the newest in-memory state — an
@@ -1162,6 +1186,7 @@ impl Services {
             event_bus: None,
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
+            parked_recovery_sends: Arc::new(Mutex::new(HashMap::new())),
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),

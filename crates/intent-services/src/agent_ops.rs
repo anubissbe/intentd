@@ -1057,6 +1057,35 @@ fn ensure_provider_runnable(
     Ok(())
 }
 
+/// Result of [`Services::claim_parked_recovery_send`] (intent-hq/intent#4962).
+pub(crate) enum RecoverySendClaim {
+    /// The marked entry was queued and ready: it is popped (listed as
+    /// draining until the guard drops) and the marker is retired.
+    Drained(Box<(QueuedMessage, DrainingGuard)>),
+    /// The marker stands but its entry cannot be dispatched right now: it
+    /// is under edit, or it was popped provisionally (an
+    /// `agent.sendQueuedMessageNow` / worker raced pop that has not yet won
+    /// the slot and may hand it back). Nothing changes; a later probe — the
+    /// slot holder's exit, the next recovery send — retries.
+    Deferred,
+    /// No marker, or the marked entry is gone from both the queue and the
+    /// draining overlay (removed, or re-minted under a new id): the stale
+    /// marker is dropped.
+    Absent,
+}
+
+/// Whether a [`Services::pop_draining`] pop commits the popped entries'
+/// delivery (intent-hq/intent#4962): a pop made under a held in-flight slot
+/// does, and retires the parked recovery-send marker on the spot; a pop made
+/// BEFORE the slot claim (`agent.sendQueuedMessageNow`, the worker's raced
+/// pop) is provisional — it may hand the entry back on a lost claim — and
+/// the caller commits once its claim succeeds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PopCommit {
+    Delivery,
+    Provisional,
+}
+
 /// One pending message in an agent's in-memory send queue (`agent.getQueue`).
 ///
 /// `editing` marks the entry as "under edit" — excluded from the **ready-to-send**
@@ -5997,6 +6026,10 @@ impl Services {
     /// editing) we additionally fire `try_drain_queue` so the message
     /// self-drains as if it had just been enqueued — honouring the user's
     /// "re-queued on save, which self-drains" semantics (PROTOCOL §5.5/§6.5).
+    /// A parked recovery send (intent-hq/intent#4962) whose redrive deferred
+    /// while it was under edit is probed first: its marker lifts the STAB-52
+    /// `Error` gate for that entry alone, and an unmarked entry still meets
+    /// the ordinary gate.
     pub(crate) async fn agent_edit_queued_message_op(
         &self,
         agent_id: AgentId,
@@ -6029,6 +6062,9 @@ impl Services {
         if was_editing && !now_editing {
             if let Some(manager) = self.agent_manager() {
                 if let Ok(session) = self.store.get_agent_session(&agent_id).await {
+                    manager
+                        .redrive_parked_recovery_send(&agent_id, &session.workspace_id)
+                        .await;
                     manager
                         .try_drain_queue(agent_id, session.workspace_id)
                         .await;
@@ -13229,6 +13265,49 @@ impl Services {
         (queued, position)
     }
 
+    /// [`Services::enqueue_message_with_id`] for an `agent.sendMessage` into
+    /// an `Error` session that lost the in-flight slot (intent-hq/intent#4962):
+    /// queues the entry AND records it as the agent's parked recovery send
+    /// in one critical section under the draining lock — the lock every
+    /// committed pop ([`Services::pop_draining`]) holds while it retires the
+    /// marker. A pop therefore either precedes the enqueue (and finds no
+    /// entry) or follows the marker (and retires it); it can never slip
+    /// between the two and leave a marker authorizing an entry a competing
+    /// drain has already dispatched (and then requeued under its ORIGINAL
+    /// id on a context-size failure). Replaces any earlier marker: the newer
+    /// send is the authorization that stands.
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_recovery_send(
+        &self,
+        agent_id: &AgentId,
+        message_id: String,
+        content: String,
+        image_blocks: Option<Value>,
+        file_blocks: Option<Value>,
+        message_metadata: Option<Value>,
+        prepend: Option<QueuedPrepend>,
+        interrupt: bool,
+        origin: MessageOrigin,
+    ) -> (QueuedMessage, usize) {
+        let _draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let (queued, position) = self.enqueue_message_with_id(
+            agent_id,
+            Some(message_id),
+            content,
+            image_blocks,
+            file_blocks,
+            message_metadata,
+            prepend,
+            interrupt,
+            origin,
+        );
+        self.mark_parked_recovery_send(agent_id, queued.id.clone());
+        (queued, position)
+    }
+
     /// Enqueue (or refresh) a **held** entry on an agent's queue: the entry
     /// carries a `(hold_kind, hold_until, child_agent_id)` debounce-hold
     /// marker, is excluded from every drain path until released, persists
@@ -13921,6 +14000,131 @@ impl Services {
             .is_some_and(|q| q.iter().any(QueuedMessage::ready_to_send))
     }
 
+    /// `true` iff the agent's queue still holds a ready-to-send entry with
+    /// this exact `id` — the test-side view of what
+    /// [`Self::claim_parked_recovery_send`] would pop.
+    #[cfg(test)]
+    pub(crate) fn is_message_queued(&self, agent_id: &AgentId, message_id: &str) -> bool {
+        self.agent_queues
+            .lock()
+            .expect("agent queue registry poisoned")
+            .get(agent_id)
+            .is_some_and(|q| q.iter().any(|m| m.id == message_id && m.ready_to_send()))
+    }
+
+    /// Record a user send parked by the busy race as the agent's pending
+    /// recovery send (intent-hq/intent#4962); see `Services::parked_recovery_sends`.
+    /// Production records it through [`Self::enqueue_recovery_send`], atomically
+    /// with the enqueue; tests seed markers directly. Replaces any earlier
+    /// marker: the newer send is the authorization that stands.
+    pub(crate) fn mark_parked_recovery_send(&self, agent_id: &AgentId, message_id: String) {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .insert(agent_id.clone(), message_id);
+    }
+
+    /// The agent's pending recovery-send marker, if any — a cheap peek so a
+    /// probe skips the drain's store reads when nothing is parked. Never
+    /// authority: only [`Self::claim_parked_recovery_send`], under the slot
+    /// claim, hands the entry out.
+    pub(crate) fn parked_recovery_send(&self, agent_id: &AgentId) -> Option<String> {
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .get(agent_id)
+            .cloned()
+    }
+
+    /// Dispatch the agent's parked recovery send (intent-hq/intent#4962):
+    /// read the marker, pop exactly that entry iff it is queued and
+    /// `ready_to_send`, and retire the marker — one critical section under
+    /// the draining lock, the same lock every committed pop holds while it
+    /// retires the marker, so no delivery can interleave with the decision.
+    /// The redrive calls this INSIDE its in-flight slot claim
+    /// (`AgentManager::claim_slot_sync`): the slot is taken only together
+    /// with the entry, so there is never an authorization living outside
+    /// this registry — no local id to go stale across gate awaits, nothing
+    /// to hand back on a lost claim, and no turn-start side effect (the
+    /// `Active` persist, `stop_reason` clear) unless a delivery follows.
+    ///
+    /// A marker whose entry is under edit, or was popped provisionally by a
+    /// path that has not yet won the slot (`agent.sendQueuedMessageNow`, the
+    /// worker's raced pop), is left standing ([`RecoverySendClaim::Deferred`])
+    /// — the provisional holder either commits the delivery, retiring it,
+    /// or hands the entry back for a later probe. A marker whose entry is in
+    /// neither the queue nor the draining overlay is stale (removed, or
+    /// re-minted under a new id by a terminal-failure requeue) and dropped.
+    pub(crate) fn claim_parked_recovery_send(&self, agent_id: &AgentId) -> RecoverySendClaim {
+        let mut draining = self
+            .draining_queue_entries
+            .lock()
+            .expect("draining queue registry poisoned");
+        let Some(message_id) = self.parked_recovery_send(agent_id) else {
+            return RecoverySendClaim::Absent;
+        };
+        let (popped, queued) = {
+            let mut queues = self
+                .agent_queues
+                .lock()
+                .expect("agent queue registry poisoned");
+            match queues.get_mut(agent_id) {
+                Some(queue) => match queue.iter().position(|m| m.id == message_id) {
+                    Some(idx) if queue[idx].ready_to_send() => (Some(queue.remove(idx)), true),
+                    Some(_) => (None, true),
+                    None => (None, false),
+                },
+                None => (None, false),
+            }
+        };
+        if let Some(entry) = popped {
+            self.parked_recovery_sends
+                .lock()
+                .expect("parked recovery send registry poisoned")
+                .remove(agent_id);
+            let guard =
+                self.register_draining(&mut draining, agent_id, std::slice::from_ref(&entry));
+            return RecoverySendClaim::Drained(Box::new((entry, guard)));
+        }
+        let popped_provisionally = draining
+            .get(agent_id)
+            .is_some_and(|d| d.iter().any(|m| m.id == message_id));
+        if queued || popped_provisionally {
+            return RecoverySendClaim::Deferred;
+        }
+        self.parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned")
+            .remove(agent_id);
+        RecoverySendClaim::Absent
+    }
+
+    /// Retire the parked recovery-send marker (intent-hq/intent#4962) when a
+    /// delivery of its entry is committed: the send it authorized is now in
+    /// flight, so a later requeue of the same entry — a context-size requeue
+    /// keeps the ORIGINAL id — must not re-validate it and lift the STAB-52
+    /// gate. Pops made under a held slot commit inside
+    /// [`Self::pop_draining`]; a provisional pop (`agent.sendQueuedMessageNow`,
+    /// the worker's raced pop — both pop BEFORE claiming the slot and hand
+    /// the entry back on a lost claim) calls this once its claim succeeds,
+    /// so an undelivered hand-back never strands the recovery send.
+    pub(crate) fn commit_recovery_send_delivery(
+        &self,
+        agent_id: &AgentId,
+        entries: &[QueuedMessage],
+    ) {
+        let mut parked = self
+            .parked_recovery_sends
+            .lock()
+            .expect("parked recovery send registry poisoned");
+        if parked
+            .get(agent_id)
+            .is_some_and(|id| entries.iter().any(|m| m.id == *id))
+        {
+            parked.remove(agent_id);
+        }
+    }
+
     /// `true` iff at least one ready-to-send queued entry is user-origin:
     /// the archived-drain exemption's legacy-row fallback (no `archivedAt`)
     /// uses this to decide whether a drain may proceed for the user entry.
@@ -14024,7 +14228,8 @@ impl Services {
     /// Pop the next ready-to-send entry ([`Services::dequeue_message`]) and,
     /// atomically with respect to [`Services::queue_snapshot`], keep it
     /// listed as draining until the returned [`DrainingGuard`] is dropped
-    /// (§6.5 drain ordering).
+    /// (§6.5 drain ordering). The caller holds the in-flight slot: the pop
+    /// commits the delivery ([`PopCommit::Delivery`]).
     pub(crate) fn dequeue_message_draining(
         &self,
         agent_id: &AgentId,
@@ -14033,6 +14238,24 @@ impl Services {
             agent_id,
             |s| s.dequeue_message(agent_id),
             std::slice::from_ref,
+            PopCommit::Delivery,
+        )
+    }
+
+    /// [`Services::dequeue_message_draining`] for the worker's end-of-turn
+    /// raced pop, which pops BEFORE re-claiming the slot and hands the entry
+    /// back on a lost claim: the pop is provisional
+    /// ([`PopCommit::Provisional`]) and the caller commits with
+    /// [`Services::commit_recovery_send_delivery`] once its claim succeeds.
+    pub(crate) fn dequeue_message_draining_provisional(
+        &self,
+        agent_id: &AgentId,
+    ) -> Option<(QueuedMessage, DrainingGuard)> {
+        self.pop_draining(
+            agent_id,
+            |s| s.dequeue_message(agent_id),
+            std::slice::from_ref,
+            PopCommit::Provisional,
         )
     }
 
@@ -14046,6 +14269,7 @@ impl Services {
             agent_id,
             |s| s.dequeue_user_origin_message(agent_id),
             std::slice::from_ref,
+            PopCommit::Delivery,
         )
     }
 
@@ -14062,6 +14286,7 @@ impl Services {
             agent_id,
             |s| s.dequeue_flush_batch(agent_id, mode, require_user_origin, min_ready),
             Vec::as_slice,
+            PopCommit::Delivery,
         )
     }
 
@@ -14077,6 +14302,7 @@ impl Services {
             agent_id,
             |s| s.dequeue_ready_batch(agent_id, require_user_origin, min_ready),
             Vec::as_slice,
+            PopCommit::Delivery,
         )
     }
 
@@ -14091,11 +14317,16 @@ impl Services {
             agent_id,
             |s| s.dequeue_system_only_batch(agent_id, min_ready),
             Vec::as_slice,
+            PopCommit::Delivery,
         )
     }
 
     /// [`Services::take_queued_message`] with the same draining registration
     /// as [`Services::dequeue_message_draining`] (`agent.sendQueuedMessageNow`).
+    /// The caller pops BEFORE claiming the slot and hands the entry back on
+    /// a lost claim, so the pop is provisional ([`PopCommit::Provisional`]);
+    /// it commits with [`Services::commit_recovery_send_delivery`] once the
+    /// claim succeeds.
     pub(crate) fn take_queued_message_draining(
         &self,
         agent_id: &AgentId,
@@ -14105,6 +14336,7 @@ impl Services {
             agent_id,
             |s| s.take_queued_message(agent_id, message_id),
             std::slice::from_ref,
+            PopCommit::Provisional,
         )
     }
 
@@ -14127,19 +14359,26 @@ impl Services {
     /// BEFORE `agent_queues`, the order [`Services::queue_snapshot`] uses), so
     /// no snapshot can observe the popped entries in neither place; the popped
     /// entries are recorded as draining and the returned [`DrainingGuard`]
-    /// retires them.
+    /// retires them. A [`PopCommit::Delivery`] pop also retires the parked
+    /// recovery-send marker under the same lock
+    /// ([`Services::commit_recovery_send_delivery`]).
     fn pop_draining<T>(
         &self,
         agent_id: &AgentId,
         pop: impl FnOnce(&Self) -> Option<T>,
         entries: impl FnOnce(&T) -> &[QueuedMessage],
+        commit: PopCommit,
     ) -> Option<(T, DrainingGuard)> {
         let mut draining = self
             .draining_queue_entries
             .lock()
             .expect("draining queue registry poisoned");
         let popped = pop(self)?;
-        let guard = self.register_draining(&mut draining, agent_id, entries(&popped));
+        let entries = entries(&popped);
+        if commit == PopCommit::Delivery {
+            self.commit_recovery_send_delivery(agent_id, entries);
+        }
+        let guard = self.register_draining(&mut draining, agent_id, entries);
         Some((popped, guard))
     }
 
