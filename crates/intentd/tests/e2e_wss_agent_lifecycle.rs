@@ -4118,6 +4118,207 @@ async fn report_to_parent_metadata_only_then_idle_delivers_single_wake_over_wss(
     );
 }
 
+/// Caller-aware terminal guard on `task.updateNoteStatus` over WSS — the
+/// incident shape: a task's assigned agent runs
+/// `ws.task.updateNoteStatus(id, "review_required")` through the production
+/// `workspace_api` MCP bridge (which passes the caller agent) AFTER a
+/// caller-less front-door write (`task.updateNoteStatus` over WSS, the
+/// coordinator/verifier/user path) closed the task as `complete`. Asserts
+/// over the real wire (PROTOCOL §5.5):
+///  - the MCP call answers `ok: true`, the unchanged `status: "complete"`
+///    and the presence-detected `advisory` string;
+///  - no `task:status-changed` is emitted for the blocked write;
+///  - `task.get` still reads `complete` after the agent's turn.
+#[tokio::test]
+async fn linked_agent_cannot_reopen_terminal_task_over_wss() {
+    const GO: &str = "GUARD_WSS_GO";
+    const RESULT_TAG: &str = "GUARD_WSS_RESULT ";
+    let Some(script) = gate("WSS task terminal-guard E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let (ws_id, note_id) = seed_workspace_and_note(&data_dir).await;
+    // The agent attempts the reopen through the MCP path, then appends the
+    // raw result to the task note so the wire-visible response shape can be
+    // read back through `note.get`.
+    let reopen_js = format!(
+        "const r = await ws.task.updateNoteStatus({}, 'review_required'); \
+         await ws.note.add({}, {{ content: '\\n' + {} + JSON.stringify(r) }}); \
+         return r;",
+        json!(note_id),
+        json!(note_id),
+        json!(RESULT_TAG),
+    );
+    let behavior = json!({
+        "rules": [
+            {
+                "ifPromptContains": GO,
+                "toolCall": {
+                    "name": "workspace_api",
+                    "arguments": { "code": reopen_js, "summary": "linked agent reopen attempt" }
+                },
+                "response": "attempted reopen",
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 4] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("INTENTD_TCP_PORT", "0"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child_proc = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child: child_proc };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let marked = wss_rpc(
+        &mut rpc,
+        10,
+        "task.markAsTask",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "in_progress" }),
+    )
+    .await;
+    assert_eq!(marked["ok"], true, "markAsTask ok: {marked}");
+    let created = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Guarded", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let assigned = wss_rpc(
+        &mut rpc,
+        12,
+        "task.assignAgent",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(assigned["ok"], true, "assignAgent ok: {assigned}");
+    // Front door (no caller): closes the task exactly as before, with no
+    // `advisory` on the response.
+    let closed = wss_rpc(
+        &mut rpc,
+        13,
+        "task.updateNoteStatus",
+        json!({ "workspaceId": ws_id, "noteId": note_id, "status": "complete" }),
+    )
+    .await;
+    assert_eq!(closed["ok"], true, "front-door complete ok: {closed}");
+    assert_eq!(
+        closed["status"], "complete",
+        "front-door complete: {closed}"
+    );
+    assert!(
+        closed.get("advisory").is_none(),
+        "no advisory on an unblocked write: {closed}"
+    );
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so we miss no task event.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*", "task:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let sent = wss_rpc(
+        &mut rpc,
+        14,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": GO }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+
+    let mut task_events: Vec<Value> = Vec::new();
+    let mut idle = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !idle {
+        let Some(frame) = wss_event_opt_until(&mut sub, deadline).await else {
+            panic!("timed out waiting for the agent's terminal agent:idle: {task_events:?}")
+        };
+        let ev = &frame["params"]["event"];
+        let ev_type = ev["type"].as_str().unwrap_or_default();
+        if ev_type.starts_with("task:") {
+            task_events.push(ev.clone());
+        }
+        if ev_type == "agent:idle" && ev["data"]["agentId"] == agent_id.as_str() {
+            idle = true;
+        }
+    }
+    assert!(
+        !task_events
+            .iter()
+            .any(|ev| ev["type"] == "task:status-changed"),
+        "blocked reopen emits no task:status-changed: {task_events:?}"
+    );
+
+    let task = wss_rpc(
+        &mut rpc,
+        15,
+        "task.get",
+        json!({ "workspaceId": ws_id, "taskNoteId": note_id }),
+    )
+    .await;
+    assert_eq!(
+        task["task"]["status"], "complete",
+        "assigned agent's reopen attempt left the task complete: {task}"
+    );
+    let note = wss_rpc(
+        &mut rpc,
+        16,
+        "note.get",
+        json!({ "workspaceId": ws_id, "noteId": note_id }),
+    )
+    .await;
+    let content = note["note"]["content"].as_str().unwrap_or_default();
+    let result_line = content
+        .lines()
+        .find_map(|line| line.strip_prefix(RESULT_TAG))
+        .unwrap_or_else(|| panic!("agent appended the MCP result to the note: {note}"));
+    let result: Value = serde_json::from_str(result_line).expect("MCP result JSON");
+    assert_eq!(result["ok"], true, "blocked write still ok: {result}");
+    assert_eq!(
+        result["noteId"], note_id,
+        "blocked write echoes noteId: {result}"
+    );
+    assert_eq!(
+        result["status"], "complete",
+        "blocked write answers the unchanged terminal status: {result}"
+    );
+    assert_eq!(
+        result["advisory"].as_str(),
+        Some(
+            "Task is complete; a task's own linked agent cannot reopen it. \
+             Ask the coordinator or user to reopen the task if more work is needed."
+        ),
+        "blocked write carries the advisory: {result}"
+    );
+}
+
 /// Agent attention requests over WSS — discussion kind, task-linked caller.
 /// A parentless delegated agent linked to an `in_progress` task note calls
 /// `ws.agent.requestDiscussion(reason)` mid-turn. Asserts over the real wire
@@ -11483,9 +11684,33 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
     let agent_id = created["agent"]["id"].as_str().unwrap().to_string();
 
     let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-    let sent = wss_rpc(
+    // Protocol 10.0: the inline `data` arm of `fileBlocks` is rejected on the
+    // wire with `-32602` naming the index, before any state change.
+    let rejected = wss_rpc_envelope(
         &mut rpc,
         11,
+        "agent.sendMessage",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "content": "look at these",
+            "fileBlocks": [
+                { "type": "file", "data": "QQ==", "mimeType": "text/plain", "fileName": "a.txt" }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    let err_msg = rejected["error"]["message"].as_str().unwrap_or_default();
+    assert!(err_msg.contains("fileBlocks[0]"), "{rejected}");
+    assert!(
+        err_msg.contains("inline file data is no longer accepted"),
+        "{rejected}"
+    );
+
+    let sent = wss_rpc(
+        &mut rpc,
+        12,
         "agent.sendMessage",
         json!({
             "workspaceId": &ws_id,
@@ -11495,7 +11720,7 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
                 { "type": "image", "data": image_data, "mimeType": "image/png" }
             ],
             "fileBlocks": [
-                { "type": "file", "data": "ZmlsZWRhdGE=", "mimeType": "text/plain", "fileName": "notes.txt" }
+                { "type": "file", "attachmentId": "att-notes", "mimeType": "text/plain", "fileName": "notes.txt" }
             ],
         }),
     )
@@ -11519,12 +11744,17 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
     // file blocks after the text block.
     let conv = wss_rpc(
         &mut rpc,
-        12,
+        13,
         "agent.getConversation",
         json!({ "workspaceId": &ws_id, "agentId": &agent_id }),
     )
     .await;
     let messages = conv["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages.iter().filter(|m| m["role"] == "user").count(),
+        1,
+        "the rejected send persisted nothing: {conv}"
+    );
     let user_row = messages
         .iter()
         .find(|m| m["role"] == "user")
@@ -11548,9 +11778,192 @@ async fn stab_133_send_message_persists_attachment_blocks_in_transcript() {
         .iter()
         .find(|b| b["type"] == "file")
         .expect("file block persisted on the user row");
-    assert_eq!(file["data"], "ZmlsZWRhdGE=");
+    assert_eq!(file["attachmentId"], "att-notes");
     assert_eq!(file["fileName"], "notes.txt");
     assert_eq!(file["mimeType"], "text/plain");
+    assert!(file.get("data").is_none(), "{file}");
+}
+
+/// Walk a served payload and fail on any `file` block still carrying `data`.
+fn assert_no_file_data(v: &Value, surface: &str) {
+    match v {
+        Value::Object(map) => {
+            if map.get("type") == Some(&json!("file")) {
+                assert!(
+                    !map.contains_key("data"),
+                    "{surface}: served a file block carrying `data`: {v}"
+                );
+            }
+            map.values().for_each(|c| assert_no_file_data(c, surface));
+        }
+        Value::Array(items) => items.iter().for_each(|c| assert_no_file_data(c, surface)),
+        _ => {}
+    }
+}
+
+/// Protocol 10.0 serve side over the real WSS wire: a legacy inline file
+/// block already persisted on a user row (`{ type: 'file', data, fileName }`
+/// with no `attachmentId`, written by a pre-10.0 daemon) is served as a
+/// `text` block naming the file — with no `data` key anywhere in the
+/// payload — on the `chat.subscribe` seq-0 snapshot, on
+/// `agent.getConversation`, and on `agent.getMessageBlock`. A nameless
+/// legacy block falls back to `"Attached file"`; an attachment-reference
+/// block on the same row is untouched. The row is seeded directly in the
+/// store before the daemon boots (the input seams reject the shape now, so
+/// no wire call can create it), and nothing is rewritten on disk.
+#[tokio::test]
+async fn legacy_inline_file_blocks_served_as_text_over_wss() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let legacy_row = json!([
+        { "type": "text", "text": "see attached" },
+        { "type": "file", "data": "ZmlsZWRhdGE=", "mimeType": "text/plain", "fileName": "notes.txt" },
+        { "type": "file", "data": "eA==", "mimeType": "application/octet-stream" },
+        { "type": "file", "attachmentId": "att-1", "fileName": "ref.pdf", "mimeType": "application/pdf" },
+    ]);
+    let (ws_id, agent_id, message_id) = {
+        use intent_core::{now_iso, AgentId, WorkspaceApi, WorkspaceId};
+        use intent_services::Services;
+        use intent_store::Store;
+        let store = Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open store");
+        let ws_root = common::hermetic_workspaces_root();
+        let services = Services::new(store.clone())
+            .with_workspaces_root(ws_root.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(ws_root.path()));
+        let ws = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace_seed(&ws))
+            .await
+            .expect("insert ws");
+        let created = services
+            .agent_create(
+                ws.clone(),
+                Some("LegacyInline".into()),
+                None,
+                None,
+                None,
+                None,
+                intent_core::AgentCreateExtra::default(),
+            )
+            .await
+            .expect("create agent");
+        let agent_id = AgentId::from(created["agent"]["id"].as_str().expect("agent id"));
+        let message_id = store
+            .append_agent_message(&agent_id, "user", &legacy_row, &now_iso())
+            .await
+            .expect("append legacy row")
+            .id;
+        (ws.0, agent_id.0, message_id)
+    };
+
+    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    let expect_projected = |blocks: &[Value], surface: &str| {
+        assert_eq!(blocks.len(), 4, "{surface}: {blocks:?}");
+        assert_eq!(blocks[0]["type"], "text", "{surface}: {:?}", blocks[0]);
+        assert_eq!(blocks[0]["text"], "see attached", "{surface}");
+        assert_eq!(blocks[1]["type"], "text", "{surface}: {:?}", blocks[1]);
+        assert_eq!(blocks[1]["text"], "Attached file: notes.txt", "{surface}");
+        assert_eq!(blocks[1]["id"], format!("{message_id}:1"), "{surface}");
+        assert_eq!(blocks[2]["type"], "text", "{surface}: {:?}", blocks[2]);
+        assert_eq!(blocks[2]["text"], "Attached file", "{surface}");
+        assert_eq!(blocks[3]["type"], "file", "{surface}: {:?}", blocks[3]);
+        assert_eq!(blocks[3]["attachmentId"], "att-1", "{surface}");
+        assert_eq!(blocks[3]["fileName"], "ref.pdf", "{surface}");
+        assert!(
+            blocks[3].get("data").is_none(),
+            "{surface}: {:?}",
+            blocks[3]
+        );
+    };
+
+    // chat.subscribe seq-0 snapshot — the payload the FE renders a transcript
+    // from on open.
+    let mut chat = connect_ws(port, cfg.clone()).await;
+    let chat_resp = wss_rpc(
+        &mut chat,
+        10,
+        "chat.subscribe",
+        json!({ "agentId": &agent_id }),
+    )
+    .await;
+    assert!(
+        chat_resp["subscriptionId"].is_string(),
+        "chat subscribed: {chat_resp}"
+    );
+    let push = wss_push(&mut chat, 15).await;
+    assert_eq!(push["params"]["kind"], "snapshot", "push: {push}");
+    let snapshot = &push["params"]["snapshot"];
+    assert_no_file_data(snapshot, "chat.subscribe snapshot");
+    let snap_messages = snapshot["messages"].as_array().expect("snapshot messages");
+    let snap_row = snap_messages
+        .iter()
+        .find(|m| m["id"] == json!(&message_id))
+        .unwrap_or_else(|| panic!("seeded row in snapshot: {snapshot}"));
+    expect_projected(
+        snap_row["contentBlocks"].as_array().expect("contentBlocks"),
+        "chat.subscribe snapshot",
+    );
+
+    // agent.getConversation (slim is the wire default and the only wire
+    // projection since v8.0).
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    for (id, params) in [
+        (11, json!({ "workspaceId": &ws_id, "agentId": &agent_id })),
+        (
+            12,
+            json!({ "workspaceId": &ws_id, "agentId": &agent_id, "projection": "slim" }),
+        ),
+    ] {
+        let conv = wss_rpc(&mut rpc, id, "agent.getConversation", params).await;
+        assert_no_file_data(&conv, "agent.getConversation");
+        let row = conv["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|m| m["id"] == json!(&message_id))
+            .unwrap_or_else(|| panic!("seeded row in conversation: {conv}"));
+        expect_projected(
+            row["contentBlocks"].as_array().expect("contentBlocks"),
+            "agent.getConversation",
+        );
+    }
+
+    // agent.getMessageBlock — the per-block hydration path serves the
+    // projected text block, never the bytes.
+    let block = wss_rpc(
+        &mut rpc,
+        13,
+        "agent.getMessageBlock",
+        json!({
+            "workspaceId": &ws_id,
+            "agentId": &agent_id,
+            "messageId": &message_id,
+            "blockId": format!("{message_id}:1"),
+        }),
+    )
+    .await;
+    assert_no_file_data(&block, "agent.getMessageBlock");
+    assert_eq!(block["block"]["type"], "text", "{block}");
+    assert_eq!(
+        block["block"]["text"], "Attached file: notes.txt",
+        "{block}"
+    );
+    assert_eq!(block["block"]["id"], format!("{message_id}:1"), "{block}");
 }
 
 /// Sender attribution for agent-to-agent sends (PROTOCOL §5.5): when agent A

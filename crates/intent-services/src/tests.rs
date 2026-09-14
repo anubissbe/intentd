@@ -201,7 +201,7 @@ fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     }
 }
 
-async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
+pub(super) async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -2250,7 +2250,7 @@ async fn set_content_reduction_guard_requires_confirmation() {
 
 /// [`setup`] plus a `note_version` snapshot at rev 0, so `expectedVersion: 0`
 /// resolves to a recoverable base for the three-way merge.
-async fn setup_versioned(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
+pub(super) async fn setup_versioned(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
     let (tmp, svc, ws, id) = setup(content).await;
     let note = svc.store.get_note(&ws, &id).await.expect("get note");
     svc.store
@@ -2472,6 +2472,48 @@ async fn set_content_future_expected_version_conflicts_without_writing() {
         2,
         "no extra snapshot appended"
     );
+}
+
+/// The future-rev `Conflict` wins over the set-content guards: normalization
+/// of the incoming text is error-free and the empty / truncation validation
+/// runs on the merged text, after the merge has already raised `Conflict`,
+/// so `expectedVersion` above the stored rev is `-32005` even when the
+/// payload is an empty quoted string or a short `...` fragment. Nothing is
+/// written either way.
+#[tokio::test]
+async fn set_content_future_expected_version_conflicts_before_content_guards() {
+    let (_tmp, svc, ws, id) = setup_versioned("body").await;
+    svc.set_note_content(ws.clone(), id.clone(), "body v1".into(), false, None, None)
+        .await
+        .expect("bump to rev 1");
+
+    for payload in ["\"\"", "short..."] {
+        let r = svc
+            .set_note_content(
+                ws.clone(),
+                id.clone(),
+                payload.into(),
+                false,
+                Some(999),
+                None,
+            )
+            .await;
+        match r {
+            Err(Error::Conflict { current }) => {
+                assert_eq!(current["rev"], serde_json::json!(1), "{payload:?}");
+                assert_eq!(
+                    current["content"],
+                    serde_json::json!("body v1"),
+                    "{payload:?}"
+                );
+            }
+            other => panic!("{payload:?}: future expectedVersion must be Conflict, got {other:?}"),
+        }
+    }
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "body v1", "nothing persisted");
+    assert_eq!(stored.rev, 1, "rev unchanged");
 }
 
 /// The read-merge-persist loop is bounded: when every attempt's gated UPDATE
@@ -2793,6 +2835,20 @@ async fn surgical_write_races_user_save<T>(
     op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, intent_core::Result<T>>,
 ) -> (T, Note) {
     let (tmp, svc, ws, id) = setup_versioned(base).await;
+    surgical_write_races_user_save_in(&tmp, &svc, &ws, &id, user, op).await
+}
+
+/// [`surgical_write_races_user_save`] over an already-prepared versioned
+/// store, for tests that seed extra rows (a linked task note) before the race
+/// or keep asserting against `svc` after it.
+async fn surgical_write_races_user_save_in<T>(
+    tmp: &TempDb,
+    svc: &Services,
+    ws: &WorkspaceId,
+    id: &NoteId,
+    user: &str,
+    op: impl for<'a> FnOnce(&'a Services, WorkspaceId, NoteId) -> BoxFuture<'a, intent_core::Result<T>>,
+) -> (T, Note) {
     let other = Store::open(&tmp.path).await.expect("open second store");
     let other_svc = Services::new(other.clone());
 
@@ -2803,9 +2859,9 @@ async fn surgical_write_races_user_save<T>(
         .acquire()
         .await
         .expect("hold write conn");
-    let mut fut = op(&svc, ws.clone(), id.clone());
+    let mut fut = op(svc, ws.clone(), id.clone());
     let parked = poll_until(&mut fut, 20, || async {
-        svc.store.get_note(&ws, &id).await.expect("get note");
+        svc.store.get_note(ws, id).await.expect("get note");
         false
     })
     .await;
@@ -2819,14 +2875,14 @@ async fn surgical_write_races_user_save<T>(
     drop(held);
 
     let result = fut.await.expect("surgical write");
-    let stored = other.get_note(&ws, &id).await.expect("final note");
+    let stored = other.get_note(ws, id).await.expect("final note");
     assert_eq!(
         stored.rev, 2,
         "surgical write lands on top of the user save"
     );
     assert_eq!(
         other
-            .get_note_version_content_by_rev(&ws, &id, 2)
+            .get_note_version_content_by_rev(ws, id, 2)
             .await
             .expect("lookup"),
         Some(stored.content.clone()),
@@ -2976,6 +3032,286 @@ async fn task_update_status_merges_onto_completed_user_save() {
     .await;
     assert!(result.ok);
     assert_eq!(stored.content, "- [x] alpha\nbeta TYPED\ngamma");
+}
+
+/// Regression for intent-hq/intent#4930 on a plain checkbox: `task.updateStatus`
+/// (`[ ]` → `[x]`) races a user save that flipped the same marker to `[/]`.
+/// The retry's three-way merge conflicts inside the brackets and, unrepaired,
+/// persisted `- [/x] alpha`, which `match_task_line` no longer recognizes.
+/// The persisted marker is one valid character — the current (user) side's —
+/// and `note.listTasks` still parses the line.
+#[tokio::test]
+async fn task_update_status_conflicting_marker_persists_a_valid_checkbox() {
+    let (tmp, svc, ws, id) = setup_versioned("- [ ] alpha\nbeta\ngamma").await;
+    let (result, stored) = surgical_write_races_user_save_in(
+        &tmp,
+        &svc,
+        &ws,
+        &id,
+        "- [/] alpha\nbeta\ngamma",
+        |svc, ws, id| svc.task_update_status(ws, id, "alpha".into(), "done".into(), None),
+    )
+    .await;
+    assert!(result.ok);
+    assert_eq!(stored.content, "- [/] alpha\nbeta\ngamma");
+
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].line_number, 1);
+    assert_eq!(rows[0].text, "alpha");
+    assert_eq!(rows[0].status, "in-progress");
+    assert_eq!(rows[0].task_note_id, None);
+}
+
+/// Regression for intent-hq/intent#4930 on a line linking a real task note.
+/// `task.updateStatus` on a linked line never merges (it redirects to the
+/// task note and materializes), so the merge-exposed write here is a
+/// `note.edit` that flips the marker to `[x]` while the user's save flipped
+/// it to `[/]`. The repaired line keeps its link (`note.listTasks` row carries
+/// `taskNoteId`) and the next `task.updateNoteStatus` materializes onto it.
+#[tokio::test]
+async fn linked_checkbox_conflicting_marker_stays_linked_and_materializes() {
+    use intent_core::{TaskMetadata, TaskStatus};
+
+    const TASK: &str = "t4930";
+    let line = |marker: &str| format!("- {marker} [T](intent://local/task/{TASK})");
+    let (tmp, svc, ws, id) = setup_versioned(&format!("{}\nbeta\ngamma", line("[ ]"))).await;
+    let mut task_note = note(&ws, TASK, "body");
+    task_note.metadata.task = Some(TaskMetadata {
+        status: TaskStatus::NotStarted,
+        ..Default::default()
+    });
+    svc.store
+        .insert_note(&task_note)
+        .await
+        .expect("insert task note");
+
+    let (result, stored) = surgical_write_races_user_save_in(
+        &tmp,
+        &svc,
+        &ws,
+        &id,
+        &format!("{}\nbeta\ngamma", line("[/]")),
+        |svc, ws, id| {
+            svc.edit_note(
+                ws,
+                id,
+                NoteEditInput {
+                    old: line("[ ]"),
+                    new: line("[x]"),
+                },
+                None,
+            )
+        },
+    )
+    .await;
+    assert_eq!(stored.content, format!("{}\nbeta\ngamma", line("[/]")));
+    assert_eq!(result.new_content, stored.content);
+
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].status, "in-progress");
+    assert_eq!(rows[0].task_note_id.as_deref(), Some(TASK));
+
+    svc.task_update_note_status(
+        ws.clone(),
+        NoteId::from(TASK),
+        "complete".into(),
+        None,
+        None,
+    )
+    .await
+    .expect("updateNoteStatus");
+    let parent = svc.store.get_note(&ws, &id).await.expect("get parent");
+    assert_eq!(parent.content, format!("{}\nbeta\ngamma", line("[x]")));
+    assert_eq!(parent.rev, 3, "materialization is one versioned write");
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows[0].status, "done");
+    assert_eq!(rows[0].task_note_id.as_deref(), Some(TASK));
+}
+
+/// Regression for intent-hq/intent#4930 via `note.setContent` with a stale
+/// `expectedVersion`: the stale writer flipped the marker to `[x]` (and
+/// appended `delta`), the current text has `[/]`. The non-conflicting append
+/// merges in, and the conflicting marker collapses to the current side's
+/// character instead of persisting `- [/x] alpha`.
+#[tokio::test]
+async fn set_content_stale_expected_version_repairs_conflicting_marker() {
+    let (_tmp, svc, ws, id) = setup_versioned("- [ ] alpha\nbeta\ngamma").await;
+
+    let b = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "- [/] alpha\nbeta\ngamma".into(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let a = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "- [x] alpha\nbeta\ngamma\ndelta".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("stale expectedVersion merges");
+    assert_eq!(a.new_content, "- [/] alpha\nbeta\ngamma\ndelta");
+    assert_eq!(a.rev, 2);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "- [/] alpha\nbeta\ngamma\ndelta");
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].text, "alpha");
+    assert_eq!(rows[0].status, "in-progress");
+}
+
+/// Same stale-`expectedVersion` race with the incoming text wrapped in the
+/// quotes the set-content cleaner strips. The cleaner runs before the merge,
+/// so the bullet is visible to the conflict-scoped repair and the persisted
+/// line is `- [/] alpha`, not `- [/x] alpha`.
+#[tokio::test]
+async fn set_content_quoted_stale_expected_version_repairs_conflicting_marker() {
+    let (_tmp, svc, ws, id) = setup_versioned("- [ ] alpha\nbeta\ngamma").await;
+
+    let b = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "- [/] alpha\nbeta\ngamma".into(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let a = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "\"- [x] alpha\nbeta\ngamma\ndelta\"".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("quoted stale expectedVersion merges");
+    assert_eq!(a.new_content, "- [/] alpha\nbeta\ngamma\ndelta");
+    assert_eq!(a.rev, 2);
+
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, "- [/] alpha\nbeta\ngamma\ndelta");
+    let rows = svc
+        .list_note_tasks(ws.clone(), id.clone())
+        .await
+        .expect("listTasks");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].text, "alpha");
+    assert_eq!(rows[0].status, "in-progress");
+}
+
+/// Controls for the pre-merge cleaner: an exact-rev quoted write still
+/// persists the unquoted text byte-for-byte, and a non-conflicting stale
+/// merge onto current text that legitimately starts with a quote keeps that
+/// quote — only the writer's own payload is cleaned.
+#[tokio::test]
+async fn set_content_cleaner_runs_once_on_the_incoming_text() {
+    let (_tmp, svc, ws, id) = setup_versioned("alpha\nbeta\ngamma").await;
+
+    let exact = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "\"alpha\nbeta\ngamma\ndelta\"".into(),
+            false,
+            Some(0),
+            None,
+        )
+        .await
+        .expect("exact quoted write");
+    assert_eq!(exact.new_content, "alpha\nbeta\ngamma\ndelta");
+    assert_eq!(exact.rev, 1);
+
+    // The surgical path does not clean, so the current text can start with a
+    // quote the set-content cleaner would otherwise strip.
+    svc.add_to_note(
+        ws.clone(),
+        id.clone(),
+        NoteAddInput {
+            content: "\"quoted\" lead".into(),
+            heading: None,
+            position: Some("start".into()),
+        },
+        None,
+    )
+    .await
+    .expect("prepend");
+    let current = svc.store.get_note(&ws, &id).await.expect("get").content;
+    assert!(current.starts_with('"'), "{current:?}");
+
+    let stale = svc
+        .set_note_content(
+            ws.clone(),
+            id.clone(),
+            "alpha\nbeta\ngamma\ndelta\nepsilon".into(),
+            false,
+            Some(1),
+            None,
+        )
+        .await
+        .expect("stale expectedVersion merges");
+    assert_eq!(stale.new_content, format!("{current}\nepsilon"));
+    assert_eq!(stale.rev, 3);
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.content, format!("{current}\nepsilon"));
+}
+
+/// The empty guard applies to the merged text, not just the writer's own:
+/// two zero-conflict partial deletions (`ab` → `a` and `ab` → `b`, each
+/// exactly 50 % so the unconfirmed reduction guard passes) merge to the empty
+/// string, which is rejected with the existing message and persists nothing.
+#[tokio::test]
+async fn set_content_stale_merge_that_empties_the_note_is_rejected() {
+    let (_tmp, svc, ws, id) = setup_versioned("ab").await;
+
+    let b = svc
+        .set_note_content(ws.clone(), id.clone(), "a".into(), false, None, None)
+        .await
+        .expect("B write");
+    assert_eq!(b.rev, 1);
+
+    let denied = svc
+        .set_note_content(ws.clone(), id.clone(), "b".into(), false, Some(0), None)
+        .await;
+    match denied {
+        Err(Error::Internal(msg)) => assert_eq!(msg, "Content cannot be empty."),
+        other => panic!("expected the empty guard, got {other:?}"),
+    }
+    let stored = svc.store.get_note(&ws, &id).await.expect("get");
+    assert_eq!(stored.rev, 1, "a rejected merge persists nothing");
+    assert_eq!(stored.content, "a");
 }
 
 /// Same race for `task.update` on a plain checkbox line: the line edit
@@ -8453,6 +8789,17 @@ mod change_event_parity {
         }
     }
 
+    /// Harness variant with the intent-hq/intentd#1857 `task.update`
+    /// projection park armed, so a race test can hold the first attempt
+    /// between the linked-line projection and the gated parent write.
+    async fn harness_with_task_update_park(
+        park: std::sync::Arc<crate::script_ops::SupervisePark>,
+    ) -> Harness {
+        let mut h = harness().await;
+        h.services = h.services.clone().with_task_update_projection_park(park);
+        h
+    }
+
     /// Subscribe to this workspace with immediate (un-batched) delivery.
     fn subscribe(h: &Harness) -> Subscription {
         h.bus.subscribe(SubscriptionFilter {
@@ -8704,6 +9051,174 @@ mod change_event_parity {
             ev["actor"],
             json!({ "type": "agent", "id": "agent-prov", "name": "Prov" })
         );
+    }
+
+    /// Caller-aware terminal guard on `task.updateNoteStatus`: a task's OWN
+    /// linked agent (session `task_note_id == noteId`, or listed in
+    /// `assignedAgentIds`) cannot move the task out of `complete` /
+    /// `cancelled` — the write is a no-op that answers the unchanged status
+    /// plus the presence-detected `advisory`, and emits no
+    /// `task:status-changed`. Every other caller (unlinked agent, the
+    /// caller-less router/FE path) and every non-terminal starting status
+    /// transition exactly as before, with no `advisory`.
+    #[tokio::test]
+    async fn task_note_status_terminal_guard_blocks_only_linked_agent() {
+        let h = harness().await;
+        let mk_session = |id: &str, task_note_id: Option<intent_core::NoteId>| AgentSession {
+            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+            harness_features: None,
+            id: AgentId::from(id),
+            workspace_id: h.ws.clone(),
+            parent_agent_id: None,
+            backend_session_id: None,
+            acp_session_id: None,
+            name: id.to_string(),
+            name_explicitly_set: true,
+            model: None,
+            reasoning_effort: None,
+            effort_levels: None,
+            provider: None,
+            system_prompt: None,
+            specialist: None,
+            status: AgentStatus::Active,
+            is_active: true,
+            messages: vec![],
+            stats: None,
+            task_note_id,
+            skip_auto_commit: false,
+            completion_report: None,
+            completion_report_timestamp: None,
+            attention_request_kind: None,
+            attention_request_reason: None,
+            attention_request_timestamp: None,
+            delegation_depth: None,
+            initial_message: None,
+            context_references: None,
+            image_blocks: None,
+            file_blocks: None,
+            is_background: false,
+            metadata: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            sandbox_id: None,
+            sandbox_path: None,
+            sandbox_branch: None,
+            stop_reason: None,
+            stop_reason_timestamp: None,
+            session_corrupted: false,
+            pending_delete_at: None,
+            retired_at: None,
+        };
+        let task_id = intent_core::NoteId::from("task-guard");
+        // `linked-session` is linked via its session row; `linked-assigned`
+        // only via the task's `assignedAgentIds`; `outsider` is neither.
+        for (id, linked) in [
+            ("linked-session", Some(task_id.clone())),
+            ("linked-assigned", None),
+            ("outsider", None),
+        ] {
+            h.store
+                .insert_agent_session(&mk_session(id, linked))
+                .await
+                .expect("session");
+        }
+        let mut tn = note(&h.ws, "task-guard", "Guarded");
+        tn.metadata.task = Some(TaskMetadata {
+            status: TaskStatus::InProgress,
+            assigned_agent_ids: vec![AgentId::from("linked-assigned")],
+            ..Default::default()
+        });
+        h.store.insert_note(&tn).await.expect("insert task note");
+        let set = |status: &str, caller: Option<&str>| {
+            h.services.task_update_note_status(
+                h.ws.clone(),
+                task_id.clone(),
+                status.to_string(),
+                None,
+                caller.map(AgentId::from),
+            )
+        };
+        let status_of = |ev: &Value| ev["type"] == "task:status-changed";
+
+        // Non-terminal start: the linked agent transitions as before.
+        let res = set("review_required", Some("linked-session"))
+            .await
+            .expect("linked agent from in_progress");
+        assert_eq!(res.status, TaskStatus::ReviewRequired);
+        assert!(res.advisory.is_none(), "no advisory on a real transition");
+
+        // Close the task with no caller (router/FE path).
+        let res = set("complete", None).await.expect("complete");
+        assert_eq!(res.status, TaskStatus::Complete);
+        assert!(res.advisory.is_none());
+        let mut sub = subscribe(&h);
+
+        // Both linkage shapes are blocked: no-op, advisory, no event.
+        for caller in ["linked-session", "linked-assigned"] {
+            let res = set("review_required", Some(caller))
+                .await
+                .expect("blocked write still ok");
+            assert!(res.ok);
+            assert_eq!(
+                res.status,
+                TaskStatus::Complete,
+                "{caller}: status unchanged"
+            );
+            assert_eq!(
+                res.note.metadata.task.as_ref().map(|t| t.status),
+                Some(TaskStatus::Complete)
+            );
+            assert_eq!(
+                res.advisory.as_deref(),
+                Some(
+                    "Task is complete; a task's own linked agent cannot reopen it. \
+                     Ask the coordinator or user to reopen the task if more work is needed."
+                ),
+                "{caller}: advisory"
+            );
+            // Terminal → terminal by the linked agent is blocked too.
+            let res = set("cancelled", Some(caller)).await.expect("blocked");
+            assert_eq!(
+                res.status,
+                TaskStatus::Complete,
+                "{caller}: complete→cancelled blocked"
+            );
+            assert!(res.advisory.is_some());
+        }
+        let stored = h.store.get_note(&h.ws, &task_id).await.expect("note");
+        assert_eq!(
+            stored.metadata.task.as_ref().map(|t| t.status),
+            Some(TaskStatus::Complete),
+            "blocked writes never reach the store"
+        );
+        assert!(
+            !drain_events(&mut sub).await.iter().any(status_of),
+            "blocked writes emit no task:status-changed"
+        );
+
+        // Same-status write by the linked agent stays the ordinary no-op
+        // (no advisory — nothing was refused).
+        let res = set("complete", Some("linked-session"))
+            .await
+            .expect("same status");
+        assert_eq!(res.status, TaskStatus::Complete);
+        assert!(res.advisory.is_none());
+
+        // An unlinked agent reopens the task as before.
+        let res = set("review_required", Some("outsider"))
+            .await
+            .expect("outsider reopens");
+        assert_eq!(res.status, TaskStatus::ReviewRequired);
+        assert!(res.advisory.is_none());
+        let evs = drain_events(&mut sub).await;
+        let ev = evs.iter().find(|ev| status_of(ev)).expect("status event");
+        assert_eq!(ev["data"]["agentId"], "outsider");
+
+        // Back to terminal, then the caller-less path reopens as before.
+        set("cancelled", None).await.expect("cancel");
+        let res = set("in_progress", None).await.expect("router reopens");
+        assert_eq!(res.status, TaskStatus::InProgress);
+        assert!(res.advisory.is_none());
     }
 
     /// Drain every published event until the bus goes quiet, flattening
@@ -13260,6 +13775,293 @@ mod change_event_parity {
         assert!(changed[0]["data"].get("agentId").is_none());
         assert_eq!(changed[0]["actor"]["type"], "system");
         assert_eq!(flipped().await, vec![(h.ws.clone(), t2)]);
+    }
+
+    /// The caller-aware terminal guard through BOTH redirects: a task's own
+    /// linked agent writing `todo` / `in-progress` against its `complete` or
+    /// `cancelled` task via `task.updateStatus` (by text) or `task.update` (by
+    /// line) is a full no-op — task status, parent `rev`, `note:updated`
+    /// count, `task:status-changed`, `completedAt` and flipped completions
+    /// all unchanged. `task.update` resolves the guard BEFORE its parent
+    /// write, so a same-text write never persists the refused marker; a real
+    /// text edit still lands in exactly one parent write carrying the
+    /// terminal marker, and the result's `status` echoes that marker.
+    #[tokio::test]
+    async fn linked_line_redirects_by_linked_agent_are_no_ops_on_terminal_task() {
+        for start in [TaskStatus::Complete, TaskStatus::Cancelled] {
+            let h = harness().await;
+            insert_task_note(&h, T1, start).await;
+            let (marker, word) = match start {
+                TaskStatus::Complete => ("[x]", "done"),
+                _ => ("[ ]", "todo"),
+            };
+            h.store
+                .insert_note(&note(&h.ws, "spec", &linked(marker, "T", T1)))
+                .await
+                .expect("insert spec");
+            let agent = AgentId::from("agent-linked");
+            let mut session = auto_unarchive_session(&agent, &h.ws, "Linked");
+            session.task_note_id = Some(intent_core::NoteId::from(T1));
+            h.store
+                .insert_agent_session(&session)
+                .await
+                .expect("session");
+            let completed_at = || async {
+                h.store
+                    .get_note(&h.ws, &intent_core::NoteId::from(T1))
+                    .await
+                    .expect("task note")
+                    .metadata
+                    .task
+                    .expect("task")
+                    .completed_at
+            };
+            let flipped_before = h
+                .store
+                .list_agent_flipped_completions(&agent)
+                .await
+                .expect("flipped");
+            let completed_before = completed_at().await;
+            let (content_before, rev_before) = note_content(&h, "spec").await;
+            let link = format!("[T](intent://local/task/{T1})");
+
+            // Requested words that would move the task off its terminal status.
+            let attempts: &[&str] = match start {
+                TaskStatus::Complete => &["todo", "in-progress"],
+                _ => &["done", "in-progress"],
+            };
+            for requested in attempts {
+                // task.updateStatus (by text).
+                let mut sub = subscribe(&h);
+                let r = h
+                    .services
+                    .task_update_status(
+                        h.ws.clone(),
+                        spec_id(),
+                        "T".into(),
+                        (*requested).into(),
+                        Some(agent.clone()),
+                    )
+                    .await
+                    .expect("updateStatus blocked");
+                let events = drain_events(&mut sub).await;
+                assert!(r.ok);
+                assert_eq!(task_status(&h, T1).await, start, "{start:?}/{requested}");
+                assert_eq!(
+                    spec_updates(&events),
+                    0,
+                    "{start:?}/{requested}: {events:?}"
+                );
+                assert!(
+                    of_type(&events, "task:status-changed").is_empty(),
+                    "{start:?}/{requested}: {events:?}"
+                );
+
+                // task.update (by line), pure status.
+                let mut sub = subscribe(&h);
+                let r = h
+                    .services
+                    .task_update(
+                        h.ws.clone(),
+                        spec_id(),
+                        1,
+                        None,
+                        Some((*requested).into()),
+                        Some(link.clone()),
+                        Some(agent.clone()),
+                    )
+                    .await
+                    .expect("task.update blocked");
+                let events = drain_events(&mut sub).await;
+                assert!(r.ok);
+                assert_eq!(
+                    r.status, word,
+                    "{start:?}/{requested}: echoes the kept marker"
+                );
+                assert_eq!(r.new_text, link);
+                assert_eq!(task_status(&h, T1).await, start);
+                assert_eq!(
+                    spec_updates(&events),
+                    0,
+                    "{start:?}/{requested}: {events:?}"
+                );
+                assert!(of_type(&events, "task:status-changed").is_empty());
+
+                // task.update (by line), same text + blocked status: the
+                // parent is not written for the refused marker.
+                let mut sub = subscribe(&h);
+                let r = h
+                    .services
+                    .task_update(
+                        h.ws.clone(),
+                        spec_id(),
+                        1,
+                        Some(link.clone()),
+                        Some((*requested).into()),
+                        None,
+                        Some(agent.clone()),
+                    )
+                    .await
+                    .expect("task.update same text blocked");
+                let events = drain_events(&mut sub).await;
+                assert!(r.ok);
+                assert_eq!(r.status, word);
+                assert_eq!(task_status(&h, T1).await, start);
+                assert_eq!(
+                    spec_updates(&events),
+                    0,
+                    "{start:?}/{requested}: {events:?}"
+                );
+                assert!(of_type(&events, "task:status-changed").is_empty());
+            }
+            let (content, rev) = note_content(&h, "spec").await;
+            assert_eq!(content, content_before, "{start:?}: marker untouched");
+            assert_eq!(rev, rev_before, "{start:?}: no parent write at all");
+            assert_eq!(completed_at().await, completed_before, "{start:?}");
+            assert_eq!(
+                h.store
+                    .list_agent_flipped_completions(&agent)
+                    .await
+                    .expect("flipped"),
+                flipped_before,
+                "{start:?}"
+            );
+
+            // A legitimate text edit with a blocked status word still lands in
+            // ONE parent write carrying the terminal marker; the task is untouched.
+            let new_text = format!("[Renamed](intent://local/task/{T1})");
+            let mut sub = subscribe(&h);
+            let r = h
+                .services
+                .task_update(
+                    h.ws.clone(),
+                    spec_id(),
+                    1,
+                    Some(new_text.clone()),
+                    Some(attempts[0].into()),
+                    None,
+                    Some(agent.clone()),
+                )
+                .await
+                .expect("task.update text edit");
+            let events = drain_events(&mut sub).await;
+            assert_eq!(r.status, word, "{start:?}");
+            assert_eq!(r.new_text, new_text);
+            assert_eq!(task_status(&h, T1).await, start);
+            let (content, rev) = note_content(&h, "spec").await;
+            assert_eq!(content, format!("- {marker} {new_text}"), "{start:?}");
+            assert_eq!(rev, rev_before + 1, "{start:?}: exactly one parent write");
+            assert_eq!(spec_updates(&events), 1, "{start:?}: {events:?}");
+            assert!(of_type(&events, "task:status-changed").is_empty());
+
+            // An unlinked caller through the same line redirect still reopens.
+            let r = h
+                .services
+                .task_update(
+                    h.ws.clone(),
+                    spec_id(),
+                    1,
+                    None,
+                    Some("in-progress".into()),
+                    None,
+                    Some(AgentId::from("agent-outsider")),
+                )
+                .await
+                .expect("outsider reopens");
+            assert_eq!(r.status, "in-progress");
+            assert_eq!(task_status(&h, T1).await, TaskStatus::InProgress);
+            assert_eq!(
+                note_content(&h, "spec").await.0,
+                format!("- [/] {new_text}"),
+                "{start:?}"
+            );
+        }
+    }
+
+    /// intent-hq/intentd#1857 review counterexample: the linked agent's
+    /// `task.update` (text + `todo`) projects `[ ]` from a read that saw the
+    /// task `in_progress`; before its parent write lands, another caller
+    /// completes the task and materialization rewrites the line to `[x]`.
+    /// The stale projection must not be three-way-merged onto the current
+    /// text (`[/]` → `[x]` vs `[/]` → `[ ]` char-interleave into `[x ]`, no
+    /// longer a checkbox): the gate miss re-derives from the fresh parent,
+    /// where the guard now refuses `todo` and the line projects `[x]`.
+    #[tokio::test]
+    async fn linked_line_write_re_derives_after_concurrent_completion() {
+        let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
+        let h = harness_with_task_update_park(park.clone()).await;
+        insert_task_note(&h, T1, TaskStatus::InProgress).await;
+        // Versioned write so a snapshot exists at the writer's read rev: the
+        // three-way merge needs that base to produce the interleave (without
+        // one it degrades to last-writer-wins, which the refused write's
+        // materialization would then heal).
+        h.store
+            .insert_note(&note(&h.ws, "spec", "- [ ] placeholder"))
+            .await
+            .expect("insert spec");
+        let mut spec = h.store.get_note(&h.ws, &spec_id()).await.expect("spec");
+        spec.content = linked("[/]", "T", T1);
+        spec.updated_at = now_iso();
+        h.store
+            .update_note_with_version(&spec, None, &crate::user_version_author(), &spec.updated_at)
+            .await
+            .expect("versioned spec write");
+        let agent = AgentId::from("agent-linked");
+        let mut session = auto_unarchive_session(&agent, &h.ws, "Linked");
+        session.task_note_id = Some(intent_core::NoteId::from(T1));
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        let new_text = format!("[T](intent://local/task/{T1}) renamed");
+
+        let writer = {
+            let services = h.services.clone();
+            let ws = h.ws.clone();
+            let new_text = new_text.clone();
+            let agent = agent.clone();
+            tokio::spawn(async move {
+                services
+                    .task_update(
+                        ws,
+                        spec_id(),
+                        1,
+                        Some(new_text),
+                        Some("todo".into()),
+                        None,
+                        Some(agent),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
+            .await
+            .expect("task.update parks before its parent write");
+
+        // Another caller completes the task inside the window; materialization
+        // rewrites the linked line to `[x]`.
+        set_status(&h, T1, "complete").await;
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            linked("[x]", "T", T1),
+            "completion materialized before the stale write"
+        );
+
+        park.release.notify_one();
+        let r = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("writer finishes")
+            .expect("writer task")
+            .expect("task.update");
+
+        assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
+        assert_eq!(
+            note_content(&h, "spec").await.0,
+            format!("- [x] {new_text}"),
+            "re-derived line carries the terminal marker, not a merged `[x ]`"
+        );
+        assert_eq!(r.status, "done", "echoes the projected marker");
+        assert_eq!(r.new_text, new_text);
     }
 }
 
@@ -42228,6 +43030,94 @@ mod derived_workspace_unread {
         // Idempotent: a second markSeen is silent.
         h.services.mark_seen(h.ws.clone()).await.expect("again");
         assert_silent(&mut sub).await;
+    }
+
+    /// Pin the workspace row and one seeded top-level session to fixed past
+    /// instants so any `updated_at` bump from a seen-marker write shows.
+    /// Returns the session's last message id.
+    async fn seed_pinned_unseen_session(h: &Harness, agent: &str) -> String {
+        let last = seed_session(h, agent, &["user", "assistant"]).await;
+        let mut ws = h.store.get_workspace(&h.ws).await.expect("load");
+        ws.created_at = "2020-01-01T00:00:00Z".to_string();
+        ws.updated_at = "2020-01-02T00:00:00Z".to_string();
+        ws.last_activity = None;
+        h.store.update_workspace(&ws).await.expect("pin workspace");
+        h.store
+            .update_agent_session_metadata(
+                &h.ws,
+                &AgentId::from(agent),
+                None,
+                "2020-01-03T00:00:00Z",
+            )
+            .await
+            .expect("pin session");
+        last
+    }
+
+    /// Regression (intent-hq/intent#1466, reopened): `workspace.markSeen`
+    /// advances the seen marker of an unseen top-level session WITHOUT
+    /// bumping that session's `updated_at`, so the derived workspace
+    /// `lastActivity` (max over session `updated_at`) stays put and the
+    /// workspace is not re-sorted to the top merely for being opened.
+    #[tokio::test]
+    async fn workspace_mark_seen_does_not_bump_session_updated_at() {
+        let h = harness().await;
+        let last = seed_pinned_unseen_session(&h, "agent-a").await;
+        assert_eq!(served_attention(&h).await, WorkspaceAttention::Unread);
+
+        let seen = h.services.mark_seen(h.ws.clone()).await.expect("seen");
+        assert_eq!(seen.attention, WorkspaceAttention::None);
+
+        let session = h
+            .store
+            .get_agent_session_summary(&AgentId::from("agent-a"))
+            .await
+            .expect("summary");
+        assert_eq!(session.last_seen_message_id(), Some(last.as_str()));
+        assert_eq!(
+            session.updated_at, "2020-01-03T00:00:00Z",
+            "workspace.markSeen must not bump the session's updated_at"
+        );
+        let mut reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(reloaded.updated_at, "2020-01-02T00:00:00Z");
+        h.services.derive_last_activity(&mut reloaded).await;
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some("2020-01-03T00:00:00Z"),
+            "derived lastActivity must not move on workspace.markSeen"
+        );
+    }
+
+    /// Regression (intent-hq/intent#1466, reopened): the direct
+    /// `agent.markSeen` op persists the marker without touching the
+    /// session's `updated_at` (served as the per-agent `lastActivity`).
+    #[tokio::test]
+    async fn agent_mark_seen_does_not_bump_session_updated_at() {
+        let h = harness().await;
+        let last = seed_pinned_unseen_session(&h, "agent-a").await;
+
+        h.services
+            .agent_mark_seen_op(h.ws.clone(), AgentId::from("agent-a"), last.clone())
+            .await
+            .expect("mark seen");
+
+        let session = h
+            .store
+            .get_agent_session_summary(&AgentId::from("agent-a"))
+            .await
+            .expect("summary");
+        assert_eq!(session.last_seen_message_id(), Some(last.as_str()));
+        assert_eq!(
+            session.updated_at, "2020-01-03T00:00:00Z",
+            "agent.markSeen must not bump the session's updated_at"
+        );
+        let mut reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
+        h.services.derive_last_activity(&mut reloaded).await;
+        assert_eq!(
+            reloaded.last_activity.as_deref(),
+            Some("2020-01-03T00:00:00Z"),
+            "derived lastActivity must not move on agent.markSeen"
+        );
     }
 
     /// The turn-end raise still only emits on the none→unread transition

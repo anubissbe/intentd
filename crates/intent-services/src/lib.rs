@@ -70,6 +70,8 @@ mod clone_ops;
 mod complete_ops;
 #[cfg(test)]
 mod completion_interception_tests;
+#[cfg(test)]
+mod conditional_write_precedence_tests;
 mod config_watcher;
 mod create_progress;
 mod delete_grace;
@@ -716,6 +718,13 @@ pub struct Services {
     /// inside that window is deterministic. `None` in production wiring;
     /// tests inject via the `#[cfg(test)]`-only `with_wake_archived_park`.
     wake_archived_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intent-hq/intentd#1857) for the `task.update`
+    /// linked-line redirect: parks the first attempt after the line is
+    /// projected from the task read and before the gated parent write, so a
+    /// concurrent task completion + materialization inside that window is
+    /// deterministic. `None` in production wiring; tests inject via the
+    /// `#[cfg(test)]`-only `with_task_update_projection_park`.
+    task_update_projection_park: Option<Arc<script_ops::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`); tests inject
@@ -1209,6 +1218,7 @@ impl Services {
             completion_flip_take_park: None,
             attention_write_park: None,
             wake_archived_park: None,
+            task_update_projection_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
                 intent_core::FileSecretStore::new(),
             ))),
@@ -1927,6 +1937,31 @@ impl Services {
     pub(crate) fn with_wake_archived_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
         self.wake_archived_park = Some(park);
         self
+    }
+
+    /// Test seam (intent-hq/intentd#1857): park the first `task.update`
+    /// attempt between the linked-line projection and the gated parent write
+    /// so a concurrent task completion + materialization inside that window
+    /// is deterministic. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_task_update_projection_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.task_update_projection_park = Some(park);
+        self
+    }
+
+    /// Park the first `task.update` attempt before its parent write when the
+    /// test seam is armed (no-op in production wiring and on retries).
+    async fn park_task_update_projection(&self, attempt: usize) {
+        if attempt != 1 {
+            return;
+        }
+        if let Some(park) = &self.task_update_projection_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
     }
 
     /// Test seam: park one selected pending-question marker mutation before it
@@ -9539,6 +9574,9 @@ struct SetContentMerge {
     base: Option<String>,
     outcome: &'static str,
     conflicting_spans: usize,
+    /// Checkbox lines whose conflicting marker was collapsed back to one
+    /// valid marker after the merge (intent-hq/intent#4930).
+    repaired_markers: usize,
 }
 
 /// Resolve what a `note.setContent` write persists on top of the stored
@@ -9573,6 +9611,7 @@ async fn merge_set_content(
                 base: None,
                 outcome: "exact",
                 conflicting_spans: 0,
+                repaired_markers: 0,
             })
         }
     };
@@ -9583,11 +9622,20 @@ async fn merge_set_content(
     {
         Some(base) => {
             let merged = note_merge::three_way_merge(&base, current, incoming);
+            // Only a conflicting span can concatenate two marker variants;
+            // clean merges persist the merged text verbatim, and the repair
+            // is scoped to the spans that actually conflicted.
+            let (text, repaired_markers) = if merged.conflicting_spans > 0 {
+                note_merge::repair_checkbox_markers(&merged.text, &merged.conflict_ranges)
+            } else {
+                (merged.text, 0)
+            };
             Ok(SetContentMerge {
-                text: merged.text,
+                text,
                 base: Some(base),
                 outcome: "merged",
                 conflicting_spans: merged.conflicting_spans,
+                repaired_markers,
             })
         }
         None => Ok(SetContentMerge {
@@ -9595,6 +9643,7 @@ async fn merge_set_content(
             base: None,
             outcome: "lww-no-base",
             conflicting_spans: 0,
+            repaired_markers: 0,
         }),
     }
 }
@@ -9635,8 +9684,10 @@ fn check_set_content_reduction(
 /// text it persists.
 #[derive(Clone, Copy)]
 enum ContentWritePolicy {
-    /// `note.setContent`: the reduction guard (measured against the writer's
-    /// base when known, else the stored current) then the set-content cleaner.
+    /// `note.setContent`: the set-content normalizer runs once on the
+    /// writer's text before any merge, then each attempt applies the
+    /// reduction guard (measured against the writer's base when known, else
+    /// the stored current) and validates the merged text before persisting.
     SetContent { confirm_replacement: bool },
     /// `note.add` / `note.edit` / `note.editLines`: the surgical transform
     /// already ran against the content the caller read; the merged text
@@ -9688,6 +9739,15 @@ struct ContentWrite<'a> {
 /// gated on the rev it read via [`persist_note_content`] — so a write that
 /// lands in between is merged into on the next attempt rather than
 /// overwritten. The last attempt's `Conflict` propagates unchanged.
+///
+/// The `SetContent` cleaner is split around the merge: normalization
+/// (quote strip, JSON-value extraction) runs on `incoming` once, before any
+/// merge, so the merge (and the checkbox repair) sees the shape that will
+/// persist — a quoted payload no longer hides a bullet behind its quote —
+/// while current text that legitimately starts with a quote is not stripped
+/// by someone else's write. Validation (empty / truncated) runs on the
+/// merged text of each attempt, since a zero-conflict merge of two partial
+/// deletions can empty a note neither side emptied.
 async fn persist_merged_content(
     store: &Store,
     workspace_id: &WorkspaceId,
@@ -9702,6 +9762,14 @@ async fn persist_merged_content(
         author,
         op,
     } = write;
+    let normalized;
+    let merge_input = match policy {
+        ContentWritePolicy::SetContent { .. } => {
+            normalized = note_ops::normalize_set_content(incoming);
+            normalized.as_str()
+        }
+        ContentWritePolicy::Surgical => incoming,
+    };
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -9716,23 +9784,22 @@ async fn persist_merged_content(
             workspace_id,
             note_id,
             &note,
-            incoming,
+            merge_input,
             expected_version,
         )
         .await?;
-        let text = match policy {
-            ContentWritePolicy::SetContent {
+        if let ContentWritePolicy::SetContent {
+            confirm_replacement,
+        } = policy
+        {
+            check_set_content_reduction(
+                merge.base.as_deref().unwrap_or(&old_content),
+                incoming,
                 confirm_replacement,
-            } => {
-                check_set_content_reduction(
-                    merge.base.as_deref().unwrap_or(&old_content),
-                    incoming,
-                    confirm_replacement,
-                )?;
-                note_ops::clean_set_content(&merge.text)?
-            }
-            ContentWritePolicy::Surgical => merge.text,
-        };
+            )?;
+            note_ops::validate_set_content(&merge.text)?;
+        }
+        let text = merge.text;
         tracing::debug!(
             note = %note_id.0,
             op,
@@ -9741,6 +9808,7 @@ async fn persist_merged_content(
             expected_version,
             outcome = merge.outcome,
             conflicting_spans = merge.conflicting_spans,
+            repaired_markers = merge.repaired_markers,
             "note content merge"
         );
         let mut plan = reanchor_note_comments(store, workspace_id, note_id, text).await?;
@@ -10079,6 +10147,36 @@ impl Services {
         }
     }
 
+    /// The caller-aware terminal guard predicate: `true` when moving `task`
+    /// (the note `note_id`) to `next` must be refused — the task is already
+    /// `complete` / `cancelled`, `next` differs, and `caller` is the task's
+    /// OWN linked agent (in its `assignedAgentIds`, or the agent whose session
+    /// `task_note_id` names the task). `None` caller and every other agent
+    /// are never blocked.
+    async fn terminal_guard_blocks(
+        &self,
+        task: &TaskMetadata,
+        note_id: &NoteId,
+        next: TaskStatus,
+        caller: Option<&AgentId>,
+    ) -> bool {
+        if task.status == next
+            || !matches!(task.status, TaskStatus::Complete | TaskStatus::Cancelled)
+        {
+            return false;
+        }
+        let Some(agent_id) = caller else {
+            return false;
+        };
+        task.assigned_agent_ids.contains(agent_id)
+            || self
+                .store
+                .get_agent_session(agent_id)
+                .await
+                .ok()
+                .is_some_and(|s| s.task_note_id.as_ref() == Some(note_id))
+    }
+
     /// Write a task note's metadata status — the single implementation behind
     /// `task.updateNoteStatus` and the checkbox-level writes (`task.updateStatus`
     /// / `task.update`) redirected from a linked line (intent-hq/intent#4255).
@@ -10086,6 +10184,21 @@ impl Services {
     /// ready-task set, re-announces dependents across the complete boundary
     /// and probes the displayStatus rollup; either way it then materializes
     /// the status char onto every line linking the task.
+    ///
+    /// Caller-aware terminal guard: when the task is already `complete` /
+    /// `cancelled` and the caller is the task's OWN linked agent (session
+    /// `task_note_id` names the task, or the agent is in the task's
+    /// `assignedAgentIds`), a move to a different status is refused as a
+    /// no-op — the result echoes the unchanged task plus `advisory` and none
+    /// of the task's own events (`task:status-changed`,
+    /// `task:ready-tasks-changed`, dependent `note:updated`) fire. The
+    /// checkbox materialization still runs, so a linked line whose marker
+    /// had drifted from the terminal status is healed with one parent write
+    /// and its `note:updated`; an already-correct marker stays untouched. Every
+    /// other caller (unlinked agent, the caller-less router path) is
+    /// unaffected. [`Self::terminal_guard_blocks`] is the predicate; the
+    /// `task.update` redirect consults it before its parent write so the
+    /// line projects the status this write actually leaves.
     pub(crate) async fn set_task_note_status(
         &self,
         workspace_id: &WorkspaceId,
@@ -10103,6 +10216,27 @@ impl Services {
             ));
         };
         let previous_status = task.status;
+        if self
+            .terminal_guard_blocks(&task, &note.id, new_status, caller_agent_id.as_ref())
+            .await
+        {
+            let word = match previous_status {
+                TaskStatus::Cancelled => "cancelled",
+                _ => "complete",
+            };
+            self.materialize_linked_checkboxes(&note.workspace_id, &note.id)
+                .await;
+            return Ok(TaskUpdateNoteStatusResult {
+                ok: true,
+                note_id: note.id.clone(),
+                status: previous_status,
+                note,
+                advisory: Some(format!(
+                    "Task is {word}; a task's own linked agent cannot reopen it. \
+                     Ask the coordinator or user to reopen the task if more work is needed."
+                )),
+            });
+        }
         let now = now_iso();
         apply_status_transition(&mut task, new_status, &now);
         note.metadata.task = Some(task);
@@ -10197,6 +10331,7 @@ impl Services {
             note_id: note.id.clone(),
             status: new_status,
             note,
+            advisory: None,
         })
     }
 }
@@ -12474,18 +12609,18 @@ impl Services {
     }
 }
 
-/// Resolve the task note a checkbox line links to: `Some((id, status))` when
+/// Resolve the task note a checkbox line links to: `Some((id, task))` when
 /// `task_id` names a task note in `workspace_id`. Dangling links and links to
 /// non-task notes yield `None`, keeping the raw checkbox write.
 async fn resolve_linked_task(
     store: &Store,
     workspace_id: &WorkspaceId,
     task_id: &str,
-) -> Option<(NoteId, TaskStatus)> {
+) -> Option<(NoteId, TaskMetadata)> {
     let id = NoteId::from(task_id);
     let note = store.get_note(workspace_id, &id).await.ok()?;
-    let status = note.metadata.task.as_ref()?.status;
-    Some((id, status))
+    let task = note.metadata.task?;
+    Some((id, task))
 }
 
 /// Task-note status a checkbox word (`todo` / `in-progress` / `done`) written
@@ -18431,13 +18566,27 @@ impl WorkspaceApi for Services {
                     };
                     // Attachment-reference validation (PROTOCOL §5.5,
                     // monorepo#3338), hoisted BEFORE any state change so a
-                    // bad `initialAgent.imageBlocks` reference rejects
-                    // `-32602` without leaving a partially created workspace
-                    // (row/metadata/event/spec note) behind. Same harvest as
-                    // `agent_create_op` (top-level param wins over the
-                    // `metadata.imageBlocks` copy); the create op re-runs
-                    // the same checks harmlessly.
+                    // bad `initialAgent.fileBlocks` / `imageBlocks` entry
+                    // rejects `-32602` without leaving a partially created
+                    // workspace (row/metadata/event/spec note) behind. Same
+                    // harvest as `agent_create_op` (top-level param wins over
+                    // the `metadata.*Blocks` copy); the create op re-runs the
+                    // same checks harmlessly.
                     if let Some(agent) = input.initial_agent.as_ref() {
+                        let effective_file_blocks = agent
+                            .file_blocks
+                            .clone()
+                            .or_else(|| {
+                                agent
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("fileBlocks").cloned())
+                            })
+                            .filter(|v| !v.is_null());
+                        crate::agent_ops::validate_file_blocks(
+                            "workspace.create",
+                            effective_file_blocks.as_ref(),
+                        )?;
                         let effective_image_blocks = agent
                             .image_blocks
                             .clone()
@@ -22460,8 +22609,10 @@ impl WorkspaceApi for Services {
             // case; after the mark-all above it is normally a no-op — the
             // settle already cleared and emitted). Review-required attention
             // persists. Merely looking at a workspace is not "activity", so
-            // `updated_at` (which feeds the derived `lastActivity`) stays
-            // untouched (intent-hq/monorepo#1466). Atomic settle-clear
+            // neither the workspace `updated_at` nor any session `updated_at`
+            // (both feed the derived `lastActivity`) moves: the per-agent
+            // marker writes above pass `updated_at: None` to the store
+            // (intent-hq/monorepo#1466). Atomic settle-clear
             // (monorepo#1481 pattern, hardened): one UPDATE guarded on
             // `attention = unread` AND the derivation re-checked inside the
             // write — touching only the attention column, so a concurrent
@@ -23942,7 +24093,7 @@ impl WorkspaceApi for Services {
                 Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
                 None => None,
             };
-            if let Some((task_id, current)) = linked {
+            if let Some((task_id, task)) = linked {
                 // The line links a task note: the task's metadata status is
                 // the source of truth and the char is its projection, so the
                 // write goes to the task (events, ready-task recompute) and
@@ -23950,7 +24101,7 @@ impl WorkspaceApi for Services {
                 // line that had drifted from the task's status.
                 // Materialization schedules the attribution recompute of
                 // every parent it rewrites.
-                match redirected_task_status(&status, current) {
+                match redirected_task_status(&status, task.status) {
                     Some(next) => {
                         services
                             .set_task_note_status(
@@ -24066,73 +24217,145 @@ impl WorkspaceApi for Services {
                     ));
                 }
             }
-            let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
-            // The link is resolved from the POST-edit line: `text` may retarget
-            // it (A → B), and it is the task the line links after this write
-            // whose status the char projects.
-            let post_edit = note_ops::apply_task_line_update(
-                &note.content,
-                line,
-                text.as_deref(),
-                None,
-                expected.as_deref(),
-            )?;
-            let linked = match note_ops::linked_task_at_line(&post_edit.content, line) {
-                Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
-                None => None,
-            };
-            // On a linked line the char is a projection of the task note's
-            // status: the status write is redirected to the task and the line
-            // edit carries the word that status projects to — with no status
-            // word, the task's current one (a text-only retarget renders the
-            // new target's marker).
-            let redirect = linked.map(|(task_id, current)| {
-                let next = status
-                    .as_deref()
-                    .and_then(|word| redirected_task_status(word, current));
-                (task_id, next, current)
-            });
-            let line_status = match &redirect {
-                Some((_, next, current)) => Some(note_ops::status_word_for_task_status(
-                    next.unwrap_or(*current),
-                )),
-                None => status.as_deref(),
-            };
-            let update = note_ops::apply_task_line_update(
-                &note.content,
-                line,
-                text.as_deref(),
-                line_status,
-                expected.as_deref(),
-            )?;
-            // A redirected pure-status write leaves the char to materialization
-            // so the parent's `note:updated` follows the task's own emissions;
-            // a text edit (or a drifted char with nothing to write on the task)
-            // lands in one direct parent write instead.
-            let write_parent = match &redirect {
-                None => true,
-                Some((_, next, _)) => {
-                    text.is_some() || (next.is_none() && update.content != note.content)
+            // Every attempt derives the line from ONE read of the parent and
+            // commits gated on exactly that rev. On a linked line the
+            // projected marker is a function of the task note's status, so
+            // a miss on the gate re-runs the derivation from the fresh
+            // parent (link, guarded target status, marker) instead of
+            // three-way-merging the stale projection onto the current text:
+            // a task completed and materialized (`[x]`) by another caller
+            // between the read and the write would otherwise char-interleave
+            // with the stale marker into `[x ]` — no longer a checkbox, so
+            // nothing could heal it (intent-hq/intentd#1857). Unlinked lines
+            // carry no projection and keep the merging write.
+            let mut attempt = 0;
+            let (note, update, redirect, write_parent) = loop {
+                attempt += 1;
+                let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+                // The link is resolved from the POST-edit line: `text` may retarget
+                // it (A → B), and it is the task the line links after this write
+                // whose status the char projects.
+                let post_edit = note_ops::apply_task_line_update(
+                    &note.content,
+                    line,
+                    text.as_deref(),
+                    None,
+                    expected.as_deref(),
+                )?;
+                let linked = match note_ops::linked_task_at_line(&post_edit.content, line) {
+                    Some(id) => resolve_linked_task(&store, &note.workspace_id, &id).await,
+                    None => None,
+                };
+                // On a linked line the char is a projection of the task note's
+                // status: the status write is redirected to the task and the line
+                // edit carries the word that status projects to — with no status
+                // word, the task's current one (a text-only retarget renders the
+                // new target's marker). A write the terminal guard will refuse
+                // (the task's own linked agent reopening a `complete` /
+                // `cancelled` task) leaves the task where it is, so the line
+                // projects the CURRENT status — the parent is never rewritten
+                // with a marker the task write will not produce.
+                let redirect = match linked {
+                    Some((task_id, task)) => {
+                        let current = task.status;
+                        let next = status
+                            .as_deref()
+                            .and_then(|word| redirected_task_status(word, current));
+                        let projected = match next {
+                            Some(n)
+                                if !services
+                                    .terminal_guard_blocks(
+                                        &task,
+                                        &task_id,
+                                        n,
+                                        caller_agent_id.as_ref(),
+                                    )
+                                    .await =>
+                            {
+                                n
+                            }
+                            _ => current,
+                        };
+                        Some((task_id, next, projected))
+                    }
+                    None => None,
+                };
+                let line_status = match &redirect {
+                    Some((_, _, projected)) => {
+                        Some(note_ops::status_word_for_task_status(*projected))
+                    }
+                    None => status.as_deref(),
+                };
+                let update = note_ops::apply_task_line_update(
+                    &note.content,
+                    line,
+                    text.as_deref(),
+                    line_status,
+                    expected.as_deref(),
+                )?;
+                // A redirected pure-status write leaves the char to materialization
+                // so the parent's `note:updated` follows the task's own emissions;
+                // a text edit (or a drifted char with nothing to write on the task)
+                // lands in one direct parent write instead. A guard-refused
+                // status word writes the parent only when the text edit actually
+                // changed the line.
+                let write_parent = match &redirect {
+                    None => true,
+                    Some((_, next, projected)) => {
+                        let refused = next.is_some_and(|n| n != *projected);
+                        if refused {
+                            text.is_some() && update.content != note.content
+                        } else {
+                            text.is_some() || (next.is_none() && update.content != note.content)
+                        }
+                    }
+                };
+                if !write_parent {
+                    break (note, update, redirect, false);
+                }
+                services.park_task_update_projection(attempt).await;
+                let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+                let read_rev = note.rev;
+                if redirect.is_none() {
+                    let merged = persist_merged_content(
+                        &store,
+                        &workspace_id,
+                        &note_id,
+                        ContentWrite {
+                            seed: Some(note),
+                            incoming: &update.content,
+                            expected_version: Some(read_rev),
+                            policy: ContentWritePolicy::Surgical,
+                            author: &author,
+                            op: "task.update",
+                        },
+                    )
+                    .await?;
+                    break (merged.note, update, redirect, true);
+                }
+                let mut plan =
+                    reanchor_note_comments(&store, &workspace_id, &note_id, update.content.clone())
+                        .await?;
+                note.content = std::mem::take(&mut plan.content);
+                note.updated_at = now_iso();
+                match persist_note_content(&store, &note, Some(read_rev), &author).await {
+                    Ok(_) => {
+                        plan.apply_orphaned(&store, &workspace_id).await?;
+                        break (note, update, redirect, true);
+                    }
+                    Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {
+                        tracing::debug!(
+                            note = %note_id.0,
+                            op = "task.update",
+                            attempt,
+                            read_rev,
+                            "linked line changed under the projection; re-deriving"
+                        );
+                    }
+                    Err(e) => return Err(e),
                 }
             };
             if write_parent {
-                let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-                let read_rev = note.rev;
-                let merged = persist_merged_content(
-                    &store,
-                    &workspace_id,
-                    &note_id,
-                    ContentWrite {
-                        seed: Some(note),
-                        incoming: &update.content,
-                        expected_version: Some(read_rev),
-                        policy: ContentWritePolicy::Surgical,
-                        author: &author,
-                        op: "task.update",
-                    },
-                )
-                .await?;
-                note = merged.note;
                 publish_event(
                     bus.as_ref(),
                     note_change_event(
@@ -24150,6 +24373,10 @@ impl WorkspaceApi for Services {
                     .maybe_emit_display_status_for_spec_write(&note.workspace_id, &note.id)
                     .await;
             }
+            // A guard-refused write still goes through the guarded path so the
+            // refusal and its materialization stay single-sourced; the task is
+            // unchanged and the line already projects it, so nothing is
+            // rewritten.
             if let Some((task_id, Some(next), _)) = redirect {
                 services
                     .set_task_note_status(&note.workspace_id, &task_id, next, None, caller_agent_id)

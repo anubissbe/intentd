@@ -1824,6 +1824,12 @@ pub struct TaskUpdateNoteStatusResult {
     pub note_id: NoteId,
     pub status: TaskStatus,
     pub note: Note,
+    /// Presence-detected: set only when the caller-aware terminal guard
+    /// refused the write (a task's own linked agent tried to move it out of
+    /// `complete` / `cancelled`). `status` / `note` then echo the unchanged
+    /// task; absent (never `null`) on every write that went through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<String>,
 }
 
 /// Result of `task.update` (atomic single-line edit).
@@ -3016,9 +3022,11 @@ pub struct AgentSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_blocks: Option<serde_json::Value>,
     /// Session-level file blocks captured at spawn (FE top-level
-    /// `fileBlocks`); an opaque JSON array persisted verbatim. Entries carry
-    /// EITHER inline `data` or an attachment-registry `attachmentId`
-    /// reference (PROTOCOL §5.5).
+    /// `fileBlocks`); an opaque JSON array persisted verbatim. Since
+    /// protocol 10.0 every entry carries an attachment-registry
+    /// `attachmentId` reference — inline `data` is rejected `-32602` at every
+    /// input seam (PROTOCOL §5.5); rows persisted before 10.0 may still hold
+    /// legacy inline entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_blocks: Option<serde_json::Value>,
     /// Sandbox ID when this agent runs in a CoW-isolated sandbox (direct-mode
@@ -3780,9 +3788,10 @@ pub struct AgentCreateExtra {
     pub workspace_context: Option<serde_json::Value>,
     pub context_references: Option<serde_json::Value>,
     pub image_blocks: Option<serde_json::Value>,
-    /// Session-level file blocks captured at spawn (PROTOCOL §5.5): entries
-    /// carry EITHER inline `data` or an attachment-registry `attachmentId`
-    /// reference; validated at the create seam like send/queue.
+    /// Session-level file blocks captured at spawn (PROTOCOL §5.5, v10.0):
+    /// every entry carries an attachment-registry `attachmentId` reference
+    /// (inline `data` is rejected `-32602`); validated at the create seam
+    /// like send/queue.
     pub file_blocks: Option<serde_json::Value>,
     pub is_background: Option<bool>,
     /// Internal override for the created session's `nameExplicitlySet` flag.

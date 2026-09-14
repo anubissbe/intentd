@@ -128,7 +128,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// `browser.syncTabs`), protocol 9.10. REV-2 routing: +2 fast-path methods
 /// (`browser.navigateTab` / `browser.closeTab`), protocol 9.11.
 ///
-/// Execution environments (protocol 9.14): +4 router methods
+/// Execution environments (protocol 10.1): +4 router methods
 /// (`sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
 /// `sandbox.image.check`).
 const EXPECTED_TOTAL_METHODS: usize = 358;
