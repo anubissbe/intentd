@@ -1,10 +1,10 @@
 //! Per-agent VM lifecycle: boot, guest setup, provider exec, teardown
 //! (monorepo#1120, EE-5).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::{LazyLock, Mutex};
+use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use intent_core::{AgentId, WorkspaceId};
@@ -29,6 +29,19 @@ const BOOT_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const BOOT_READY_POLL: Duration = Duration::from_millis(250);
 /// Budget for each guest setup command.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Helper stderr lines kept for the boot error (most recent first dropped).
+const STDERR_TAIL_LINES: usize = 8;
+/// Per-line cap for the kept stderr tail (chars).
+const STDERR_TAIL_LINE_CHARS: usize = 512;
+/// How long to let the stderr drain catch up once the helper has exited
+/// before formatting the boot error (failure path only).
+const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Helper exit codes with a fixed meaning (`intentd-microvm-helper/src/main.rs`);
+/// any other code is the guest command's exit status.
+const HELPER_EXIT_USAGE: i32 = 64;
+const HELPER_EXIT_UNAVAILABLE: i32 = 69;
+const HELPER_EXIT_KRUN_API: i32 = 70;
 
 /// Guest stderr capture file for the provider (inside the per-VM rootfs, so
 /// host-visible at `<vm rootfs>/intent/acp.err`).
@@ -288,20 +301,14 @@ impl MicrovmVm {
             .spawn()
             .map_err(|e| MicrovmError::Boot(format!("spawn helper: {e}")))?;
 
-        // Drain helper stderr into the tracing log (bounded lines).
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                use tokio::io::AsyncBufReadExt;
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "microvm_helper", "{line}");
-                }
-            });
-        }
+        // Drain helper stderr into the tracing log, keeping a bounded tail
+        // for the boot error should the helper die before the guest answers.
+        let mut helper_stderr = HelperStderr::spawn_drain(child.stderr.take());
 
         // 4. Readiness: poll the forwarded exec socket with a trivial guest
         // command until the exec agent answers (bounded).
-        let ready = wait_for_exec_agent(&exec_sock, &mut child).await;
+        let ready =
+            wait_for_exec_agent(&exec_sock, &mut child, &mut helper_stderr, &console_log).await;
         if let Err(e) = ready {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -517,9 +524,102 @@ fn scrub_stale_exec_sock(path: &Path) -> Result<(), MicrovmError> {
         .map_err(|e| MicrovmError::Io(format!("scrub stale exec socket: {e}")))
 }
 
+/// The helper's stderr drain: every line goes to tracing, and the last
+/// [`STDERR_TAIL_LINES`] are kept so a pre-ready helper exit can report the
+/// helper's own diagnostic (e.g. the dlopen failure behind exit 69).
+struct HelperStderr {
+    tail: Arc<Mutex<VecDeque<String>>>,
+    drain: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HelperStderr {
+    fn spawn_drain(stderr: Option<tokio::process::ChildStderr>) -> Self {
+        let tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+        let drain = stderr.map(|stderr| {
+            let tail = Arc::clone(&tail);
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "microvm_helper", "{line}");
+                    push_tail_line(&mut tail.lock().unwrap(), &line);
+                }
+            })
+        });
+        Self { tail, drain }
+    }
+
+    /// Snapshot the kept tail, first giving the drain a bounded grace period
+    /// to consume whatever the exited helper left in the pipe.
+    async fn snapshot(&mut self) -> Vec<String> {
+        if let Some(drain) = self.drain.take() {
+            // A timeout means the pipe is still open (e.g. a grandchild
+            // inherited it); report what we have.
+            let _ = tokio::time::timeout(STDERR_DRAIN_GRACE, drain).await;
+        }
+        self.tail.lock().unwrap().iter().cloned().collect()
+    }
+}
+
+/// Append one stderr line to the bounded tail: oldest lines fall off past
+/// [`STDERR_TAIL_LINES`], and each line is clipped to
+/// [`STDERR_TAIL_LINE_CHARS`] chars.
+fn push_tail_line(tail: &mut VecDeque<String>, line: &str) {
+    let mut kept: String = line.chars().take(STDERR_TAIL_LINE_CHARS).collect();
+    if kept.len() < line.len() {
+        kept.push('…');
+    }
+    if tail.len() == STDERR_TAIL_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(kept);
+}
+
+/// One-line meaning of a helper exit code with a fixed contract, if any.
+fn helper_exit_meaning(status: ExitStatus) -> Option<&'static str> {
+    match status.code()? {
+        HELPER_EXIT_USAGE => Some("invalid helper configuration"),
+        HELPER_EXIT_UNAVAILABLE => Some("libkrun unavailable"),
+        HELPER_EXIT_KRUN_API => Some("libkrun API error"),
+        _ => None,
+    }
+}
+
+/// Build the `MicrovmError::Boot` message for a helper that exited before
+/// the guest exec agent answered. `console_log` is the path to mention —
+/// callers pass `Some` only when the file actually exists on disk.
+fn format_helper_boot_error(
+    status: ExitStatus,
+    stderr_tail: &[String],
+    console_log: Option<&Path>,
+) -> String {
+    let mut msg = format!("microVM helper exited during boot ({status}");
+    if let Some(meaning) = helper_exit_meaning(status) {
+        msg.push_str(": ");
+        msg.push_str(meaning);
+    }
+    msg.push(')');
+    if stderr_tail.is_empty() {
+        msg.push_str("; helper stderr was empty");
+    } else {
+        msg.push_str("; helper stderr:\n");
+        msg.push_str(&stderr_tail.join("\n"));
+    }
+    if let Some(log) = console_log {
+        msg.push_str("\nguest console log: ");
+        msg.push_str(&log.display().to_string());
+    }
+    msg
+}
+
 /// Poll the exec socket with a trivial command until the guest agent answers,
 /// failing fast when the helper process exits first.
-async fn wait_for_exec_agent(sock: &Path, child: &mut Child) -> Result<(), MicrovmError> {
+async fn wait_for_exec_agent(
+    sock: &Path,
+    child: &mut Child,
+    helper_stderr: &mut HelperStderr,
+    console_log: &Path,
+) -> Result<(), MicrovmError> {
     let deadline = Instant::now() + BOOT_READY_TIMEOUT;
     let probe = ExecRequest {
         argv: vec!["/bin/true".into()],
@@ -530,8 +630,13 @@ async fn wait_for_exec_agent(sock: &Path, child: &mut Child) -> Result<(), Micro
     let mut sock_tightened = false;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            return Err(MicrovmError::Boot(format!(
-                "microVM helper exited during boot ({status}); see console.log in the VM dir"
+            let tail = helper_stderr.snapshot().await;
+            let log = tokio::fs::try_exists(console_log)
+                .await
+                .unwrap_or(false)
+                .then_some(console_log);
+            return Err(MicrovmError::Boot(format_helper_boot_error(
+                status, &tail, log,
             )));
         }
         // Defense-in-depth: chmod the socket to 0600 as soon as libkrun's
@@ -673,6 +778,104 @@ mod tests {
         schedule_scrub(vm_dir.clone(), sock.clone());
         await_pending_scrub(&vm_dir).await;
         assert!(!vm_dir.exists());
+    }
+
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn stderr_tail_is_bounded_and_lines_are_clipped() {
+        let mut tail = VecDeque::new();
+        for i in 0..(STDERR_TAIL_LINES + 3) {
+            push_tail_line(&mut tail, &format!("line {i}"));
+        }
+        assert_eq!(tail.len(), STDERR_TAIL_LINES);
+        assert_eq!(tail.front().unwrap(), "line 3");
+        assert_eq!(
+            tail.back().unwrap(),
+            &format!("line {}", STDERR_TAIL_LINES + 2)
+        );
+
+        let long = "x".repeat(STDERR_TAIL_LINE_CHARS + 40);
+        push_tail_line(&mut tail, &long);
+        let kept = tail.back().unwrap();
+        assert_eq!(kept.chars().count(), STDERR_TAIL_LINE_CHARS + 1);
+        assert!(kept.ends_with('…'));
+        // Multi-byte input is clipped on char boundaries, never split.
+        let wide = "é".repeat(STDERR_TAIL_LINE_CHARS);
+        push_tail_line(&mut tail, &wide);
+        assert_eq!(tail.back().unwrap(), &wide);
+    }
+
+    #[test]
+    fn boot_error_exit_69_carries_stderr_tail_without_console_log() {
+        let tail = vec![
+            "intentd-microvm-helper: failed to load /opt/homebrew/lib/libkrun.dylib: \
+             dlopen(...): Library not loaded: /opt/homebrew/opt/libepoxy/lib/libepoxy.0.dylib"
+                .to_string(),
+        ];
+        let msg = format_helper_boot_error(exit_status(69), &tail, None);
+        assert!(msg.contains("exit status: 69"), "{msg}");
+        assert!(msg.contains("libkrun unavailable"), "{msg}");
+        assert!(
+            msg.contains("Library not loaded: /opt/homebrew/opt/libepoxy"),
+            "{msg}"
+        );
+        assert!(!msg.contains("console"), "{msg}");
+    }
+
+    #[test]
+    fn boot_error_exit_70_mentions_existing_console_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("console.log");
+        std::fs::write(&log, b"[    0.000000] Linux version ...").unwrap();
+        let tail = vec!["intentd-microvm-helper: krun_start_enter failed: -22".to_string()];
+        let msg = format_helper_boot_error(exit_status(70), &tail, Some(&log));
+        assert!(msg.contains("exit status: 70"), "{msg}");
+        assert!(msg.contains("libkrun API error"), "{msg}");
+        assert!(msg.contains("krun_start_enter failed"), "{msg}");
+        assert!(msg.contains(&log.display().to_string()), "{msg}");
+    }
+
+    #[test]
+    fn boot_error_guest_exit_has_no_meaning_and_notes_empty_stderr() {
+        let msg = format_helper_boot_error(exit_status(1), &[], None);
+        assert_eq!(
+            msg,
+            "microVM helper exited during boot (exit status: 1); helper stderr was empty"
+        );
+    }
+
+    /// End-to-end through the readiness poll: a helper that dies with a
+    /// diagnostic on stderr before the exec socket ever appears yields a
+    /// boot error carrying that diagnostic.
+    #[tokio::test]
+    async fn wait_for_exec_agent_reports_helper_stderr_on_early_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo 'intentd-microvm-helper: boom' >&2; exit 69")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let mut helper_stderr = HelperStderr::spawn_drain(child.stderr.take());
+        let err = wait_for_exec_agent(
+            &tmp.path().join("absent.sock"),
+            &mut child,
+            &mut helper_stderr,
+            &tmp.path().join("console.log"),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, MicrovmError::Boot(_)), "{msg}");
+        assert!(msg.contains("exit status: 69"), "{msg}");
+        assert!(msg.contains("libkrun unavailable"), "{msg}");
+        assert!(msg.contains("intentd-microvm-helper: boom"), "{msg}");
+        assert!(!msg.contains("console.log"), "{msg}");
     }
 
     #[test]
