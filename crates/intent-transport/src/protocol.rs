@@ -440,7 +440,7 @@
 //! workspace, retained 7 days. No method-catalog change.
 //!
 //! Version 9.14 adds the execution-environment surface (additive;
-//! §5.35, §5.1, §5.5b): the `sandbox.profiles.list` /
+//! §5.1, §5.5b): the `sandbox.profiles.list` /
 //! `sandbox.profiles.update` / `sandbox.options` / `sandbox.image.check`
 //! router methods, the `system.capabilities.microvmSupported` field (§5.7),
 //! the `workspace.create` `executionEnvironment` param with the persisted

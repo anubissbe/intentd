@@ -27308,7 +27308,7 @@ mod worktree_provisioning {
         }
     }
 
-    /// `sandbox.profiles.list` (§5.35): the default settings yield one row
+    /// `sandbox.profiles.list` (§5.5b): the default settings yield one row
     /// per type in catalog order — direct/worktree enabled, cow/microvm
     /// disabled, `defaultType: "worktree"`, a `null` microvm image, and the
     /// default microvm VM sizing. Registry-less wiring serves schema
@@ -27336,7 +27336,7 @@ mod worktree_provisioning {
         );
     }
 
-    /// `sandbox.profiles.update` (§5.35): a batch update persists through the
+    /// `sandbox.profiles.update` (§5.5b): a batch update persists through the
     /// settings registry and returns the updated list shape; an explicit
     /// `image: null` clears the override; unknown types/fields → `InvalidParams`
     /// with nothing applied.
@@ -27468,7 +27468,7 @@ mod worktree_provisioning {
         assert!(matches!(err, intent_core::Error::InvalidParams(_)), "{err}");
     }
 
-    /// `sandbox.options` (§5.35): joins the settings intent with host
+    /// `sandbox.options` (§5.5b): joins the settings intent with host
     /// capability — direct/worktree always available, `cow` gated on the `CoW`
     /// probe, `microvm` on platform AND `CoW`; `reason` present exactly when
     /// unavailable.
