@@ -45,9 +45,10 @@ pub const MAX_SOCKET_PATH_BYTES: usize = 103;
                   length-limited) — deliver real workloads as a script file over virtio-fs, \
                   e.g. `-- /bin/sh /ctl/run.sh`.\n\nPROBE MODE\n  `--probe` resolves the \
                   libkrun directory, dlopens libkrun and resolves the symbols the boot path \
-                  needs, then exits 0 without creating a VM. It takes no --root-fs and no \
-                  guest command; --libkrun-dir / $INTENTD_LIBKRUN_DIR are honoured exactly \
-                  as at boot.\n\nEXIT CODES\n  0-255 guest command exit \
+                  needs, then exits 0 without creating a VM, printing one JSON line on stdout \
+                  ({\"status\":\"ok\",\"libkrun_dir\":DIR,\"libkrun\":DYLIB,\"libkrun_version\":V}). \
+                  It takes no --root-fs and no guest command; --libkrun-dir / \
+                  $INTENTD_LIBKRUN_DIR are honoured exactly as at boot.\n\nEXIT CODES\n  0-255 guest command exit \
                   status (VM booted and ran to completion); 0 also means the --probe \
                   succeeded\n  2     CLI parse error\n  64    \
                   invalid configuration (validation failed before boot)\n  69    microVM \

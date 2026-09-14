@@ -63,6 +63,10 @@ type FnStartEnter = unsafe extern "C" fn(u32) -> i32;
 /// stay lazy in [`try_boot`].
 struct KrunApi {
     lib: *mut c_void,
+    /// Resolved dylib directory (the process cwd after [`enter_dylib_dir`]).
+    dir: PathBuf,
+    /// The libkrun dylib that was dlopened, symlinks resolved.
+    path: PathBuf,
     set_log_level: FnSetLogLevel,
     create_ctx: FnCreateCtx,
     set_vm_config: FnSetVmConfig,
@@ -80,9 +84,11 @@ impl KrunApi {
     fn load(libkrun_dir: Option<&Path>) -> Result<Self, BootError> {
         let dir = resolve_libkrun_dir(libkrun_dir)?;
         enter_dylib_dir(&dir)?;
-        let lib = load_libkrun(&dir)?;
+        let (path, lib) = load_libkrun(&dir)?;
         Ok(Self {
             lib,
+            dir,
+            path,
             set_log_level: sym(lib, "krun_set_log_level")?,
             create_ctx: sym(lib, "krun_create_ctx")?,
             set_vm_config: sym(lib, "krun_set_vm_config")?,
@@ -102,16 +108,84 @@ pub fn boot(plan: &BootPlan) -> BootError {
     }
 }
 
+/// What a successful `--probe` reports on stdout (one JSON line) — the
+/// daemon logs it at startup so a support bundle shows which libkrun was
+/// loaded from where.
+#[derive(Debug, PartialEq)]
+pub struct ProbeReport {
+    pub libkrun_dir: PathBuf,
+    pub libkrun_path: PathBuf,
+    /// Version taken from the canonical dylib file name
+    /// (`libkrun.<version>.dylib`); libkrun exports no version symbol
+    /// (no `krun_get_version` as of 1.19.4), so a bare `libkrun.dylib`
+    /// with no versioned target yields `None`.
+    pub libkrun_version: Option<String>,
+}
+
+impl ProbeReport {
+    /// One-line JSON object: `{"status":"ok","libkrun_dir":…,"libkrun":…,
+    /// "libkrun_version":…|null}`. Hand-rolled (the helper has no serde) —
+    /// [`json_string`] escapes the path values.
+    pub fn to_json_line(&self) -> String {
+        format!(
+            "{{\"status\":\"ok\",\"libkrun_dir\":{},\"libkrun\":{},\"libkrun_version\":{}}}",
+            json_string(&self.libkrun_dir.to_string_lossy()),
+            json_string(&self.libkrun_path.to_string_lossy()),
+            self.libkrun_version
+                .as_deref()
+                .map_or_else(|| "null".to_string(), json_string),
+        )
+    }
+}
+
 /// `--probe`: loads libkrun exactly as boot would (same directory
 /// resolution, same dlopen, same required symbols) without creating a VM
 /// context. `Ok` means a boot on this host would get past dylib loading.
-pub fn probe(plan: &ProbePlan) -> Result<(), BootError> {
+pub fn probe(plan: &ProbePlan) -> Result<ProbeReport, BootError> {
     let libkrun_dir = plan
         .libkrun_dir
         .as_deref()
         .map(absolutize_path)
         .transpose()?;
-    KrunApi::load(libkrun_dir.as_deref()).map(|_| ())
+    let api = KrunApi::load(libkrun_dir.as_deref())?;
+    Ok(ProbeReport {
+        libkrun_version: libkrun_version_from_path(&api.path),
+        libkrun_dir: api.dir,
+        libkrun_path: api.path,
+    })
+}
+
+/// `libkrun.1.19.4.dylib` → `1.19.4`; `libkrun.1.dylib` / `libkrun.dylib`
+/// carry no full version and yield `None`.
+fn libkrun_version_from_path(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let version = name.strip_prefix("libkrun.")?.strip_suffix(".dylib")?;
+    let mut parts = version.split('.');
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if parts.by_ref().take(3).filter(|p| numeric(p)).count() == 3 && parts.next().is_none() {
+        Some(version.to_string())
+    } else {
+        None
+    }
+}
+
+/// JSON string literal with `"`, `\` and control characters escaped.
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 enum Never {}
@@ -325,8 +399,9 @@ fn enter_dylib_dir(dir: &Path) -> Result<(), BootError> {
 }
 
 /// dlopens libkrun, first verifying libkrunfw is present in the same
-/// directory (libkrun needs it at boot; see [`enter_dylib_dir`]).
-fn load_libkrun(dir: &Path) -> Result<*mut c_void, BootError> {
+/// directory (libkrun needs it at boot; see [`enter_dylib_dir`]). Returns
+/// the canonical path of the dylib that was opened alongside the handle.
+fn load_libkrun(dir: &Path) -> Result<(PathBuf, *mut c_void), BootError> {
     if !LIBKRUNFW_NAMES.iter().any(|n| dir.join(n).is_file()) {
         return Err(unavailable(format!(
             "libkrunfw.5.dylib not found next to libkrun in {} (libkrun dlopens it \
@@ -340,7 +415,9 @@ fn load_libkrun(dir: &Path) -> Result<*mut c_void, BootError> {
         .map(|n| dir.join(n))
         .find(|p| p.is_file())
         .expect("resolve_libkrun_dir guarantees a libkrun dylib exists");
-    dlopen(&krun)
+    let handle = dlopen(&krun)?;
+    let canonical = std::fs::canonicalize(&krun).unwrap_or(krun);
+    Ok((canonical, handle))
 }
 
 fn dlopen(path: &Path) -> Result<*mut c_void, BootError> {
@@ -400,4 +477,57 @@ fn cstring_from_path(what: &str, path: &Path) -> Result<CString, BootError> {
         path.to_str()
             .ok_or_else(|| api_error(format!("{what} is not valid UTF-8: {}", path.display())))?,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_comes_from_the_canonical_file_name() {
+        let v = |n: &str| libkrun_version_from_path(Path::new(n));
+        assert_eq!(
+            v("/opt/x/lib/libkrun.1.19.4.dylib").as_deref(),
+            Some("1.19.4")
+        );
+        assert_eq!(v("libkrun.1.dylib"), None);
+        assert_eq!(v("libkrun.dylib"), None);
+        assert_eq!(v("libkrun.1.19.dylib"), None);
+        assert_eq!(v("libkrun.1.19.4.5.dylib"), None);
+        assert_eq!(v("libkrun.a.b.c.dylib"), None);
+        assert_eq!(v("libkrunfw.5.dylib"), None);
+    }
+
+    #[test]
+    fn probe_report_is_one_escaped_json_line() {
+        let report = ProbeReport {
+            libkrun_dir: PathBuf::from("/Applications/Intent.app/Contents/Frameworks/quo\"te"),
+            libkrun_path: PathBuf::from("/tmp/back\\slash/libkrun.1.19.4.dylib"),
+            libkrun_version: Some("1.19.4".into()),
+        };
+        let line = report.to_json_line();
+        assert!(!line.contains('\n'));
+        assert_eq!(
+            line,
+            "{\"status\":\"ok\",\
+             \"libkrun_dir\":\"/Applications/Intent.app/Contents/Frameworks/quo\\\"te\",\
+             \"libkrun\":\"/tmp/back\\\\slash/libkrun.1.19.4.dylib\",\
+             \"libkrun_version\":\"1.19.4\"}"
+        );
+
+        let unversioned = ProbeReport {
+            libkrun_dir: PathBuf::from("/x"),
+            libkrun_path: PathBuf::from("/x/libkrun.dylib"),
+            libkrun_version: None,
+        };
+        assert!(unversioned
+            .to_json_line()
+            .ends_with("\"libkrun_version\":null}"));
+    }
+
+    #[test]
+    fn json_string_escapes_control_characters() {
+        assert_eq!(json_string("a\tb\nc\u{1}"), "\"a\\tb\\nc\\u0001\"");
+        assert_eq!(json_string("plain/path"), "\"plain/path\"");
+    }
 }
