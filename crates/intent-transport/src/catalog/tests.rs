@@ -128,15 +128,15 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// `browser.syncTabs`), protocol 9.10. REV-2 routing: +2 fast-path methods
 /// (`browser.navigateTab` / `browser.closeTab`), protocol 9.11.
 ///
-/// Execution environments (protocol 10.1): +4 router methods
+/// Execution environments (protocol 10.2): +4 router methods
 /// (`sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
 /// `sandbox.image.check`).
-const EXPECTED_TOTAL_METHODS: usize = 358;
+const EXPECTED_TOTAL_METHODS: usize = 359;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 307;
+const EXPECTED_ROUTER_METHODS: usize = 308;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 49;

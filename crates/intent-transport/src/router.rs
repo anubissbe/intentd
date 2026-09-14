@@ -9,8 +9,9 @@
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ClientId, ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate,
-    NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, ScriptCreateParams, ScriptMode,
-    TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId, WorkspaceUpdate,
+    NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput, RepoRef, ScriptCreateParams,
+    ScriptMode, TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId,
+    WorkspaceUpdate,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -2776,6 +2777,15 @@ async fn dispatch(
                 .map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "github.relatedRepos.list" => {
+            let (owner, repo) = require_repo_slug(params)?;
+            let git_ref = opt_str(params, "ref");
+            let r = api
+                .github_related_repos_list(owner, repo, git_ref)
+                .await
+                .map_err(domain_to_rpc)?;
+            Ok(r)
+        }
         "github.pulls.get" => {
             let owner = require_str_param(params, "owner")?;
             let repo = require_str_param(params, "repo")?;
@@ -2832,15 +2842,15 @@ async fn dispatch(
             Ok(r)
         }
         "github.pulls.search" => {
-            let owner = require_str_param(params, "owner")?;
-            let repo = require_str_param(params, "repo")?;
+            let (owner, repo) = require_repo_slug(params)?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
+            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_pulls_search(owner, repo, filter, state, query, limit, next_token)
+                .github_pulls_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -2890,15 +2900,15 @@ async fn dispatch(
             Ok(r)
         }
         "github.issues.search" => {
-            let owner = require_str_param(params, "owner")?;
-            let repo = require_str_param(params, "repo")?;
+            let (owner, repo) = require_repo_slug(params)?;
             let filter = opt_str(params, "filter");
             let state = opt_str(params, "state");
             let query = opt_str(params, "query");
+            let repos = opt_repo_refs(params, "repos")?;
             let limit = opt_int(params, "limit").or_else(|| opt_int(params, "perPage"));
             let next_token = opt_str(params, "nextToken");
             let r = api
-                .github_issues_search(owner, repo, filter, state, query, limit, next_token)
+                .github_issues_search(owner, repo, filter, state, query, repos, limit, next_token)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)
@@ -4205,6 +4215,84 @@ fn require_present(params: &Map<String, Value>, name: &str) -> Result<(), RpcErr
 /// Optional string param (absent/null/non-string → `None`).
 fn opt_str(params: &Map<String, Value>, name: &str) -> Option<String> {
     params.get(name).and_then(Value::as_str).map(str::to_string)
+}
+
+/// GitHub's own length ceilings for a login (user / org) and a repository
+/// name; anything longer cannot name a real repo and is rejected up front.
+const MAX_GITHUB_OWNER_LEN: usize = 39;
+const MAX_GITHUB_REPO_LEN: usize = 100;
+
+/// Validate one half of a GitHub `owner/repo` slug against GitHub's naming
+/// rules — owner: `[A-Za-z0-9-]`, repo: `[A-Za-z0-9._-]` (never `.` / `..`),
+/// both non-empty and length-capped. The slugs are interpolated verbatim
+/// into search qualifiers (`repo:{owner}/{repo}`) and REST paths, so a value
+/// carrying whitespace, `:` or `/` could smuggle in extra qualifiers or path
+/// segments; `label` names the offending param in the `-32602` message.
+fn validate_repo_slug_part(label: &str, value: &str, is_owner: bool) -> Result<(), RpcErr> {
+    let (what, max_len) = if is_owner {
+        ("GitHub owner", MAX_GITHUB_OWNER_LEN)
+    } else {
+        ("GitHub repository name", MAX_GITHUB_REPO_LEN)
+    };
+    let allowed =
+        |c: char| c.is_ascii_alphanumeric() || c == '-' || (!is_owner && (c == '_' || c == '.'));
+    let valid = !value.is_empty()
+        && value.len() <= max_len
+        && value != "."
+        && value != ".."
+        && value.chars().all(allowed);
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_params(format!(
+            "{label} is not a valid {what}: {value:?}"
+        )))
+    }
+}
+
+/// Require the `(owner, repo)` pair addressing a GitHub repository (§5.27)
+/// and validate both halves via [`validate_repo_slug_part`]; missing/non-string
+/// → the usual "Missing required parameter" `-32602`.
+fn require_repo_slug(params: &Map<String, Value>) -> Result<(String, String), RpcErr> {
+    let owner = require_str_param(params, "owner")?;
+    let repo = require_str_param(params, "repo")?;
+    validate_repo_slug_part("owner", &owner, true)?;
+    validate_repo_slug_part("repo", &repo, false)?;
+    Ok((owner, repo))
+}
+
+/// Optional `[{ owner, repo }]` param (the `github.*.search` `repos` extras,
+/// §5.27): absent/null → empty. Anything else must be an array whose every
+/// entry is an object with string `owner` and `repo` that pass
+/// [`validate_repo_slug_part`] → `-32602` naming the entry index otherwise.
+/// Dedup and the total-repo cap are applied downstream by the services layer.
+fn opt_repo_refs(params: &Map<String, Value>, name: &str) -> Result<Vec<RepoRef>, RpcErr> {
+    let entries = match params.get(name) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(invalid_params(format!(
+                "{name} must be an array of {{ owner, repo }} objects"
+            )))
+        }
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let field = |key: &str, is_owner: bool| {
+                let label = format!("{name}[{idx}].{key}");
+                let value = entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| invalid_params(format!("{label} must be a non-empty string")))?;
+                validate_repo_slug_part(&label, value, is_owner)?;
+                Ok::<_, RpcErr>(value.to_string())
+            };
+            Ok(RepoRef::new(field("owner", true)?, field("repo", false)?))
+        })
+        .collect()
 }
 
 /// Like [`opt_str`] but treats empty and whitespace-only values as absent, so

@@ -454,22 +454,35 @@
 //! file"` when the name is missing) with the bytes dropped. `imageBlocks`
 //! keep their inline arm unchanged. No method-catalog change.
 //!
-//! Version 10.1 adds the execution-environment surface (additive;
+//! Version 10.1 adds the `github.relatedRepos.list` router method (additive;
+//! §5.27): the GitHub repositories a remote repository's `.gitmodules`
+//! references, fetched via the contents API without a clone →
+//! `{ repos: [{ owner, repo, path }] }` (file order, deduplicated, the parent
+//! excluded, capped at 5; a missing or unparsable file is `{ repos: [] }`,
+//! never an error). Also within 10.1 (additive optional param, no catalog
+//! change): `github.pulls.search` / `github.issues.search` accept
+//! `repos?: [{ owner, repo }]` extras — ONE search request spanning at most
+//! 6 repositories (addressed + extras, deduplicated; over-cap or a malformed
+//! entry → `-32602`), `sort=updated`, every item's `owner` / `repo` naming
+//! its own hit's repository. The catalog contains 304 router methods, 49
+//! fast-path methods, and two aliases: 355 client-callable names.
+//!
+//! Version 10.2 adds the execution-environment surface (additive;
 //! §5.1, §5.5b): the `sandbox.profiles.list` /
 //! `sandbox.profiles.update` / `sandbox.options` / `sandbox.image.check`
 //! router methods, the `system.capabilities.microvmSupported` field (§5.7),
 //! the `workspace.create` `executionEnvironment` param with the persisted
 //! `Workspace.executionEnvironment` field, and the structured
 //! `execution-environment-unavailable` / `execution-environment-not-implemented`
-//! error payloads (§9). The catalog contains 307 router methods, 49
-//! fast-path methods, and two aliases: 358 client-callable names. The five
+//! error payloads (§9). The catalog contains 308 router methods, 49
+//! fast-path methods, and two aliases: 359 client-callable names. The five
 //! reverse methods are counted separately.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.1";
+pub const PROTOCOL_VERSION: &str = "10.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

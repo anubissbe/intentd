@@ -29443,6 +29443,7 @@ impl WorkspaceApi for Services {
                         author: None,
                         involvement: None,
                         search: None,
+                        extra_repos: Vec::new(),
                         limit: Some(limit),
                         cursor,
                     },
@@ -29464,6 +29465,7 @@ impl WorkspaceApi for Services {
         filter: Option<String>,
         state: Option<String>,
         query: Option<String>,
+        repos: Vec<intent_sourcecontrol::RepoRef>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -29472,18 +29474,20 @@ impl WorkspaceApi for Services {
             let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
             let search = github_ops::normalize_search_query(query);
             // Search defaults to open PRs (FE `searchGitHubPullRequests`); a
-            // `filter:"all"` with no free-text `query` carries no constraint
-            // and so degrades to the plain `github.pulls.list` listing the
-            // engine performs, while involvement and/or free text route
-            // through `GET /search/issues`.
+            // `filter:"all"` with no free-text `query` and no `repos` extras
+            // carries no constraint and so degrades to the plain
+            // `github.pulls.list` listing the engine performs, while
+            // involvement, free text, and/or a multi-repo scope route through
+            // `GET /search/issues`.
             let state = match state {
                 Some(s) => github_ops::parse_pr_state(Some(s.as_str()))?,
                 None => Some(intent_sourcecontrol::PrState::Open),
             };
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .list_prs(
                     &repo_ref,
@@ -29494,13 +29498,21 @@ impl WorkspaceApi for Services {
                         author: None,
                         involvement,
                         search,
+                        extra_repos: extra_repos.clone(),
                         limit: Some(limit),
                         cursor,
                     },
                 )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
-            let pulls: Vec<_> = page.items.iter().map(github_ops::pull_to_json).collect();
+            let scope: Vec<_> = std::iter::once(repo_ref).chain(extra_repos).collect();
+            let pulls: Vec<_> = page
+                .items
+                .iter()
+                .map(|p| {
+                    github_ops::pull_to_json_with_repo(p, &github_ops::hit_repo(&scope, &p.url))
+                })
+                .collect();
             Ok(serde_json::json!({
                 "pulls": pulls,
                 "nextToken": github_ops::next_token_value(page.next_cursor.as_deref()),
@@ -29661,6 +29673,7 @@ impl WorkspaceApi for Services {
                         state: Some(state),
                         labels,
                         search: None,
+                        extra_repos: Vec::new(),
                         limit: Some(limit),
                         cursor,
                     },
@@ -29686,6 +29699,7 @@ impl WorkspaceApi for Services {
         filter: Option<String>,
         state: Option<String>,
         query: Option<String>,
+        repos: Vec<intent_sourcecontrol::RepoRef>,
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -29695,9 +29709,9 @@ impl WorkspaceApi for Services {
             // (no PR-only `review-requested`). The host-agnostic engine
             // cannot express `@me` involvement for issues (v1 limitation —
             // that needs an involvement clause on `IssueQuery`); a free-text
-            // `query` routes through the engine's `GET /search/issues` path,
-            // and without one the search degrades to the repo-issue listing
-            // filtered by state.
+            // `query` and/or `repos` extras route through the engine's
+            // `GET /search/issues` path, and without either the search
+            // degrades to the repo-issue listing filtered by state.
             github_ops::parse_issue_filter(filter.as_deref())?;
             let search = github_ops::normalize_search_query(query);
             let state = match state {
@@ -29706,8 +29720,9 @@ impl WorkspaceApi for Services {
             };
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected).await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
+            let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
+            let sc = pr_ops::resolve_source_control(injected).await?;
             let page = sc
                 .list_issues(
                     &repo_ref,
@@ -29715,16 +29730,21 @@ impl WorkspaceApi for Services {
                         state: Some(state),
                         labels: None,
                         search,
+                        extra_repos: extra_repos.clone(),
                         limit: Some(limit),
                         cursor,
                     },
                 )
                 .await
                 .map_err(pr_ops::map_sc_err)?;
+            let scope: Vec<_> = std::iter::once(repo_ref).chain(extra_repos).collect();
             let items: Vec<_> = page
                 .items
                 .iter()
-                .map(|i| github_ops::issue_to_json(i, &repo_ref.owner, &repo_ref.name))
+                .map(|i| {
+                    let hit = github_ops::hit_repo(&scope, &i.url);
+                    github_ops::issue_to_json(i, &hit.owner, &hit.name)
+                })
                 .collect();
             Ok(serde_json::json!({
                 "issues": items,
@@ -30021,6 +30041,47 @@ impl WorkspaceApi for Services {
                     "exists": false,
                 })),
             }
+        })
+    }
+
+    fn github_related_repos_list(
+        &self,
+        owner: String,
+        repo: String,
+        git_ref: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let injected = self.source_control.clone();
+        Box::pin(async move {
+            let sc = pr_ops::resolve_source_control(injected).await?;
+            let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
+            // Missing `.gitmodules` → { repos: [] }. A mis-shaped contents
+            // payload (directory, non-base64/non-UTF-8 content) folds the
+            // same way — never an error, like `github.repoConfig.get`.
+            // Transport/auth failures still surface like the other
+            // `github.*` methods.
+            let content = match sc
+                .get_file_content(&repo_ref, ".gitmodules", git_ref.as_deref())
+                .await
+            {
+                Ok(c) => c,
+                Err(intent_sourcecontrol::Error::Decode(msg)) => {
+                    tracing::warn!(
+                        "Mis-shaped remote .gitmodules at {}/{}@{}: {}",
+                        owner,
+                        repo,
+                        git_ref.as_deref().unwrap_or("default"),
+                        msg
+                    );
+                    None
+                }
+                Err(e) => return Err(pr_ops::map_sc_err(e)),
+            };
+            let repos = content
+                .map(|text| github_browse_ops::related_repos_from_gitmodules(&text, &repo_ref))
+                .unwrap_or_default();
+            Ok(serde_json::json!({
+                "repos": github_browse_ops::related_repos_to_wire(&repos),
+            }))
         })
     }
 
