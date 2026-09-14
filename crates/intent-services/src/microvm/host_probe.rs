@@ -104,6 +104,9 @@ impl HostProbeCache {
 }
 
 /// Spawn `intentd-microvm-helper --probe` and map its outcome onto a reason.
+/// On success the helper's one-line JSON report (resolved dylib directory,
+/// libkrun path and version) is logged at INFO — the startup prewarm is the
+/// usual emitter, so a support bundle shows which libkrun the daemon loads.
 async fn run_probe() -> HostProbeResult {
     let helper = match resolve_helper_exe() {
         Ok(p) => p,
@@ -121,7 +124,7 @@ async fn run_probe() -> HostProbeResult {
     let mut cmd = tokio::process::Command::new(&helper);
     cmd.arg("--probe")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let child = match cmd.spawn() {
@@ -146,7 +149,16 @@ async fn run_probe() -> HostProbeResult {
     };
     let tail = stderr_tail(&output.stderr);
     match output.status.code() {
-        Some(0) => Ok(()),
+        Some(0) => {
+            let report = String::from_utf8_lossy(&output.stdout);
+            let report = report.trim();
+            tracing::info!(
+                helper = %helper.display(),
+                report = %report,
+                "microVM helper probe: libkrun loadable"
+            );
+            Ok(())
+        }
         Some(EXIT_UNAVAILABLE) => Err(format!("libkrun cannot be loaded on this host: {tail}")),
         Some(EXIT_KRUN_API) => Err(format!("libkrun probe hit a libkrun API error: {tail}")),
         Some(code) => Err(format!("microVM helper probe failed (exit {code}): {tail}")),

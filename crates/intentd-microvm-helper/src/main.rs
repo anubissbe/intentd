@@ -9,8 +9,10 @@
 //! parses and validates, then exits `EXIT_UNAVAILABLE` (69).
 //!
 //! `--probe` runs the boot path's dylib resolution + dlopen + symbol lookup
-//! without creating a VM and exits 0 when libkrun is loadable; intentd uses
-//! it to decide `system.capabilities.microvmSupported`.
+//! without creating a VM and exits 0 when libkrun is loadable, printing one
+//! JSON line (`{"status":"ok","libkrun_dir":…,"libkrun":…,"libkrun_version":…}`)
+//! on stdout; intentd uses the exit status to decide
+//! `system.capabilities.microvmSupported` and logs the line at startup.
 
 mod cli;
 #[cfg(target_os = "macos")]
@@ -39,7 +41,10 @@ fn main() {
     {
         let err = match mode {
             cli::Mode::Probe(plan) => match krun::probe(&plan) {
-                Ok(()) => std::process::exit(0),
+                Ok(report) => {
+                    println!("{}", report.to_json_line());
+                    std::process::exit(0)
+                }
                 Err(err) => err,
             },
             // On success krun_start_enter never returns: the process becomes
