@@ -5039,6 +5039,49 @@ async fn multi_bind_serves_every_configured_address() {
     }
 }
 
+/// Reserve one port on both loopback stacks for the partial-bind-failure
+/// test: a listening blocker on `127.0.0.1` (the address meant to fail) and a
+/// bound-but-NOT-listening `SO_REUSEADDR` guard on `::1` (the address meant
+/// to succeed). Without the guard, a parallel test could take the
+/// to-succeed endpoint between the reservation and the server's bind, and
+/// `start()` would fail on the wrong address (intent-hq/intent#4978).
+///
+/// What each socket excludes while held:
+/// - the listening blocker refuses every other bind of `127.0.0.1:port`,
+///   including the `SO_REUSEADDR` bind+listen a fixed-port test performs when
+///   it rebinds a remembered `free_port()` (they see `AddrInUse` and retry);
+/// - the guard takes `::1:port` out of every process's ephemeral (port 0)
+///   selection and refuses plain explicit binds, while the server's own
+///   `SO_REUSEADDR` listen on it still succeeds (two reuse-address sockets may
+///   share an endpoint when the earlier one is not listening). What it does
+///   NOT exclude is another explicit `SO_REUSEADDR` bind+listen on `::1:port`
+///   — and no remembered-port rebind in this suite can reach one: the
+///   IPv4-only rebinders (`free_port()` callers, the daemon's default bind
+///   set) never touch `::1`, and the dual-stack rebinders
+///   (`runtime_bind_address_list_applies_and_validates`,
+///   `multi_bind_serves_every_configured_address`) bind `127.0.0.1` first, so
+///   the listening blocker fails them before their `::1` bind runs. That is
+///   why the IPv6 side is the one meant to succeed.
+///
+/// Reservation of the pair is retried on a fresh ephemeral port when
+/// `::1:port` happens to be taken already; the server bind itself is never
+/// retried.
+fn reserve_dual_stack_port_with_v4_blocker() -> (StdTcpListener, tokio::net::TcpSocket, u16) {
+    for _ in 0..16 {
+        let blocker = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("blocker bind");
+        let port = blocker.local_addr().expect("blocker addr").port();
+        let guard = tokio::net::TcpSocket::new_v6().expect("guard socket");
+        guard.set_reuseaddr(true).expect("guard SO_REUSEADDR");
+        if guard
+            .bind((std::net::Ipv6Addr::LOCALHOST, port).into())
+            .is_ok()
+        {
+            return (blocker, guard, port);
+        }
+    }
+    panic!("could not reserve one port on both 127.0.0.1 and ::1");
+}
+
 /// monorepo#3314: partial bind failure is a hard error — when any address in
 /// the set cannot bind, `start()` fails and the addresses that DID bind are
 /// released (never silently serve fewer interfaces than configured).
@@ -5048,9 +5091,9 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
         eprintln!("skipping: IPv6 loopback unavailable");
         return;
     }
-    // Occupy a port on ::1 only, then ask for [127.0.0.1, ::1] on it.
-    let blocker = StdTcpListener::bind(("::1", 0)).expect("blocker bind");
-    let port = blocker.local_addr().expect("blocker addr").port();
+    // Occupy a port on 127.0.0.1 (listening) while keeping ::1 on the same
+    // port owned but bindable, then ask for [::1, 127.0.0.1] on it.
+    let (_blocker, _v6_guard, port) = reserve_dual_stack_port_with_v4_blocker();
 
     let (api, bus, _store, _registry, dir) = make_services(None, None).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
@@ -5060,8 +5103,8 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
     let opts = WsOptions {
         base_port: port,
         bind_addresses: vec![
-            Ipv4Addr::LOCALHOST.into(),
             std::net::Ipv6Addr::LOCALHOST.into(),
+            Ipv4Addr::LOCALHOST.into(),
         ],
         ..WsOptions::default()
     };
@@ -5069,18 +5112,20 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
     let err = ws
         .start()
         .await
-        .expect_err("start must fail when ::1 is occupied");
+        .expect_err("start must fail when 127.0.0.1 is occupied");
     assert!(
-        err.to_string().contains("::1"),
+        err.to_string().contains("127.0.0.1"),
         "bind error names the failing address: {err}"
     );
 
-    // All-or-nothing: the successfully-bound 127.0.0.1 listener was released.
+    // All-or-nothing: the successfully-bound ::1 listener was released. The
+    // non-listening guard answers connects with RST, so only a leaked server
+    // listener could make this connect succeed.
     assert!(
-        TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
             .await
             .is_err(),
-        "127.0.0.1:{port} must not accept after a partial bind failure"
+        "[::1]:{port} must not accept after a partial bind failure"
     );
 }
 
