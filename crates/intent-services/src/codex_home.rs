@@ -102,7 +102,27 @@ pub(crate) fn prepare(
 }
 
 fn write_config(source: &Path, home: &Path) -> io::Result<()> {
-    let text = match std::fs::read_to_string(source.join("config.toml")) {
+    write_config_file(source, home, "config.toml")?;
+    // Named profile files are loaded alongside config.toml. Copy them with
+    // the same path and storage adjustments rather than losing that layer.
+    let entries = match std::fs::read_dir(source) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            if name.ends_with(".config.toml") && entry.path().is_file() {
+                write_config_file(source, home, name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_config_file(source: &Path, home: &Path, name: &str) -> io::Result<()> {
+    let text = match std::fs::read_to_string(source.join(name)) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
@@ -110,6 +130,7 @@ fn write_config(source: &Path, home: &Path) -> io::Result<()> {
     let mut config = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| io::Error::other(format!("Invalid Codex config: {e}")))?;
+    rebase_paths(config.as_table_mut(), source, false);
     // A user-level SQLite override must not reconnect the isolated sessions
     // to the desktop's index. Preserve every unrelated setting.
     config["sqlite_home"] = toml_edit::value(home.to_string_lossy().as_ref());
@@ -123,7 +144,44 @@ fn write_config(source: &Path, home: &Path) -> io::Result<()> {
             }
         }
     }
-    atomic_write(&home.join("config.toml"), config.to_string().as_bytes())
+    atomic_write(&home.join(name), config.to_string().as_bytes())
+}
+
+/// These paths are relative to the declaring configuration, unlike MCP
+/// command arguments and subprocess working directories. Point role config
+/// files at their originals so their own relative references stay anchored.
+fn rebase_paths(table: &mut dyn toml_edit::TableLike, source: &Path, skills: bool) {
+    for (name, item) in table.iter_mut() {
+        let name = name.get();
+        if matches!(
+            name,
+            "config_file"
+                | "model_instructions_file"
+                | "experimental_compact_prompt_file"
+                | "model_catalog_json"
+        ) || (skills && name == "path")
+        {
+            if let Some(path) = item.as_str() {
+                if Path::new(path).is_relative() && !path.starts_with('~') {
+                    *item = toml_edit::value(source.join(path).to_string_lossy().as_ref());
+                }
+            }
+        }
+        let skills = skills || name == "skills";
+        if let Some(child) = item.as_table_like_mut() {
+            rebase_paths(child, source, skills);
+        } else if let Some(array) = item.as_array_of_tables_mut() {
+            for child in array.iter_mut() {
+                rebase_paths(child, source, skills);
+            }
+        } else if let Some(array) = item.as_array_mut() {
+            for value in array.iter_mut() {
+                if let Some(child) = value.as_inline_table_mut() {
+                    rebase_paths(child, source, skills);
+                }
+            }
+        }
+    }
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -244,5 +302,53 @@ mod tests {
         std::fs::write(&target, "keep-me").unwrap();
         assert!(link(&tmp.path().join("source"), &target).is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "keep-me");
+    }
+
+    #[test]
+    fn preserves_relative_config_references_and_named_profiles() {
+        let tmp = crate::test_support::test_tempdir("codex-config-");
+        let source = tmp.path().join("user");
+        std::fs::create_dir(&source).unwrap();
+        let text = "model_instructions_file = 'instructions/custom.md'\n[agents.reviewer]\nconfig_file = 'roles/reviewer.toml'\n[skills]\nconfig = [{path = 'custom-skills/review', enabled = true}]\n[mcp_servers.test]\nargs = ['relative-argument']\n";
+        std::fs::write(source.join("config.toml"), text).unwrap();
+        std::fs::write(
+            source.join("work.config.toml"),
+            "model_catalog_json = 'catalog.json'\nsqlite_home = '/shared'\n",
+        )
+        .unwrap();
+        let home = prepare(&tmp.path().join("intent"), &source, "agent", false).unwrap();
+        let config = std::fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            config["model_instructions_file"].as_str(),
+            source.join("instructions/custom.md").to_str()
+        );
+        assert_eq!(
+            config["agents"]["reviewer"]["config_file"].as_str(),
+            source.join("roles/reviewer.toml").to_str()
+        );
+        assert_eq!(
+            config["skills"]["config"][0]["path"].as_str(),
+            source.join("custom-skills/review").to_str()
+        );
+        assert_eq!(
+            config["mcp_servers"]["test"]["args"][0].as_str(),
+            Some("relative-argument")
+        );
+        let profile = std::fs::read_to_string(home.join("work.config.toml"))
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(profile["sqlite_home"].as_str(), home.to_str());
+        assert_eq!(
+            profile["model_catalog_json"].as_str(),
+            source.join("catalog.json").to_str()
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.join("config.toml")).unwrap(),
+            text
+        );
     }
 }
