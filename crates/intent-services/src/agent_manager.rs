@@ -2503,6 +2503,21 @@ impl AgentManager {
         self
     }
 
+    /// Render the login remedy for the home actually selected for this agent.
+    pub(crate) fn provider_auth_message(&self, provider_id: &str, agent_id: &AgentId) -> String {
+        let message = crate::provider_auth::not_authenticated_message(provider_id);
+        if provider_id == "codex" {
+            if let Some(command) = self
+                .codex_state_root
+                .as_ref()
+                .and_then(|root| crate::codex_home::login_command(root, &agent_id.to_string()))
+            {
+                return message.replace("codex login", &command);
+            }
+        }
+        message
+    }
+
     /// Set the dedicated spawn cwd for chief provider children (STAB-50).
     /// The composition root passes `intent_core::chief_cwd_root(&config.data_dir)`;
     /// the directory is created on demand right before a chief spawn resolves.
@@ -8231,13 +8246,10 @@ impl AgentManager {
                         if message
                             .contains(&crate::provider_auth::not_authenticated_message("codex"))
                         {
-                            if let Some(command) = self.codex_state_root.as_ref().and_then(|root| {
-                                crate::codex_home::login_command(root, &agent_id.to_string())
-                            }) {
-                                return Err(Error::InvalidParams(
-                                    message.replace("codex login", &command),
-                                ));
-                            }
+                            return Err(Error::InvalidParams(message.replace(
+                                &crate::provider_auth::not_authenticated_message("codex"),
+                                &self.provider_auth_message("codex", agent_id),
+                            )));
                         }
                     }
                 }

@@ -94,6 +94,11 @@ pub(crate) fn prepare(
             link(&source.join(name), &selected.join(name))?;
         }
     }
+    // A first login writes through the link and needs its target parent.
+    // Preserve permissions on an existing user-managed home.
+    if !source.exists() {
+        private_dir(source)?;
+    }
     link(&source.join("auth.json"), &selected.join("auth.json"))?;
     write_config(source, &selected)?;
     // Record routing before spawn: retries must select the same storage.
@@ -241,6 +246,18 @@ fn link(source: &Path, target: &Path) -> io::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_login_can_write_through_shared_auth_link() {
+        let tmp = crate::test_support::test_tempdir("codex-first-login-");
+        let source = tmp.path().join("missing/user");
+        let home = prepare(&tmp.path().join("intent"), &source, "new-agent", false).unwrap();
+        std::fs::write(home.join("auth.json"), "test-credential").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(source.join("auth.json")).unwrap(),
+            "test-credential"
+        );
+    }
 
     #[test]
     fn separates_state_and_keeps_file_auth_live_across_restarts() {
