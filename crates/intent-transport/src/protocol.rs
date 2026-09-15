@@ -476,22 +476,23 @@
 //! exits for a staged update only once idle; `system.requestUpdate`
 //! (SIGUSR1) still restarts immediately. No method-catalog change.
 //!
-//! Version 9.14 adds principals (additive; multiplayer w1): every connection
-//! is bound to a principal at admission (UDS and the legacy bearer token →
+//! Version 10.3 adds multiplayer (additive; staged as 9.14 while main moved
+//! to 10.x). Principals (multiplayer w1): every connection is bound to a
+//! principal at admission (UDS and the legacy bearer token →
 //! the primary user; a hashed per-principal credential → its principal) and
 //! `principal.me` returns that binding
 //! (`{ id, login?, displayName?, avatarUrl?, isAdministrator }`).
 //! `workspace.get` / `workspace.list` rows carry the flattened membership
 //! summary `ownerPrincipalId?`, `myRole?` (`owner` | `collaborator`, relative
 //! to the caller), `memberCount`, `openInviteCount`. The catalog contains
-//! 305 router methods, 49 fast-path methods, and two aliases: 356
+//! 316 router methods, 49 fast-path methods, and two aliases: 367
 //! client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-pub const PROTOCOL_VERSION: &str = "10.2";
+pub const PROTOCOL_VERSION: &str = "10.3";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text
