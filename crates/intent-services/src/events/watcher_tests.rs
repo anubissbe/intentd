@@ -14,7 +14,7 @@ use tokio::time::{timeout, Instant};
 use super::bus::EventBus;
 use super::filter::SubscriptionFilter;
 use super::shared_watch::SharedWatchHub;
-use super::watcher::{flush_due, Action, FileWatcher};
+use super::watcher::{debounce_loop, flush_due, Action, FileWatcher};
 use super::{TestBudget, LIVENESS};
 
 /// Self-cleaning temp directory (watched workspace root); see
@@ -674,24 +674,26 @@ async fn dedupe_within_window_emits_one_event_per_path() {
 // `*.secret`/`dist*` filenames used below.
 // ---------------------------------------------------------------------------
 
+/// Run `git -C root args`, panicking with stderr on failure.
+fn git(root: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `git init` the temp dir (plus user config) so the watcher sees a real repo.
 fn git_init(root: &Path) {
-    let run = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .expect("run git");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    run(&["init", "-q"]);
-    run(&["config", "user.email", "watcher-test@example.com"]);
-    run(&["config", "user.name", "Watcher Test"]);
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "watcher-test@example.com"]);
+    git(root, &["config", "user.name", "Watcher Test"]);
 }
 
 /// Wait until the control path's event arrives (up to `LIVENESS`), asserting
@@ -933,6 +935,264 @@ async fn gitignore_edit_takes_effect_without_restart() {
     std::fs::write(dir.path.join("after-edit-control.txt"), b"c").expect("write control");
 
     expect_suppressed(&mut sub, &["runtime-ignored.txt"], "after-edit-control.txt").await;
+}
+
+/// Provision `<base>/main` as a primary checkout with one commit and
+/// `<base>/wt` as a linked worktree of it (`git worktree add`), ensuring the
+/// common dir's `info/` exists. Returns `(main, worktree)`.
+fn linked_worktree(base: &Path, branch: &str) -> (PathBuf, PathBuf) {
+    let main = base.join("main");
+    std::fs::create_dir_all(&main).expect("mk main");
+    git_init(&main);
+    git(&main, &["commit", "--allow-empty", "-q", "-m", "init"]);
+    let worktree = base.join("wt");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            branch,
+            worktree.to_str().expect("utf-8 path"),
+        ],
+    );
+    std::fs::create_dir_all(main.join(".git/info")).expect("mk common info");
+    (main, worktree)
+}
+
+/// Linked-worktree analogue of [`gitignore_edit_takes_effect_without_restart`]
+/// (intent-hq/intent#5057): the repo's `info/exclude` lives in the primary
+/// checkout's common dir, *outside* the watched worktree root, so the
+/// recursive root watch never reports its edits. The watcher must observe
+/// `<common>/info` itself — this is the ONLY invalidation trigger here; no
+/// `.gitignore` is touched and nothing restarts.
+#[tokio::test]
+async fn common_dir_info_exclude_edit_takes_effect_in_linked_worktree() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let base = TempDir::new("gi-wt-excl");
+    let (main, worktree) = linked_worktree(&base.path, "wt-branch");
+    let exclude = main.join(".git/info/exclude");
+    std::fs::write(&exclude, "initial-excluded.txt\n").expect("write exclude");
+
+    let watcher = FileWatcher::start(
+        &SharedWatchHub::new(),
+        bus.clone(),
+        WorkspaceId::from("ws-wt"),
+        &worktree,
+    );
+    watcher.wait_established(LIVENESS).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Not excluded yet: must emit.
+    std::fs::write(worktree.join("runtime-excluded.txt"), b"v1").expect("write pre-rule");
+    next_for(&mut sub, "runtime-excluded.txt", None, LIVENESS)
+        .await
+        .expect("event before the exclude rule exists");
+
+    // Add the rule in the COMMON dir at runtime. The edit is outside the
+    // worktree root, so no `file:*` event surfaces for it. The ordering
+    // (edit applied before the write below is evaluated) is guaranteed by the
+    // loop draining the `info/` channel ahead of each workspace event — see
+    // `queued_exclude_edit_is_applied_before_workspace_events_already_ready`;
+    // the pause only covers OS delivery latency of the raw event.
+    std::fs::write(&exclude, "initial-excluded.txt\nruntime-excluded.txt\n").expect("edit exclude");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    std::fs::write(worktree.join("runtime-excluded.txt"), b"v2 longer").expect("write excluded");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(worktree.join("wt-edit-control.txt"), b"c").expect("write control");
+
+    expect_suppressed(&mut sub, &["runtime-excluded.txt"], "wt-edit-control.txt").await;
+}
+
+/// PR #1910 review: the common dir's `info/exclude` need not exist when the
+/// watcher starts (`git init` templates may omit it; a user creates it
+/// later). The matcher then records only the worktree's unresolved
+/// `../..`-relative spelling of the path, while the out-of-root watch
+/// reports the canonical one — the two must still be recognised as the same
+/// file, so creating `exclude` at runtime takes effect like an edit.
+#[tokio::test]
+async fn common_dir_info_exclude_created_after_start_takes_effect_in_linked_worktree() {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let base = TempDir::new("gi-wt-excl-new");
+    let (main, worktree) = linked_worktree(&base.path, "wt-new-branch");
+    let exclude = main.join(".git/info/exclude");
+    let _ = std::fs::remove_file(&exclude);
+    assert!(!exclude.exists(), "exclude must be absent at watcher start");
+
+    let watcher = FileWatcher::start(
+        &SharedWatchHub::new(),
+        bus.clone(),
+        WorkspaceId::from("ws-wt-new"),
+        &worktree,
+    );
+    watcher.wait_established(LIVENESS).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    std::fs::write(worktree.join("late-excluded.txt"), b"v1").expect("write pre-rule");
+    next_for(&mut sub, "late-excluded.txt", None, LIVENESS)
+        .await
+        .expect("event before the exclude file exists");
+
+    // CREATE the exclude file (not edit) with the rule.
+    std::fs::write(&exclude, "late-excluded.txt\n").expect("create exclude");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    std::fs::write(worktree.join("late-excluded.txt"), b"v2 longer").expect("write excluded");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::fs::write(worktree.join("wt-new-control.txt"), b"c").expect("write control");
+
+    expect_suppressed(&mut sub, &["late-excluded.txt"], "wt-new-control.txt").await;
+}
+
+/// PR #1910 review: the out-of-root `info/` stream and the workspace stream
+/// are separate channels, and `select!` picks between ready branches
+/// arbitrarily. When an `info/exclude` edit and a following workspace write
+/// are BOTH already queued, the edit must be applied first — otherwise the
+/// write is evaluated against the stale matcher and, once queued, is never
+/// re-evaluated. Drives [`debounce_loop`] directly with hand-built events on
+/// the current-thread runtime, so both channels are provably ready before
+/// the loop is polled; no OS watch or timing is involved.
+#[tokio::test]
+async fn queued_exclude_edit_is_applied_before_workspace_events_already_ready() {
+    use notify::event::{CreateKind, DataChange, EventKind, ModifyKind};
+
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let base = TempDir::new("gi-wt-order");
+    let (main, worktree) = linked_worktree(&base.path, "wt-order-branch");
+    let exclude = std::fs::canonicalize(main.join(".git/info"))
+        .expect("canonical info dir")
+        .join("exclude");
+    std::fs::write(&exclude, "unrelated.txt\n").expect("write exclude");
+    let root = std::fs::canonicalize(&worktree).expect("canonical worktree");
+
+    let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (exclude_tx, exclude_rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(debounce_loop(
+        bus.clone(),
+        WorkspaceId::from("ws-order"),
+        root.clone(),
+        raw_rx,
+        Some(exclude_rx),
+    ));
+    // Let the loop build its matcher (without the rule) and park on select.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    // Now the edit lands, followed by the write it should suppress and a
+    // control — all queued before the loop is polled again.
+    std::fs::write(&exclude, "unrelated.txt\nraced.txt\n").expect("edit exclude");
+    std::fs::write(root.join("raced.txt"), b"x").expect("write raced");
+    std::fs::write(root.join("order-control.txt"), b"c").expect("write control");
+    exclude_tx
+        .send(
+            notify::Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                .add_path(exclude.clone()),
+        )
+        .expect("send exclude event");
+    raw_tx
+        .send(
+            notify::Event::new(EventKind::Create(CreateKind::File))
+                .add_path(root.join("raced.txt")),
+        )
+        .expect("send raced event");
+    raw_tx
+        .send(
+            notify::Event::new(EventKind::Create(CreateKind::File))
+                .add_path(root.join("order-control.txt")),
+        )
+        .expect("send control event");
+
+    expect_suppressed(&mut sub, &["raced.txt"], "order-control.txt").await;
+    task.abort();
+}
+
+/// Descriptor census for the `<common>/info` subscription above: in the
+/// daemon the git metadata watcher already holds a linked worktree's common
+/// dir as a git-dir root (whose pruned walk keeps `info/`), so the file
+/// watcher's non-recursive root on `<common>/info` must share that descriptor
+/// rather than add one. Every inotify descriptor the file watcher brings must
+/// lie under the worktree root itself. (The registry starts the file watcher
+/// first; inotify keys descriptors per inode within the hub's one Linux
+/// instance, so the total is the same in that order — the common-dir root
+/// then finds `info/` already watched.)
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[expect(clippy::await_holding_lock)]
+async fn linked_worktree_exclude_watch_adds_no_descriptor_outside_the_root() {
+    use super::{inode_of, inotify_watched_inodes};
+    let _serial = super::WATCHER_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.expect("open store");
+    let bus = EventBus::new(store);
+
+    let base = TempDir::new("gi-wt-census");
+    let (main, worktree) = linked_worktree(&base.path, "census-branch");
+    std::fs::create_dir_all(worktree.join("src/nested")).expect("mk src");
+    let common = std::fs::canonicalize(main.join(".git")).expect("canonical common dir");
+    let worktree = std::fs::canonicalize(&worktree).expect("canonical worktree");
+
+    // What the git metadata watcher holds for this worktree in production.
+    let hub = SharedWatchHub::new();
+    let (common_sub, _common_rx, _) = hub.subscribe_git_dir(&common);
+    common_sub.wait_established(LIVENESS).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let before = inotify_watched_inodes();
+    assert!(
+        before.contains(&inode_of(&common.join("info"))),
+        "the common dir's info/ must already be watched via the git-dir root"
+    );
+
+    let watcher = FileWatcher::start(&hub, bus, WorkspaceId::from("ws-census"), &worktree);
+    watcher.wait_established(LIVENESS).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let after = inotify_watched_inodes();
+
+    let worktree_dirs: std::collections::HashSet<u64> = ignore::WalkBuilder::new(&worktree)
+        .standard_filters(false)
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_dir()))
+        .map(|e| inode_of(e.path()))
+        .collect();
+    let added: Vec<u64> = after.difference(&before).copied().collect();
+    assert!(
+        !added.is_empty(),
+        "the worktree root watch must add descriptors of its own"
+    );
+    let outside: Vec<u64> = added
+        .iter()
+        .copied()
+        .filter(|ino| !worktree_dirs.contains(ino))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "the file watcher added {} descriptor(s) outside the worktree root \
+         (the <common>/info subscription must ride the existing git-dir root): {outside:?}",
+        outside.len()
+    );
+    eprintln!(
+        "[census] linked worktree: {} descriptors with the common-dir root only, {} after the file watcher (+{})",
+        before.len(),
+        after.len(),
+        added.len()
+    );
 }
 
 #[tokio::test]
