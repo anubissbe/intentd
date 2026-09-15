@@ -12236,8 +12236,19 @@ impl Services {
             // mid-migration, sidestepping the helper's theoretical
             // failure-path duplicate (the rollback restore racing a
             // concurrent dequeue of an already-migrated entry).
+            //
+            // Everything keyed on a workspace from here on uses the live
+            // target's HOME, not the task/caller workspace
+            // (intent-hq/intent#5046): the migration helper's
+            // target-workspace guard would otherwise reject every
+            // cross-workspace target and strand its poisoned siblings'
+            // queues on each wake; `deliver_wake_message` rebinds to the
+            // same home itself; and the explicit drain kick below keys on
+            // it so the drained turn spawns where the wake did, never under
+            // the caller's workspace.
+            let target_home_ws = session.workspace_id.clone();
             let failed = self
-                .migrate_poisoned_queues_to(&poisoned, &agent_id, &workspace_id)
+                .migrate_poisoned_queues_to(&poisoned, &agent_id, &target_home_ws)
                 .await;
             // Failed migrations stay assigned (and out of the response's
             // `cleanedUpAgentIds`) so the next wakeOrCreate retries them.
@@ -12267,7 +12278,7 @@ impl Services {
                     tokio::spawn({
                         let mgr = mgr.clone();
                         let agent_id = agent_id.clone();
-                        let workspace_id = workspace_id.clone();
+                        let workspace_id = target_home_ws;
                         async move {
                             mgr.try_drain_queue(agent_id, workspace_id).await;
                         }
@@ -12773,16 +12784,48 @@ impl Services {
         // without it a wake racing an `agent.delete` parks a phantom entry no
         // drain can ever deliver. The append-failure arms keep their own
         // NotFound re-check as the check-then-act race guard.
-        if matches!(
-            self.store.get_agent_session_status(agent_id).await,
-            Err(Error::NotFound(_))
-        ) {
-            self.drop_queue(agent_id);
-            return Err(Error::InvalidParams(format!(
-                "unknown agent id: {}",
-                agent_id.0
-            )));
-        }
+        //
+        // The same session read binds the delivery to the target's OWN
+        // session workspace (intent-hq/intent#5046, the wake-path residual
+        // of intent-hq/intent#5017): `agent.wakeOrCreate` passes the waking
+        // CALLER's workspace, which `check_watch_scope` lets differ from the
+        // target's home (a sibling caller waking a chief-homed agent), and
+        // every scope-sensitive step below — the archived gate, the
+        // `try_begin` claim, the event echo, the drain kicks, and the spawn
+        // (`ensure_started` → `resolve_spawn` cwd + `create_agent`
+        // workspace-MCP scope) — must key on the workspace the target lives
+        // in. Any other lookup error fails CLOSED like the send routes'
+        // `require_agent_session`: unlike the archived/retired gates below
+        // (which fail open because their fallback is the normal path), a
+        // failed read here means the destination identity is unknown, and
+        // binding to the caller's workspace would be exactly the scope leak
+        // this guard exists to prevent. Nothing has been claimed, queued or
+        // published yet, so the caller may simply retry; the queue is left
+        // intact (only a confirmed-vanished session drops it).
+        let workspace_id = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => crate::agent_manager::AgentManager::session_workspace(
+                agent_id,
+                workspace_id,
+                &session,
+            ),
+            Err(Error::NotFound(_)) => {
+                self.drop_queue(agent_id);
+                return Err(Error::InvalidParams(format!(
+                    "unknown agent id: {}",
+                    agent_id.0
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.as_str(),
+                    error = %e,
+                    "wake delivery: session lookup failed; refusing to bind the delivery to the requested workspace"
+                );
+                return Err(e);
+            }
+        };
+        let workspace_id = &workspace_id;
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the wake front door — the
         // `agent.wakeOrCreate` context message carries the daemon-stamped
         // attribution, and this path persists/enqueues directly (it never
