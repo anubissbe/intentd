@@ -2497,9 +2497,13 @@ impl AgentManager {
     }
 
     /// Set the private persistent root for Intent-created Codex sessions.
+    /// Isolation currently requires Unix symlinks. Other platforms retain
+    /// their existing Codex home so unsupported linking cannot block launches.
     #[must_use]
     pub fn with_codex_state_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.codex_state_root = Some(root.into());
+        if cfg!(unix) {
+            self.codex_state_root = Some(root.into());
+        }
         self
     }
 
