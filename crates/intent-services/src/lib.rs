@@ -163,6 +163,10 @@ mod v2_1_goldens;
 mod v2_2_goldens;
 #[cfg(test)]
 mod v2_3_goldens;
+#[cfg(test)]
+mod v2_4_goldens;
+#[cfg(test)]
+mod v2_5_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
 pub use config_watcher::ConfigWatcher;
@@ -1039,6 +1043,16 @@ pub struct Services {
     /// race can be decided by moving the deadline instead of racing wall
     /// clock.
     hook_clock_skew: Option<Arc<std::sync::atomic::AtomicI64>>,
+    /// Base backoff between retries of a failed hook-run persistence step
+    /// (1 s in production, doubling per attempt — see
+    /// [`hook_manager::HOOK_STORE_RETRY_ATTEMPTS`]). Tests compress it via
+    /// the `#[cfg(test)]`-only `with_hook_store_retry_base`.
+    hook_store_retry_base: std::time::Duration,
+    /// Test-only fault injector consulted before every hook-run persistence
+    /// step (intent-hq/intent#5035): `Some(err)` fails that attempt without
+    /// touching the store. `None` in production wiring.
+    #[cfg(test)]
+    hook_store_fault: Option<hook_manager::HookStoreFault>,
     /// Host suspend-overlap query used by [`Services::run_prompt_turn`] to
     /// recognize a sleep-induced turn failure and enroll it as interrupted for
     /// wake-triggered resume (Task C). Wired by the composition root from the
@@ -1298,6 +1312,9 @@ impl Services {
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
+            hook_store_retry_base: hook_manager::HOOK_STORE_RETRY_BASE,
+            #[cfg(test)]
+            hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
             pr_monitor_poll_seconds: None,
@@ -1407,6 +1424,23 @@ impl Services {
         skew_ms: Arc<std::sync::atomic::AtomicI64>,
     ) -> Self {
         self.hook_clock_skew = Some(skew_ms);
+        self
+    }
+
+    /// Test-only: compress the backoff between hook persistence retries so
+    /// store-failure coverage completes in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_hook_store_retry_base(mut self, base: std::time::Duration) -> Self {
+        self.hook_store_retry_base = base;
+        self
+    }
+
+    /// Test-only: inject a fault into hook-run persistence steps. The
+    /// injector is called with the step name before every attempt and fails
+    /// the attempt when it returns `Some(err)`.
+    #[cfg(test)]
+    pub(crate) fn with_hook_store_fault(mut self, fault: hook_manager::HookStoreFault) -> Self {
+        self.hook_store_fault = Some(fault);
         self
     }
 
@@ -3587,28 +3621,74 @@ impl Services {
         }
     }
 
-    /// Post-seen-marker settlement of the workspace-level `unread` state
-    /// (§5.1): when advancing a per-agent seen marker (`agent.markSeen`, or
-    /// the `workspace.markSeen` mark-all loop) leaves the workspace with no
-    /// unread top-level session, clear the stored legacy flag and emit ONE
-    /// self-sufficient `workspace:attention-changed { none }` — clients
-    /// clear the blue dot together whether they track the derived or the
-    /// stored flag. The clear is ATOMIC
-    /// ([`intent_store::Store::clear_workspace_unread_if_all_seen`]): the
-    /// guarded UPDATE re-checks the derivation inside the write itself
+    /// Take the [`UnreadSnapshot`] for `workspace_id`: the derivation probe
+    /// plus one primary-key read of the stored flag. Both reads fail CLOSED
+    /// on emission — a probe failure records `derived = false` and a
+    /// stored-flag read failure records `stored_unread = true`, each of
+    /// which keeps the settle's fallback emit off (recording `derived =
+    /// true` on error would be the opposite: a transient probe failure
+    /// followed by a successful post-write fallback would publish a
+    /// spurious `{ none }`). Chief has no attention state and snapshots as
+    /// not-unread.
+    pub(crate) async fn snapshot_workspace_unread(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> UnreadSnapshot {
+        if workspace_id.is_chief() {
+            return UnreadSnapshot {
+                derived: false,
+                stored_unread: true,
+            };
+        }
+        let derived = self
+            .store
+            .workspace_has_unread_top_level_session(workspace_id)
+            .await
+            .unwrap_or(false);
+        let stored_unread = match self.store.get_workspace(workspace_id).await {
+            Ok(ws) => ws.attention == WorkspaceAttention::Unread,
+            Err(_) => true,
+        };
+        UnreadSnapshot {
+            derived,
+            stored_unread,
+        }
+    }
+
+    /// Post-write settlement of the workspace-level `unread` state (§5.1):
+    /// when a write that drops a session out of the unread derivation (a
+    /// per-agent seen-marker advance via `agent.markSeen`, or a retire via
+    /// `agent.retire`) leaves the workspace with no unread top-level
+    /// session, clear the stored legacy flag and emit ONE self-sufficient
+    /// `workspace:attention-changed { none }` — clients clear the blue dot
+    /// together whether they track the derived or the stored flag. The clear
+    /// is ATOMIC ([`intent_store::Store::clear_workspace_unread_if_all_seen`]):
+    /// the guarded UPDATE re-checks the derivation inside the write itself
     /// (`attention = unread AND NOT EXISTS <unread session>`), so an
     /// assistant message landing between the probe below and the write can
     /// never have a freshly-raised unread retired — the write declines and
     /// stays silent (`review_required` is likewise never touched).
-    /// `was_unread` is the derivation observed before the marker write; a
-    /// still-unread workspace (other sessions pending) is a silent no-op, so
-    /// partial reads never emit. Best-effort: a probe failure fails closed
+    ///
+    /// `before` is the [`UnreadSnapshot`] taken before the caller's write.
+    /// A still-unread workspace (other sessions pending) is a silent no-op,
+    /// so partial reads never emit. Exact-once: when the stored flag WAS
+    /// `unread` at snapshot time, only the settle whose guarded clear
+    /// affects the row emits — a concurrent settle (two sessions retired or
+    /// read at once) finds the clear declined and stays silent, since the
+    /// winner already emitted (or a fresh raise re-armed the flag and
+    /// reads serve `unread` again). The fallback emit below exists for the
+    /// other case only — the derivation read unread while the stored flag
+    /// was ALREADY clear (a skipped turn-end raise, a dropped store write),
+    /// so no clear can ever affect a row and clients tracking the derived
+    /// value would never get their `{ none }`; two concurrent settles of
+    /// such an unflagged workspace can both take it (the emit is
+    /// idempotent for clients). Best-effort: a probe failure fails closed
     /// (no emit we cannot confirm) and a write failure skips the settle —
-    /// the marker write is the contract; reads re-derive.
+    /// the caller's write is the contract; reads re-derive.
     pub(crate) async fn settle_workspace_unread_after_seen(
         &self,
         workspace_id: &WorkspaceId,
-        was_unread: bool,
+        before: UnreadSnapshot,
     ) {
         if workspace_id.is_chief() {
             return;
@@ -3638,7 +3718,7 @@ impl Services {
             .await;
             return;
         }
-        if was_unread {
+        if before.derived && !before.stored_unread {
             // The derivation transitioned while the stored flag was already
             // clear (e.g. a turn-end raise was skipped, or a store error
             // dropped it): the read paths were serving derived `unread`, so
@@ -3646,7 +3726,11 @@ impl Services {
             // the dot (it wins on reads; emitting `none` would wrongly
             // retire it), or the derivation flipped back to unread in the
             // park gap (a new assistant message landed; emitting `none`
-            // would contradict what reads now serve).
+            // would contradict what reads now serve). A stored `unread` at
+            // snapshot time never takes this branch: the declined clear
+            // means a concurrent settle already cleared-and-emitted (or a
+            // fresh raise re-armed the flag) — emitting again would
+            // duplicate the `{ none }`.
             let derived_unread = self
                 .store
                 .workspace_has_unread_top_level_session(workspace_id)
@@ -11168,13 +11252,13 @@ fn note_to_workspace_task(
 /// root agents. `isBackground` (monorepo#3789) carries the session's persisted
 /// `is_background` flag (the value surfaced as `metadata.isBackground` on
 /// full agent loads), omitted for foreground agents. Soft-deleted sessions
-/// (`AgentStatus::Deleted`) are excluded from `count`/`agents`/`agentIds` so
-/// clients never render deleted rows (mirrors the
-/// `workspace_attention_signals` filter).
+/// (`AgentStatus::Deleted`) and soft-retired sessions (`retired_at` set) are
+/// excluded from `count`/`agents`/`agentIds` so clients never render deleted
+/// or retired rows (mirrors the `workspace_attention_signals` filter).
 fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
     let live: Vec<&AgentSession> = sessions
         .iter()
-        .filter(|s| s.status != intent_core::AgentStatus::Deleted)
+        .filter(|s| s.status != intent_core::AgentStatus::Deleted && s.retired_at.is_none())
         .collect();
     let agents: Vec<WorkspaceAgentInfo> = live
         .iter()
@@ -13195,6 +13279,21 @@ fn activity_changed_event(workspace_id: &WorkspaceId, activity: WorkspaceActivit
             "activity": activity,
         }),
     }
+}
+
+/// Pre-write observation of a workspace's unread state, taken by the settle
+/// callers ([`Services::settle_workspace_unread_after_seen`]) BEFORE the
+/// write that drops a session out of the unread derivation (a seen-marker
+/// advance or a retire), via [`Services::snapshot_workspace_unread`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnreadSnapshot {
+    /// The derivation read unread (an unread top-level session existed). A
+    /// probe failure records `false`: the fallback emit stays off.
+    pub(crate) derived: bool,
+    /// The stored legacy `attention` flag read `unread`. A read failure
+    /// records `true`: the settle then only ever emits through the atomic
+    /// clear, never the fallback (conservative — silent).
+    pub(crate) stored_unread: bool,
 }
 
 /// Build a `workspace:attention-changed` change event with the self-sufficient
@@ -18751,9 +18850,10 @@ impl WorkspaceApi for Services {
                     // a workspace row. The inputs are shaped to their final
                     // form first so the plan sees exactly what is persisted;
                     // the trimmed prompt and effective image blocks ride along
-                    // for id / branch naming and the first turn. The plan's
-                    // `workspace_id` is a passthrough the planner never reads,
-                    // so it is stamped once the id is derived below.
+                    // for id / branch naming and the first turn. The plan
+                    // carries no workspace identity — the planner never reads
+                    // it — so the id derived below goes straight to the
+                    // persist half as an argument.
                     let planned_initial_agent = match input.initial_agent.take() {
                         Some(agent) => {
                             let prompt = agent
@@ -18842,15 +18942,15 @@ impl WorkspaceApi for Services {
                                 .as_deref()
                                 .map(PathBuf::from)
                                 .filter(|p| p.is_dir());
-                            // Post-plan inputs, stamped on the plan later:
-                            // `workspace_id` once the id is derived (right
-                            // below) and `skip_auto_commit`, which depends on
-                            // the workspace's effective auto-commit seeded by
-                            // the insert, right before persist.
+                            // Post-plan input, stamped on the plan later:
+                            // `skip_auto_commit`, which depends on the
+                            // workspace's effective auto-commit seeded by
+                            // the insert, right before persist. The workspace
+                            // id is derived after the plan and handed to the
+                            // persist half directly.
                             let plan = services
                                 .plan_agent_create(
                                     "workspace.create",
-                                    WorkspaceId::from_string(String::new()),
                                     nonempty_owned(agent.name),
                                     nonempty_owned(agent.model),
                                     nonempty_owned(agent.specialist),
@@ -18892,10 +18992,6 @@ impl WorkspaceApi for Services {
                         &workspaces_root,
                     )
                     .await;
-                    let planned_initial_agent = planned_initial_agent.map(|(mut plan, prompt, image_blocks)| {
-                        plan.workspace_id = id.clone();
-                        (plan, prompt, image_blocks)
-                    });
                     let progress = progress_id.and_then(|pid| {
                         bus.clone().map(|b| {
                             std::sync::Arc::new(create_progress::CreateProgress::new(
@@ -20540,7 +20636,9 @@ impl WorkspaceApi for Services {
                         // `baseRef` (agent.create parity: worktree, else the
                         // repository path).
                         let snapshot_wp = crate::git_ops::worktree_path(&ws);
-                        let created = services.persist_agent_create(plan, snapshot_wp).await?;
+                        let created = services
+                            .persist_agent_create(plan, ws.id.clone(), snapshot_wp)
+                            .await?;
                         let child = AgentId::from(
                             created["agent"]["id"].as_str().unwrap_or_default(),
                         );
@@ -29479,7 +29577,7 @@ impl WorkspaceApi for Services {
                 .map(|c| c.name.as_str())
                 .collect();
 
-            Ok(serde_json::json!({
+            let mut snapshot = serde_json::json!({
                 "repo": repo_slug,
                 "prNumber": pr_number,
                 "title": pr.title,
@@ -29508,14 +29606,20 @@ impl WorkspaceApi for Services {
                 "comments": {
                     "conversationCount": conversation_count,
                     "reviewCommentCount": review_comment_count,
-                    "unresolvedThreadCount": unresolved_thread_count,
                     "totalCount": conversation_count + review_comment_count,
                 },
                 // The merge-requirements checklist: the same object
                 // `ws.pr.monitor` returns and monitor wakes / list summaries
                 // carry.
                 "requirements": requirements,
-            }))
+            });
+            // Presence-detected like `requirements.threads.unresolved`: the
+            // key is omitted (never null or 0) when the per-thread
+            // resolution state was unreadable.
+            if let Some(count) = unresolved_thread_count {
+                snapshot["comments"]["unresolvedThreadCount"] = serde_json::json!(count);
+            }
+            Ok(snapshot)
         })
     }
 

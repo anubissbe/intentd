@@ -96,8 +96,9 @@ fn is_running_turn(status: AgentStatus) -> bool {
 }
 
 /// Terminal statuses the retire cascade never touches (the same set
-/// `count_child_agents` treats as terminal).
-fn is_terminal_status(status: AgentStatus) -> bool {
+/// `count_child_agents` treats as terminal). Also the "owner can no longer
+/// receive wakes" test behind PR-monitor adoption (intent-hq/intent#5079).
+pub(crate) fn is_terminal_status(status: AgentStatus) -> bool {
     matches!(
         status,
         AgentStatus::Completed | AgentStatus::Error | AgentStatus::Deleted
@@ -465,28 +466,19 @@ pub(crate) struct CreateModelAndEffort {
 /// persist keep their own errors (e.g. `workspace.create`'s `ensure_spec_note`
 /// can still hit `NotFound` on a concurrent delete).
 ///
-/// Two fields are post-plan inputs that `workspace.create`'s `initialAgent`
-/// stamps on the plan between planning and persisting; neither is a
-/// validation. `skip_auto_commit` depends on the new workspace's effective
-/// auto-commit, known only once the workspace row exists. `workspace_id` is
-/// a pure passthrough: the planner forwards it untouched, no check consults
-/// it, and `workspace.create` plans with an empty placeholder and stamps
-/// the derived id before persist (see the field doc).
+/// The plan carries no workspace identity: none of the planner's checks
+/// consult it, and [`Services::persist_agent_create`] takes the
+/// [`WorkspaceId`] as an argument instead — which is what lets
+/// `workspace.create` plan before its id is derived. `skip_auto_commit` is
+/// the one post-plan input `workspace.create`'s `initialAgent` stamps on the
+/// plan between planning and persisting; it is a derivation, not a
+/// validation, and depends on the new workspace's effective auto-commit,
+/// known only once the workspace row exists.
 #[derive(Debug, Clone)]
 pub(crate) struct AgentCreatePlan {
     /// Error-label method (`agent.create` / `workspace.create`) for the
     /// persist half's infrastructure failures.
     pub(crate) method: &'static str,
-    /// Workspace the session row belongs to. Passthrough/stamping invariant:
-    /// [`Services::plan_agent_create`] only forwards this field — none of its
-    /// checks read it — so `workspace.create` passes an empty placeholder
-    /// (the id is derived only after the plan, from the initial prompt) and
-    /// stamps the derived id here before [`Services::persist_agent_create`].
-    /// Store-backed seams (`agent.create` & co.) pass the real id up front.
-    /// A future API could drop workspace identity from the plan and take the
-    /// `WorkspaceId` as a persist argument instead, removing the placeholder
-    /// without changing `agent_create_op`'s signature (note only; not done).
-    pub(crate) workspace_id: WorkspaceId,
     pub(crate) parent_agent_id: Option<AgentId>,
     pub(crate) task_note_id: Option<NoteId>,
     pub(crate) skip_auto_commit: bool,
@@ -3925,10 +3917,10 @@ impl Services {
     /// This op is the thin `plan → persist` wrapper for the store-backed
     /// seams (`agent.create`, `agent.delegate`, `agent.wakeOrCreate`);
     /// `workspace.create` calls the two phases directly — plan right after
-    /// its request-shape preflight (before the workspaces root is resolved or
-    /// the workspace row is inserted; the plan's `workspace_id` is stamped
-    /// once the id is derived), persist after the insert (see the
-    /// `create_workspace` closure in `lib.rs`).
+    /// its request-shape preflight (before the workspaces root is resolved,
+    /// the id is derived, or the workspace row is inserted), persist after
+    /// the insert with the derived id (see the `create_workspace` closure in
+    /// `lib.rs`).
     ///
     /// Agent ids are server-assigned: the op always mints a fresh
     /// `agent-{uuid}` id (client-supplied ids are rejected `-32602` at the
@@ -3981,7 +3973,6 @@ impl Services {
         let plan = self
             .plan_agent_create(
                 "agent.create",
-                workspace_id,
                 name,
                 model,
                 specialist,
@@ -3992,7 +3983,9 @@ impl Services {
                 spec_wp.clone(),
             )
             .await?;
-        Ok(self.persist_agent_create(plan, spec_wp).await?)
+        Ok(self
+            .persist_agent_create(plan, workspace_id, spec_wp)
+            .await?)
     }
 
     /// Plan half of an agent create: runs, in order, every `-32602` producer
@@ -4015,7 +4008,6 @@ impl Services {
     pub(crate) async fn plan_agent_create(
         &self,
         method: &'static str,
-        workspace_id: WorkspaceId,
         name: Option<String>,
         model: Option<String>,
         specialist: Option<String>,
@@ -4194,7 +4186,6 @@ impl Services {
             .await?;
         Ok(AgentCreatePlan {
             method,
-            workspace_id,
             parent_agent_id,
             task_note_id,
             skip_auto_commit,
@@ -4224,18 +4215,23 @@ impl Services {
     /// internal / join failures remain possible and map to `-32603`; what the
     /// caller itself does between insert and persist is outside this claim).
     ///
-    /// `snapshot_wp` is the project-tier root for the *non-failing* specialist
-    /// snapshot (`resolve_prompt_injection` / `resolve_is_orchestrator`): the
-    /// stored workspace's worktree for the store-backed seams, the freshly
-    /// provisioned worktree at `baseRef` for `workspace.create`.
+    /// `workspace_id` is the workspace the session row belongs to: the stored
+    /// workspace's id for the store-backed seams, the id derived after the
+    /// plan (from the initial prompt) for `workspace.create`. No planner check
+    /// consults it, which is why it is a persist argument rather than a plan
+    /// field. `snapshot_wp` is the project-tier root for the *non-failing*
+    /// specialist snapshot (`resolve_prompt_injection` /
+    /// `resolve_is_orchestrator`): the stored workspace's worktree for the
+    /// store-backed seams, the freshly provisioned worktree at `baseRef` for
+    /// `workspace.create`.
     pub(crate) async fn persist_agent_create(
         &self,
         plan: AgentCreatePlan,
+        workspace_id: WorkspaceId,
         snapshot_wp: Option<PathBuf>,
     ) -> std::result::Result<Value, AgentPersistError> {
         let AgentCreatePlan {
             method,
-            workspace_id,
             parent_agent_id,
             task_note_id,
             skip_auto_commit,
@@ -5028,6 +5024,13 @@ impl Services {
         reason: Option<&str>,
     ) -> Result<Option<String>> {
         let now = now_iso();
+        // Unread state observed BEFORE the retire write (derived + stored
+        // flag): a retired session drops out of the unread derivation, so
+        // this is the snapshot the post-retire settle below needs. Both
+        // reads fail closed on emission (derived `false`, stored `unread`),
+        // so a transient probe failure can never publish a spurious
+        // `{ none }` through the settle's fallback.
+        let before = self.snapshot_workspace_unread(&session.workspace_id).await;
         // CAS write: only the request that actually flips NULL → set emits
         // the event.
         let transitioned = self
@@ -5087,6 +5090,21 @@ impl Services {
         // pending attention request or unanswered question goes inert with
         // the row): recompute-and-compare (§6.5 step 0).
         self.maybe_emit_display_status_changed(&session.workspace_id)
+            .await;
+        // A retired session no longer counts toward the workspace's derived
+        // `unread` (the FE cannot land on a hidden agent to read it), so
+        // settle the stored flag exactly as the last seen-marker advance
+        // would: when this was the last unread top-level session, clear the
+        // stored `unread` and emit ONE `workspace:attention-changed { none }`
+        // (`review_required` untouched; a still-unread workspace stays
+        // silent). Runs after the displayStatus recompute so the attention
+        // rungs settle before the blue dot; the cascade retires children
+        // through this same path. Exact-once under concurrency: the guarded
+        // UPDATE inside the settle affects a row for only one of several
+        // concurrent retires (or seen-marker advances) racing on the same
+        // stored `unread`, and the pre-write snapshot keeps the losers out
+        // of the stored-flag-already-clear fallback.
+        self.settle_workspace_unread_after_seen(&session.workspace_id, before)
             .await;
         // The watch/group sweep above may have removed the workspace's last
         // waiting reason (watches feed
@@ -5148,6 +5166,11 @@ impl Services {
         .await;
         self.maybe_emit_display_status_changed(&session.workspace_id)
             .await;
+        // Restore is SILENT for the workspace `unread` state (decision): the
+        // stored flag is NOT re-raised and no `workspace:attention-changed`
+        // is emitted. Read paths (`workspace.get` / `workspace.list`)
+        // re-derive unread from the store predicate, so a restored session
+        // with an unseen assistant last message surfaces on the next fetch.
         // Re-engage the queue parked by the retired gates (`try_drain_queue`
         // / `deliver_wake_message`): nothing kicks the restored agent's drain
         // organically, so without this a wake parked during retirement would
@@ -7414,16 +7437,13 @@ impl Services {
                 "messageId exceeds maximum length of {MAX_MESSAGE_ID_LEN}"
             )));
         }
-        // Pre-write unread derivation (§5.1): whether the workspace read as
-        // unread BEFORE this marker advance, so the settle below only emits
-        // the workspace-level clear on an actual unread→none transition. A
-        // probe failure reads `false` — fail closed on emission (no spurious
-        // clear), the marker write is unaffected.
-        let was_unread = self
-            .store
-            .workspace_has_unread_top_level_session(&workspace_id)
-            .await
-            .unwrap_or(false);
+        // Pre-write unread snapshot (§5.1): whether the workspace read as
+        // unread (derived + stored flag) BEFORE this marker advance, so the
+        // settle below only emits the workspace-level clear on an actual
+        // unread→none transition — and exactly once when several advances
+        // race on the same stored `unread`. Probe failures fail closed on
+        // emission (no spurious clear); the marker write is unaffected.
+        let before = self.snapshot_workspace_unread(&workspace_id).await;
         for _ in 0..MARK_SEEN_CAS_ATTEMPTS {
             // Metadata-only lookup (no transcript hydration); workspace
             // mismatch surfaces as NotFound (defense-in-depth against
@@ -7504,8 +7524,9 @@ impl Services {
             // clear the stored legacy flag + emit ONE
             // `workspace:attention-changed { none }`. A workspace with other
             // unread sessions — or one that was not unread to begin with —
-            // stays silent.
-            self.settle_workspace_unread_after_seen(&workspace_id, was_unread)
+            // stays silent; a concurrent advance that loses the guarded
+            // clear stays silent too.
+            self.settle_workspace_unread_after_seen(&workspace_id, before)
                 .await;
             return Ok(json!({
                 "success": true,
@@ -8036,9 +8057,11 @@ impl Services {
             let mut metadata = json!({
                 "type": "event_notification",
                 "eventCount": 1,
+                // event-type-lint: allow — wake-metadata pseudo-type; never published on the bus
                 "eventTypes": ["agent:reportToParent"],
                 "events": [{
                     "id": uuid::Uuid::new_v4().to_string(),
+                    // event-type-lint: allow — wake-metadata pseudo-type; never published on the bus
                     "type": "agent:reportToParent",
                     "timestamp": saved_at,
                     "data": {
@@ -12275,8 +12298,19 @@ impl Services {
             // mid-migration, sidestepping the helper's theoretical
             // failure-path duplicate (the rollback restore racing a
             // concurrent dequeue of an already-migrated entry).
+            //
+            // Everything keyed on a workspace from here on uses the live
+            // target's HOME, not the task/caller workspace
+            // (intent-hq/intent#5046): the migration helper's
+            // target-workspace guard would otherwise reject every
+            // cross-workspace target and strand its poisoned siblings'
+            // queues on each wake; `deliver_wake_message` rebinds to the
+            // same home itself; and the explicit drain kick below keys on
+            // it so the drained turn spawns where the wake did, never under
+            // the caller's workspace.
+            let target_home_ws = session.workspace_id.clone();
             let failed = self
-                .migrate_poisoned_queues_to(&poisoned, &agent_id, &workspace_id)
+                .migrate_poisoned_queues_to(&poisoned, &agent_id, &target_home_ws)
                 .await;
             // Failed migrations stay assigned (and out of the response's
             // `cleanedUpAgentIds`) so the next wakeOrCreate retries them.
@@ -12306,7 +12340,7 @@ impl Services {
                     tokio::spawn({
                         let mgr = mgr.clone();
                         let agent_id = agent_id.clone();
-                        let workspace_id = workspace_id.clone();
+                        let workspace_id = target_home_ws;
                         async move {
                             mgr.try_drain_queue(agent_id, workspace_id).await;
                         }
@@ -12812,16 +12846,48 @@ impl Services {
         // without it a wake racing an `agent.delete` parks a phantom entry no
         // drain can ever deliver. The append-failure arms keep their own
         // NotFound re-check as the check-then-act race guard.
-        if matches!(
-            self.store.get_agent_session_status(agent_id).await,
-            Err(Error::NotFound(_))
-        ) {
-            self.drop_queue(agent_id);
-            return Err(Error::InvalidParams(format!(
-                "unknown agent id: {}",
-                agent_id.0
-            )));
-        }
+        //
+        // The same session read binds the delivery to the target's OWN
+        // session workspace (intent-hq/intent#5046, the wake-path residual
+        // of intent-hq/intent#5017): `agent.wakeOrCreate` passes the waking
+        // CALLER's workspace, which `check_watch_scope` lets differ from the
+        // target's home (a sibling caller waking a chief-homed agent), and
+        // every scope-sensitive step below — the archived gate, the
+        // `try_begin` claim, the event echo, the drain kicks, and the spawn
+        // (`ensure_started` → `resolve_spawn` cwd + `create_agent`
+        // workspace-MCP scope) — must key on the workspace the target lives
+        // in. Any other lookup error fails CLOSED like the send routes'
+        // `require_agent_session`: unlike the archived/retired gates below
+        // (which fail open because their fallback is the normal path), a
+        // failed read here means the destination identity is unknown, and
+        // binding to the caller's workspace would be exactly the scope leak
+        // this guard exists to prevent. Nothing has been claimed, queued or
+        // published yet, so the caller may simply retry; the queue is left
+        // intact (only a confirmed-vanished session drops it).
+        let workspace_id = match self.store.get_agent_session_summary(agent_id).await {
+            Ok(session) => crate::agent_manager::AgentManager::session_workspace(
+                agent_id,
+                workspace_id,
+                &session,
+            ),
+            Err(Error::NotFound(_)) => {
+                self.drop_queue(agent_id);
+                return Err(Error::InvalidParams(format!(
+                    "unknown agent id: {}",
+                    agent_id.0
+                )));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent = %agent_id.0,
+                    workspace = %workspace_id.as_str(),
+                    error = %e,
+                    "wake delivery: session lookup failed; refusing to bind the delivery to the requested workspace"
+                );
+                return Err(e);
+            }
+        };
+        let workspace_id = &workspace_id;
         // A2A sender header (intent-hq/intent#3721, monorepo#1015): the wake front door — the
         // `agent.wakeOrCreate` context message carries the daemon-stamped
         // attribution, and this path persists/enqueues directly (it never
@@ -13564,6 +13630,7 @@ impl Services {
         };
         !events.is_empty()
             && events.iter().all(|e| {
+                // event-type-lint: allow — matches the wake-metadata pseudo-type above
                 e.get("type").and_then(|t| t.as_str()) == Some("agent:reportToParent")
                     && e.get("data")
                         .and_then(|d| d.get("agentId"))

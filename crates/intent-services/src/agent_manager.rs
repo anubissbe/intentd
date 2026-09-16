@@ -11,12 +11,28 @@
 //! `agent-process-registry` (acquire/register/markActive/markIdle/deregister +
 //! a global concurrency cap with LRU idle eviction); full timer/memory-pressure
 //! reaping is M5, exposed here as the [`AgentManager::reap_idle`] hook.
+//!
+//! Session-workspace invariant (intent-hq/intent#5017): an agent is always
+//! activated in ITS OWN session workspace — the `AgentSession.workspace_id`
+//! it was created in — never in the workspace the activating caller happens
+//! to be scoped to. Every delivery front door that can start a turn
+//! (`send_message`, `interrupt_send_message`, `send_queued_message_now`, and
+//! `Services::deliver_wake_message` — the `agent.wakeOrCreate` / hook /
+//! PR-monitor wake path, intent-hq/intent#5046) rebinds the caller-supplied
+//! workspace to the session's via [`AgentManager::session_workspace`] BEFORE
+//! any scope-sensitive step (the archived gate, the `try_begin` claim, event
+//! echoes, and the spawn: `ensure_started` → `resolve_spawn` cwd +
+//! `create_agent` workspace-MCP scope). A cross-workspace `ws.agent.send` /
+//! `ws.agent.sendToTask` / `ws.agent.wakeOrCreate` arrives keyed on the
+//! SENDER's bridge workspace; without the rebind the woken child would run
+//! in the sender's checkout with a `workspace_api` bridge scoped to the
+//! sender's workspace.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use intent_acp::handshake::try_bypass_permissions_mode;
 use intent_acp::session::{ContentBlock, McpServer, SessionModeState, StopReason};
@@ -2233,6 +2249,16 @@ pub struct AgentManager {
     /// `agent.sendMessage` consults this to flip a message to the queue while a
     /// turn is mid-stream (the TS "queue while streaming" semantics).
     busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Start of the current stretch with no turn in flight: `Some(boot)`
+    /// initially, cleared on the `busy` empty → non-empty edge and re-armed
+    /// on the non-empty → empty edge. Every access — the two writers AND the
+    /// [`Self::idle_since`] reader — happens under the `busy` lock (lock
+    /// order busy → `idle_since`), so the pair (`busy`, `idle_since`) is always
+    /// observed consistently and a turn that starts AND ends between two
+    /// samples still moves the timestamp forward. Consulted by the
+    /// composition root's continuous-idle gate for the sitter update
+    /// handshake.
+    idle_since: Arc<Mutex<Option<Instant>>>,
     /// Agents claimed by the idle-reap sweep for the duration of their kill
     /// (monorepo#2118). The claim is taken under the `busy` lock (lock order
     /// busy → `reap_claims`, matching `try_begin`'s read), so "not busy →
@@ -2425,6 +2451,7 @@ impl AgentManager {
             antigravity_state_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
+            idle_since: Arc::new(Mutex::new(Some(Instant::now()))),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
@@ -5575,7 +5602,9 @@ impl AgentManager {
 
     /// Snapshot every agent with a turn currently in flight together with its
     /// owning workspace. This is the daemon-global source for
-    /// `agent.listActive`; it never scans persisted workspaces or sessions.
+    /// `agent.listActive` and the composition root's idle gate for the
+    /// sitter update handshake; it never scans persisted workspaces or
+    /// sessions.
     ///
     /// Lock-order invariant: `busy` is always acquired before `agent_ws`
     /// (here and in every `busy/agent_ws` mutator — `try_begin`,
@@ -5583,7 +5612,11 @@ impl AgentManager {
     /// while holding the `busy` lock. That makes a claim/release visible
     /// atomically from this snapshot's perspective: a busy agent always has
     /// its `agent_ws` entry.
-    pub(crate) fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
         let busy = self.busy.lock().unwrap();
         let agent_ws = self.agent_ws.lock().unwrap();
         let mut active = busy
@@ -5753,11 +5786,39 @@ impl AgentManager {
         self.services
             .clear_live_turn_unless_flush_in_flight(agent_id);
         busy.insert(agent_id.clone());
+        if busy.len() == 1 {
+            *self.idle_since.lock().unwrap() = None;
+        }
         self.agent_ws
             .lock()
             .unwrap()
             .insert(agent_id.clone(), workspace_id.clone());
         Ok(claimed)
+    }
+
+    /// Start of the current continuous stretch with no turn in flight, or
+    /// `None` while any agent holds an in-flight slot. Maintained on the
+    /// `busy` empty/non-empty edges under the `busy` lock, so — unlike
+    /// sampling [`Self::list_busy`] — a turn that begins and ends between two
+    /// reads is still reflected: the returned instant is never earlier than
+    /// the end of the most recent turn.
+    ///
+    /// The read takes the `busy` lock first (busy → `idle_since`, the
+    /// writers' order) and answers `None` whenever `busy` is non-empty, so it
+    /// is atomic against [`Self::claim_slot_sync`] / [`Self::release_slot_sync`]:
+    /// it can never return the stale pre-turn `Some` in the window between a
+    /// slot becoming visible in `busy` and the timestamp being cleared — a
+    /// `Some` answer means no turn was in flight at the instant of the read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn idle_since(&self) -> Option<Instant> {
+        let busy = self.busy.lock().unwrap();
+        if !busy.is_empty() {
+            return None;
+        }
+        *self.idle_since.lock().unwrap()
     }
 
     /// The turn-start side effects of a successful slot claim — the
@@ -5869,6 +5930,9 @@ impl AgentManager {
         let mut busy = self.busy.lock().unwrap();
         if !busy.remove(agent_id) {
             return None;
+        }
+        if busy.is_empty() {
+            *self.idle_since.lock().unwrap() = Some(Instant::now());
         }
         // Drop a stale auto-unarchive prompt flag with the slot: a claim
         // whose turn never built a prompt (harness wake turns, a persist
@@ -6226,6 +6290,33 @@ impl AgentManager {
         self.workers.lock().unwrap().remove(agent_id);
     }
 
+    /// The workspace a delivery to `agent_id` is bound to: the target's OWN
+    /// session workspace (intent-hq/intent#5017). A cross-workspace
+    /// `ws.agent.send` / `ws.agent.sendToTask` reaches the runtime with the
+    /// SENDER's bridge workspace as `requested`; honouring it would spawn the
+    /// woken child in the sender's checkout with a `workspace_api` bridge
+    /// scoped to the sender's workspace, claim the in-flight slot under the
+    /// wrong workspace activity, and publish the turn's events into the
+    /// wrong workspace. A mismatch is logged (it names the caller-side scope
+    /// leak) and the session's workspace wins. Shared with
+    /// `Services::deliver_wake_message` (intent-hq/intent#5046), whose
+    /// `agent.wakeOrCreate` callers pass the waking caller's workspace.
+    pub(crate) fn session_workspace(
+        agent_id: &AgentId,
+        requested: &WorkspaceId,
+        session: &AgentSession,
+    ) -> WorkspaceId {
+        if *requested != session.workspace_id {
+            tracing::debug!(
+                agent = %agent_id,
+                requested = %requested.as_str(),
+                session_workspace = %session.workspace_id.as_str(),
+                "delivery workspace differs from the target's session workspace; binding to the session workspace (intent-hq/intent#5017)"
+            );
+        }
+        session.workspace_id.clone()
+    }
+
     /// `agent.sendMessage` runtime path (§5.5/§6.8): when a turn is already in
     /// flight, enqueue (the worker flips it to in-flight when the current turn
     /// ends); otherwise persist the user message (under the client-supplied
@@ -6281,6 +6372,14 @@ impl AgentManager {
         // a truncated/mistyped id must not claim the slot or queue a phantom
         // message that never drains (the sender then waits forever).
         let session = self.services.require_agent_session(&agent_id).await?;
+        // Bind the delivery to the target's OWN session workspace
+        // (intent-hq/intent#5017): a cross-workspace `ws.agent.send` arrives
+        // with the SENDER's bridge workspace, and every scope-sensitive step
+        // below — the archived gate, the `try_begin` claim, the event echo,
+        // and the spawn (`ensure_started` → `resolve_spawn` cwd +
+        // `create_agent` workspace-MCP scope) — must key on the workspace
+        // the target lives in, not the caller's.
+        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
         // Quarantine gate (monorepo#840): a provably-poisoned session (parked
         // in Error with a session-fatal provider block, or a streak of
         // identical terminal failures) must NOT be redriven by message
@@ -7078,6 +7177,12 @@ impl AgentManager {
         // monorepo#564: fail closed on a nonexistent target BEFORE touching
         // the queue.
         let session = self.services.require_agent_session(&agent_id).await?;
+        // Bind the activation to the target's OWN session workspace
+        // (intent-hq/intent#5017): the router forwards the CALLER's
+        // `workspaceId` unchanged, and the `try_begin` claim, the queue /
+        // status events, and the spawn below must key on the workspace the
+        // target lives in (see the module-header invariant).
+        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
         // Quarantine gate (monorepo#840): a provably-poisoned session must
         // not be redriven by delivery — every replay deterministically
         // fails. The entry STAYS in the queue (no side effects); the absent
@@ -7425,7 +7530,11 @@ impl AgentManager {
         options.interrupt_priority = true;
         // monorepo#564: reject nonexistent targets BEFORE the dedup record or
         // any preemption — same fail-closed guard as `send_message`.
-        self.services.require_agent_session(&agent_id).await?;
+        let session = self.services.require_agent_session(&agent_id).await?;
+        // Same session-workspace binding as `send_message`
+        // (intent-hq/intent#5017): the archived gate below keys on the
+        // target's home workspace, not the sender's bridge scope.
+        let workspace_id = Self::session_workspace(&agent_id, &workspace_id, &session);
         // Duplicate-delivery guard: check-and-record is atomic under the lock,
         // so of two racing duplicates exactly one proceeds. Runs BEFORE the
         // archived gate below so a parked interrupt still records its id and
@@ -10574,14 +10683,15 @@ async fn run_message_worker(
                             // `interrupted_agent` row) and emitted the
                             // interrupted terminal `agent:stream:end` — NOT
                             // `agent:failed`. Suppress the terminal-failure path
-                            // (no Error status, no manual-retry surface): settle
-                            // the session to idle and stop the worker, leaving
-                            // the enrolled turn for the wake orchestrator (Task
-                            // D) to resume. Placed before the pre-output redrive
-                            // arm so a suspend-overlapping pre-output failure is
-                            // resumed via `session/load` (preserving the partial
-                            // turn) rather than silently redriven on a fresh
-                            // child.
+                            // (no Error status, no manual-retry surface) and
+                            // fall through to the end-of-turn drain below,
+                            // leaving the enrolled turn for the wake
+                            // orchestrator (Task D) to resume. Placed before
+                            // the pre-output redrive arm so a
+                            // suspend-overlapping pre-output failure is
+                            // resumed via `session/load` (preserving the
+                            // partial turn) rather than silently redriven on a
+                            // fresh child.
                             tracing::info!(
                                 agent = %agent_id,
                                 error = %e,
@@ -10600,8 +10710,26 @@ async fn run_message_worker(
                             // child and reload the persisted session via
                             // `session/load` (or the recreate fallback).
                             mgr.kill_child_only(&agent_id).await;
-                            mgr.end_turn(&agent_id).await;
-                            break 'outer;
+                            // Do NOT `end_turn` + `break 'outer` here
+                            // (intent-hq/intent#4972): the enrollment's
+                            // self-heal (and the wake sweep) deliver the
+                            // resume continuation through `send_message`,
+                            // and when that send lands while this worker
+                            // still holds the in-flight slot — the debounce
+                            // is a timer, and under load the enrollment
+                            // persist + `kill_child_only` above outlast it —
+                            // it loses `try_begin` and is parked in the queue.
+                            // A `break` exits without a drain pass and the
+                            // session is `RuntimeIdle`, not `Error`, so the
+                            // parked-recovery-send redrive at the worker exit
+                            // does not cover it either: the continuation
+                            // strands until an unrelated message arrives.
+                            // Falling through to the shared end-of-turn drain
+                            // (the benign-error arm's contract) delivers a
+                            // parked continuation on this worker — spawning a
+                            // fresh child that reloads the session — and, when
+                            // nothing is queued, releases the slot with the
+                            // same `end_turn` and exits.
                         } else if !silent_redrive_used && pre_output_transport_failure(&e) {
                             // Silent redrive (monorepo#764): the transport closed
                             // before the turn streamed anything — the prompt
@@ -11111,7 +11239,8 @@ async fn run_message_worker(
 /// completion is its parent/coordinator's attention surface, not the
 /// user's. Same sub-agent definition as the attention-clear gate above and
 /// rules.rs. `NotFound` means the agent was deleted while its drain
-/// finished — nothing to surface, skip. Archived workspaces additionally
+/// finished — nothing to surface, skip. A soft-retired session (`retired_at`
+/// set) is inert and skips the raise too. Archived workspaces additionally
 /// stay quiet: a turn finishing in a workspace whose status is `Archived`
 /// skips the raise (the user parked the workspace; unarchiving restores
 /// normal behavior — no persisted suppression state). FAIL OPEN on any
@@ -11131,7 +11260,7 @@ pub(crate) async fn should_raise_turn_end_unread(services: &Services, agent_id: 
             return true;
         }
     };
-    if session.parent_agent_id.is_some() || session.is_background {
+    if session.parent_agent_id.is_some() || session.is_background || session.retired_at.is_some() {
         return false;
     }
     match services.store.get_workspace(&session.workspace_id).await {

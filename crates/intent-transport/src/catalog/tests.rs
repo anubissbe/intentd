@@ -133,7 +133,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// already-shipped `accept-changes.*` / `file-tracking.*` router arms were never
 /// frozen here. No protocol bump — the wire surface did not change.
 ///
-/// Execution environments (protocol 10.2): +4 router methods
+/// Execution environments (protocol 10.3): +4 router methods
 /// (`sandbox.profiles.list` / `sandbox.profiles.update` / `sandbox.options` /
 /// `sandbox.image.check`).
 const EXPECTED_TOTAL_METHODS: usize = 370;

@@ -12,14 +12,17 @@
 //! [`v2_2`] rewrites the workspace status-message guidance to one short
 //! plain sentence; [`v2_3`] rewords the `## Suggested Next Steps` prompt
 //! hint so suggestions are levers on the plan, not a restatement of it,
-//! byte-pinned by `crate::v2_3_goldens`). Call sites carry typed data
-//! into the harness and never format doctrine/envelope text themselves, so a
+//! byte-pinned by `crate::v2_3_goldens`; [`v2_4`] extends that hint so
+//! prompts may carry markdown inline links for clickable PR/issue
+//! references, byte-pinned by `crate::v2_4_goldens`; [`v2_5`] keeps those
+//! text surfaces while versioning three PR-context specialists). Call sites carry
+//! typed data into the harness and never format doctrine/envelope text themselves, so a
 //! future version can reword or reorder surfaces without touching managers.
 //! A new version that changes no text surface reuses the prior version's
 //! harness singleton and swaps only its doctrine (as [`v1_1`]–[`v2_2`] do);
 //! one that rewords a surface adds a unit struct whose [`Harness`] impl
 //! forwards every method to the prior implementation and overrides only
-//! what changed (as [`v2_3`] does) — the v(N)→v(N+1) diff is exactly the
+//! what changed (as [`v2_3`] and [`v2_4`] do) — the v(N)→v(N+1) diff is exactly the
 //! changed surfaces, and the compiler enforces the forwarding set.
 //!
 //! Wake/queue system messages (hook/PR-monitor/watch wakes, dequeue notes,
@@ -32,7 +35,7 @@
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
 //! session `harnessVersion` (`"1.0"`, `"1.1"`, `"2.0"`, `"2.1"`, `"2.2"`,
-//! or `"2.3"`) to the pair, so a session keeps assembling the exact doctrine
+//! `"2.3"`, `"2.4"`, or `"2.5"`) to the pair, so a session keeps assembling the exact doctrine
 //! it was created with even after the binary ships a newer set. All past
 //! versions stay bundled.
 
@@ -42,6 +45,8 @@ pub(crate) mod v2;
 pub(crate) mod v2_1;
 pub(crate) mod v2_2;
 pub(crate) mod v2_3;
+pub(crate) mod v2_4;
+pub(crate) mod v2_5;
 
 use crate::agent_ops::ready_delta::UnblockedTask;
 use crate::pr_monitor::PrMonitorSnapshot;
@@ -443,6 +448,8 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v2_1::ENTRY,
     &v2_2::ENTRY,
     &v2_3::ENTRY,
+    &v2_4::ENTRY,
+    &v2_5::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -499,8 +506,9 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "2.3");
-        assert_eq!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
+        assert_eq!(entry.version, "2.5");
+        assert_eq!(next_steps(entry.harness), next_steps(&v2_4::V2_4));
+        assert_ne!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
         assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));
     }
 
@@ -574,7 +582,7 @@ mod tests {
     fn latest_is_current_harness_version() {
         assert_eq!(LATEST_VERSION, intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(latest_entry().version, LATEST_VERSION);
-        assert_eq!(next_steps(latest()), next_steps(&v2_3::V2_3));
+        assert_eq!(next_steps(latest()), next_steps(&v2_4::V2_4));
         assert_ne!(next_steps(latest()), next_steps(&v1::V1));
     }
 
@@ -686,5 +694,70 @@ mod tests {
             v2_2.harness.commit_policy_clause(),
             v2_3.harness.commit_policy_clause()
         );
+    }
+
+    /// v2.4 keeps v2.3's doctrine byte-for-byte and swaps only the
+    /// text-surface implementation, so the diff is exactly the extended
+    /// suggested-next-steps block (markdown-link guidance).
+    #[test]
+    fn v2_4_extends_only_suggested_next_steps() {
+        let v2_3 = resolve_entry("2.3");
+        let v2_4 = resolve_entry("2.4");
+        assert_eq!(v2_3.doctrine.specialists, v2_4.doctrine.specialists);
+        assert!(std::ptr::eq(
+            v2_3.doctrine.instructions,
+            v2_4.doctrine.instructions
+        ));
+        assert_eq!(next_steps(v2_4.harness), next_steps(&v2_4::V2_4));
+        for auto_commit in [false, true] {
+            assert_ne!(
+                v2_3.harness.suggested_next_steps_block(auto_commit),
+                v2_4.harness.suggested_next_steps_block(auto_commit)
+            );
+        }
+        assert!(next_steps(v2_4.harness).contains("[label](url)"));
+        assert!(!next_steps(v2_3.harness).contains("[label](url)"));
+        assert_eq!(
+            v2_3.harness.ask_questions_block(),
+            v2_4.harness.ask_questions_block()
+        );
+        assert_eq!(
+            v2_3.harness.commit_policy_clause(),
+            v2_4.harness.commit_policy_clause()
+        );
+    }
+
+    #[test]
+    fn v2_5_versions_only_pr_context_specialists() {
+        let v2_4 = resolve_entry("2.4");
+        let v2_5 = resolve_entry("2.5");
+        assert!(std::ptr::eq(
+            v2_4.doctrine.instructions,
+            v2_5.doctrine.instructions
+        ));
+        assert_eq!(next_steps(v2_4.harness), next_steps(v2_5.harness));
+        assert_eq!((v2_4.default_features)(), (v2_5.default_features)());
+        assert_eq!(v2_4.feature_labels, v2_5.feature_labels);
+        assert_eq!(
+            v2_5.doctrine.specialists,
+            crate::specialists::EMBEDDED_BUNDLED_V2_5
+        );
+        assert_eq!(
+            v2_4.doctrine.specialists.len(),
+            v2_5.doctrine.specialists.len()
+        );
+        for ((old_id, old_content), (new_id, new_content)) in v2_4
+            .doctrine
+            .specialists
+            .iter()
+            .zip(v2_5.doctrine.specialists.iter())
+        {
+            assert_eq!(old_id, new_id);
+            if matches!(*old_id, "implementor" | "spec-writer" | "verifier") {
+                assert_ne!(old_content, new_content, "{old_id} must be versioned");
+            } else {
+                assert_eq!(old_content, new_content, "{old_id} must not change");
+            }
+        }
     }
 }

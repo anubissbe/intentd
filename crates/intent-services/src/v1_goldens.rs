@@ -728,7 +728,7 @@ fn merge_requirements(
             changes_requested: 0,
         },
         threads: crate::pr_ops::MergeRequirementsThreads {
-            unresolved,
+            unresolved: Some(unresolved),
             resolution_required: Some(true),
         },
         merge_state_status: None,
@@ -739,7 +739,7 @@ fn merge_requirements(
     }
 }
 
-fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
+pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
     crate::pr_monitor::PrMonitorSnapshot {
         title: "feat: add adapter".to_string(),
         url: "https://github.com/o/r/pull/42".to_string(),
@@ -888,6 +888,17 @@ fn golden_pr_monitor_checklist_branch_lines() {
          - checks: 2 passed, 0 failed, 1 pending (of 3) (required-check flags unavailable)\n\
          - unresolved threads: 1\n\
          - (branch rules unreadable — approval/thread requirements unknown)"
+    );
+    // Thread resolution state unreadable (`threads.unresolved` absent): the
+    // row says so instead of printing a fabricated 0.
+    let mut s = pr_snapshot("open");
+    s.requirements.threads.unresolved = None;
+    assert_eq!(
+        crate::pr_monitor::render_checklist(&s),
+        "- state: open\n\
+         - approvals: review_required (0/1 required)\n\
+         - checks: 2 passed, 0 failed, 1 pending (of 3); pending required: build\n\
+         - unresolved threads: unknown (thread resolution state unreadable) (resolution required to merge)"
     );
 }
 
@@ -1615,7 +1626,8 @@ fn golden_supervisor_history_truncation_markers() {
 /// via a hermetic assembly with no workspace path (no rule files, no skills,
 /// no RTK — only the always-on layers). Assembled under a session pinned to
 /// `harnessVersion: "1.0"` so the bytes stay frozen as later versions reword
-/// surfaces (v2.3 rewords the next-steps layer; `v2_3_goldens` pins that).
+/// surfaces (v2.3/v2.4 reword the next-steps layer; `v2_3_goldens` /
+/// `v2_4_goldens` pin those).
 #[tokio::test]
 async fn golden_assembled_prompt_static_layers() {
     let (_t, svc, ws) = setup().await;
@@ -1853,8 +1865,8 @@ async fn golden_v1_session_assembles_v1_doctrine() {
     assert!(latest.contains("ws.workspace.proposeSibling"));
     // Only the doctrine layer differs between v1 and v2.2 (the last version
     // on v1 text surfaces): the static layers after the specialization
-    // rules are byte-identical. Latest (v2.3) additionally rewords the
-    // next-steps layer and nothing else.
+    // rules are byte-identical. Latest (v2.4, like v2.3) additionally
+    // rewords the next-steps layer and nothing else.
     session.harness_version = "2.2".to_string();
     let pinned_v2_2 = assemble(Some(session.clone())).await;
     let v2_2_rules = crate::instructions::get_instruction_with_common_for(

@@ -1475,6 +1475,328 @@ async fn wss_agent_soft_retire_and_restore_round_trip() {
     srv.ws.stop().await;
 }
 
+/// Retired agents drop out of attention and unread over the real WSS
+/// transport (§5.1 derived `attention`, §5.5 "Retire cascade & cleanup",
+/// §6.5): a top-level foreground agent with an unseen assistant tail and a
+/// pending discussion request reads `attention: "unread"` /
+/// `displayStatus: "needs_attention"`; retiring it settles both —
+/// `workspace.get` serves `attention: "none"`, a `displayStatus` other than
+/// `needs_attention`, and `agentSummary.count == 0` — and an
+/// `events.subscribe` subscriber sees `agent:retired`, exactly ONE
+/// `workspace:attention-changed { none }`, and a
+/// `workspace:displayStatus-changed` away from `needs_attention`.
+/// `agent.restore` is SILENT for the unread state: `workspace.get` re-derives
+/// `attention: "unread"` and `agentSummary.count == 1`, but the restore emits
+/// no `workspace:attention-changed`.
+///
+/// The assistant tail lands through the `agent.appendMessage` wire method;
+/// the discussion request and the retire go through the `WorkspaceApi` seams
+/// the MCP `ws.agent.requestDiscussion` / `ws.agent.retire` bindings route to
+/// (this harness has no agent runtime, and there is deliberately no wire
+/// `agent.retire`). A live self-retire always runs mid-turn, where the tail
+/// is the turn's user message, so the post-turn unread state under test is
+/// only reachable this way.
+#[tokio::test]
+async fn wss_agent_retire_settles_unread_and_needs_attention_restore_is_silent() {
+    async fn send_and_wait(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        frame: String,
+        id: i64,
+    ) -> Value {
+        ws.send(Message::Text(frame.into())).await.expect("send");
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let v: Value = serde_json::from_str(&text).expect("json");
+                    if v.get("id") == Some(&serde_json::json!(id)) {
+                        return v;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("expected text frame, got {other:?}"),
+            }
+        }
+    }
+    /// Next `events.event` frame of any type before `deadline`; `None` once
+    /// the deadline passes with no event.
+    async fn next_event_until(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
+        deadline: tokio::time::Instant,
+    ) -> Option<Value> {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" {
+                            return v["params"]["event"].clone();
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    let srv = start(WsOptions::default()).await;
+    srv.set_setting("model.defaultProvider", serde_json::json!("auggie"));
+    let created_ws = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.create","params":{"title":"Retire Unread"}}"#,
+    )
+    .await;
+    let ws_id = created_ws["result"]["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let workspace_id = WorkspaceId(ws_id.clone());
+    let created = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"agent.create","params":{{"workspaceId":"{ws_id}","name":"Elder"}}}}"#
+        ),
+    )
+    .await;
+    let agent_id = created["result"]["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let agent = intent_core::AgentId::from(agent_id.as_str());
+    let get_frame = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"workspace.get","params":{{"workspaceId":"{ws_id}"}}}}"#
+    );
+
+    // An unseen assistant tail: the derived `unread` reads on.
+    let appended = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"agent.appendMessage","params":{{"agentId":"{agent_id}","role":"assistant","contentBlocks":[{{"type":"text","text":"done with the review"}}]}}}}"#
+        ),
+    )
+    .await;
+    assert!(
+        appended["result"]["message"]["id"].is_string(),
+        "appendMessage: {appended}"
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(
+        ws_row["attention"], "unread",
+        "unseen assistant tail: {ws_row}"
+    );
+    assert_eq!(ws_row["agentSummary"]["count"], 1, "{ws_row}");
+    assert!(
+        ws_row["displayStatus"].is_string() && ws_row["displayStatus"] != "needs_attention",
+        "no attention request yet: {ws_row}"
+    );
+
+    // Subscribe BEFORE the raise/retire so no event can be missed.
+    let mut sub = connect_ws(srv.port, srv.cfg.clone()).await;
+    let subscribed = send_and_wait(
+        &mut sub,
+        format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"events.subscribe","params":{{"eventTypes":["agent:retired","agent:restored","workspace:attention-changed","workspace:displayStatus-changed"],"workspaceId":"{ws_id}"}}}}"#
+        ),
+        5,
+    )
+    .await;
+    assert!(
+        subscribed["result"]["subscriptionId"].is_string(),
+        "subscribe: {subscribed}"
+    );
+
+    // Pending discussion request → `needs_attention` (surfaces immediately:
+    // no turn in flight).
+    let raised = srv
+        .api
+        .agent_request_attention(
+            workspace_id.clone(),
+            "discussion".to_string(),
+            "need a decision before continuing".to_string(),
+            Some(agent.clone()),
+        )
+        .await
+        .expect("requestDiscussion");
+    assert_eq!(raised["ok"], serde_json::json!(true), "{raised}");
+    let promoted = next_event_until(
+        &mut sub,
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    )
+    .await
+    .expect("displayStatus promotion event");
+    assert_eq!(
+        promoted["type"], "workspace:displayStatus-changed",
+        "{promoted}"
+    );
+    assert_eq!(
+        promoted["data"],
+        serde_json::json!({ "workspaceId": ws_id, "displayStatus": "needs_attention" }),
+        "{promoted}"
+    );
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(ws_row["attention"], "unread", "{ws_row}");
+    assert_eq!(ws_row["displayStatus"], "needs_attention", "{ws_row}");
+
+    // Retire via the WorkspaceApi seam (the MCP `ws.agent.retire` binding).
+    let retired = srv
+        .api
+        .agent_retire(
+            agent.clone(),
+            Some(workspace_id.clone()),
+            Some("handing off".to_string()),
+        )
+        .await
+        .expect("retire");
+    assert_eq!(retired["success"], serde_json::json!(true), "{retired}");
+
+    // Collect the retire's events: `agent:retired`, ONE
+    // `workspace:attention-changed { none }`, and a
+    // `workspace:displayStatus-changed` away from `needs_attention`
+    // (relative order not asserted). Keep draining for a quiet window after
+    // the three arrive so a duplicate attention event would still be caught.
+    let mut retired_evt: Option<Value> = None;
+    let mut attention_evts: Vec<Value> = Vec::new();
+    let mut display_evts: Vec<Value> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut quiet_until: Option<tokio::time::Instant> = None;
+    loop {
+        let until = quiet_until.unwrap_or(deadline);
+        let Some(evt) = next_event_until(&mut sub, until).await else {
+            break;
+        };
+        match evt["type"].as_str().unwrap_or_default() {
+            "agent:retired" => retired_evt = Some(evt),
+            "workspace:attention-changed" => attention_evts.push(evt),
+            "workspace:displayStatus-changed" => display_evts.push(evt),
+            other => panic!("unexpected event after retire: {other}: {evt}"),
+        }
+        if quiet_until.is_none()
+            && retired_evt.is_some()
+            && !attention_evts.is_empty()
+            && !display_evts.is_empty()
+        {
+            quiet_until = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+        }
+    }
+    let retired_evt = retired_evt.expect("agent:retired");
+    assert_eq!(retired_evt["workspaceId"], ws_id.as_str(), "{retired_evt}");
+    assert_eq!(
+        retired_evt["data"]["agentId"],
+        agent_id.as_str(),
+        "{retired_evt}"
+    );
+    assert_eq!(retired_evt["data"]["agentName"], "Elder", "{retired_evt}");
+    assert_eq!(
+        retired_evt["data"]["reason"], "handing off",
+        "{retired_evt}"
+    );
+    assert_eq!(
+        retired_evt["data"]["retiredAt"], retired["retiredAt"],
+        "{retired_evt}"
+    );
+    assert_eq!(
+        attention_evts.len(),
+        1,
+        "retiring the last unread session emits exactly one attention event: {attention_evts:?}"
+    );
+    assert_eq!(attention_evts[0]["workspaceId"], ws_id.as_str());
+    assert_eq!(
+        attention_evts[0]["data"],
+        serde_json::json!({ "workspaceId": ws_id, "attention": "none" }),
+        "{:?}",
+        attention_evts[0]
+    );
+    assert!(
+        !display_evts.is_empty(),
+        "retire recomputes displayStatus away from needs_attention"
+    );
+    for evt in &display_evts {
+        assert_eq!(evt["workspaceId"], ws_id.as_str(), "{evt}");
+        assert_eq!(evt["data"]["workspaceId"], ws_id.as_str(), "{evt}");
+        assert_ne!(
+            evt["data"]["displayStatus"], "needs_attention",
+            "a retired session's request must not promote: {evt}"
+        );
+    }
+
+    // Read path after the retire.
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(
+        ws_row["attention"], "none",
+        "retired tail is not unread: {ws_row}"
+    );
+    assert!(
+        ws_row["displayStatus"].is_string() && ws_row["displayStatus"] != "needs_attention",
+        "retired request no longer promotes: {ws_row}"
+    );
+    assert_eq!(
+        ws_row["agentSummary"]["count"], 0,
+        "retired row leaves the card aggregate: {ws_row}"
+    );
+
+    // `agent.restore` over the wire: reads re-derive `unread`, and the
+    // restore itself emits NO `workspace:attention-changed`.
+    let restored = wss_call(
+        srv.port,
+        srv.cfg.clone(),
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"agent.restore","params":{{"workspaceId":"{ws_id}","agentId":"{agent_id}"}}}}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        restored["result"]["restored"],
+        serde_json::json!(true),
+        "{restored}"
+    );
+    let mut restored_evt: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut quiet_until: Option<tokio::time::Instant> = None;
+    loop {
+        let until = quiet_until.unwrap_or(deadline);
+        let Some(evt) = next_event_until(&mut sub, until).await else {
+            break;
+        };
+        match evt["type"].as_str().unwrap_or_default() {
+            "agent:restored" => {
+                assert_eq!(evt["data"]["agentId"], agent_id.as_str(), "{evt}");
+                restored_evt = Some(evt);
+                quiet_until = Some(tokio::time::Instant::now() + Duration::from_millis(1500));
+            }
+            "workspace:attention-changed" => {
+                panic!("agent.restore must be silent for the unread state: {evt}")
+            }
+            // The restored request may re-promote displayStatus; not under test.
+            "workspace:displayStatus-changed" => {}
+            other => panic!("unexpected event after restore: {other}: {evt}"),
+        }
+    }
+    assert!(restored_evt.is_some(), "agent:restored");
+    let got = wss_call(srv.port, srv.cfg.clone(), &get_frame).await;
+    let ws_row = &got["result"]["workspace"];
+    assert_eq!(
+        ws_row["attention"], "unread",
+        "restore re-derives the unseen tail on read: {ws_row}"
+    );
+    assert_eq!(
+        ws_row["agentSummary"]["count"], 1,
+        "restored row is back in the card aggregate: {ws_row}"
+    );
+
+    srv.ws.stop().await;
+}
+
 /// Retire cascade + cleanup over the real WSS transport (PROTOCOL §5.5):
 /// retiring a parent with an ACTIVE child is rejected (`InvalidParams`
 /// naming the child, nothing mutated); after the child settles the retire
@@ -5230,6 +5552,49 @@ async fn multi_bind_serves_every_configured_address() {
     }
 }
 
+/// Reserve one port on both loopback stacks for the partial-bind-failure
+/// test: a listening blocker on `127.0.0.1` (the address meant to fail) and a
+/// bound-but-NOT-listening `SO_REUSEADDR` guard on `::1` (the address meant
+/// to succeed). Without the guard, a parallel test could take the
+/// to-succeed endpoint between the reservation and the server's bind, and
+/// `start()` would fail on the wrong address (intent-hq/intent#4978).
+///
+/// What each socket excludes while held:
+/// - the listening blocker refuses every other bind of `127.0.0.1:port`,
+///   including the `SO_REUSEADDR` bind+listen a fixed-port test performs when
+///   it rebinds a remembered `free_port()` (they see `AddrInUse` and retry);
+/// - the guard takes `::1:port` out of every process's ephemeral (port 0)
+///   selection and refuses plain explicit binds, while the server's own
+///   `SO_REUSEADDR` listen on it still succeeds (two reuse-address sockets may
+///   share an endpoint when the earlier one is not listening). What it does
+///   NOT exclude is another explicit `SO_REUSEADDR` bind+listen on `::1:port`
+///   — and no remembered-port rebind in this suite can reach one: the
+///   IPv4-only rebinders (`free_port()` callers, the daemon's default bind
+///   set) never touch `::1`, and the dual-stack rebinders
+///   (`runtime_bind_address_list_applies_and_validates`,
+///   `multi_bind_serves_every_configured_address`) bind `127.0.0.1` first, so
+///   the listening blocker fails them before their `::1` bind runs. That is
+///   why the IPv6 side is the one meant to succeed.
+///
+/// Reservation of the pair is retried on a fresh ephemeral port when
+/// `::1:port` happens to be taken already; the server bind itself is never
+/// retried.
+fn reserve_dual_stack_port_with_v4_blocker() -> (StdTcpListener, tokio::net::TcpSocket, u16) {
+    for _ in 0..16 {
+        let blocker = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("blocker bind");
+        let port = blocker.local_addr().expect("blocker addr").port();
+        let guard = tokio::net::TcpSocket::new_v6().expect("guard socket");
+        guard.set_reuseaddr(true).expect("guard SO_REUSEADDR");
+        if guard
+            .bind((std::net::Ipv6Addr::LOCALHOST, port).into())
+            .is_ok()
+        {
+            return (blocker, guard, port);
+        }
+    }
+    panic!("could not reserve one port on both 127.0.0.1 and ::1");
+}
+
 /// monorepo#3314: partial bind failure is a hard error — when any address in
 /// the set cannot bind, `start()` fails and the addresses that DID bind are
 /// released (never silently serve fewer interfaces than configured).
@@ -5239,9 +5604,9 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
         eprintln!("skipping: IPv6 loopback unavailable");
         return;
     }
-    // Occupy a port on ::1 only, then ask for [127.0.0.1, ::1] on it.
-    let blocker = StdTcpListener::bind(("::1", 0)).expect("blocker bind");
-    let port = blocker.local_addr().expect("blocker addr").port();
+    // Occupy a port on 127.0.0.1 (listening) while keeping ::1 on the same
+    // port owned but bindable, then ask for [::1, 127.0.0.1] on it.
+    let (_blocker, _v6_guard, port) = reserve_dual_stack_port_with_v4_blocker();
 
     let (api, bus, _store, _registry, dir) = make_services(None, None).await;
     let tls = ensure_tls_certificate(dir.path()).expect("cert");
@@ -5251,8 +5616,8 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
     let opts = WsOptions {
         base_port: port,
         bind_addresses: vec![
-            Ipv4Addr::LOCALHOST.into(),
             std::net::Ipv6Addr::LOCALHOST.into(),
+            Ipv4Addr::LOCALHOST.into(),
         ],
         ..WsOptions::default()
     };
@@ -5260,18 +5625,20 @@ async fn multi_bind_partial_failure_is_all_or_nothing() {
     let err = ws
         .start()
         .await
-        .expect_err("start must fail when ::1 is occupied");
+        .expect_err("start must fail when 127.0.0.1 is occupied");
     assert!(
-        err.to_string().contains("::1"),
+        err.to_string().contains("127.0.0.1"),
         "bind error names the failing address: {err}"
     );
 
-    // All-or-nothing: the successfully-bound 127.0.0.1 listener was released.
+    // All-or-nothing: the successfully-bound ::1 listener was released. The
+    // non-listening guard answers connects with RST, so only a leaked server
+    // listener could make this connect succeed.
     assert!(
-        TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port))
             .await
             .is_err(),
-        "127.0.0.1:{port} must not accept after a partial bind failure"
+        "[::1]:{port} must not accept after a partial bind failure"
     );
 }
 
@@ -15939,6 +16306,8 @@ impl SystemControl for WatchHealthControl {
             fd_count: None,
             fd_limit: None,
             update_supported: false,
+            busy_agents: 0,
+            idle_update_check: intent_transport::IdleUpdateCheckStatus::default(),
         }
     }
     fn host_environment(&self) -> intent_transport::HostEnvironment {

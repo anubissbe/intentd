@@ -152,6 +152,10 @@ struct ForgeState {
     in_merge_queue: Option<bool>,
     /// The latest merge-queue removal event served by `merge_requirements`.
     merge_queue_removal: Option<MergeQueueRemoval>,
+    /// When set, `get_review_threads` fails with a non-rate-limit API error so
+    /// the requirements probe takes the REST review-comments fallback (no
+    /// per-thread resolution state).
+    review_threads_unreadable: bool,
 }
 
 impl Default for ForgeState {
@@ -164,6 +168,7 @@ impl Default for ForgeState {
             review_decision: ReviewDecision::ReviewRequired,
             in_merge_queue: None,
             merge_queue_removal: None,
+            review_threads_unreadable: false,
         }
     }
 }
@@ -373,7 +378,10 @@ impl SourceControl for StubForge {
         _: u64,
         _: PageParams,
     ) -> ScResult<Page<ReviewComment>> {
-        unsupported("list_review_comments")
+        Ok(Page {
+            items: Vec::new(),
+            next_cursor: None,
+        })
     }
     async fn reply_to_review_comment(
         &self,
@@ -390,6 +398,11 @@ impl SourceControl for StubForge {
         _: u64,
         _: PageParams,
     ) -> ScResult<Page<ReviewThread>> {
+        if self.state.lock().unwrap().review_threads_unreadable {
+            return Err(intent_sourcecontrol::Error::Api(
+                "review threads unavailable".into(),
+            ));
+        }
         Ok(Page {
             items: Vec::new(),
             next_cursor: None,
@@ -735,6 +748,13 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
     );
     assert_eq!(row["lastSnapshot"]["approvals"]["needed"], 1);
     assert_eq!(row["lastSnapshot"]["threads"]["resolutionRequired"], true);
+    // Readable thread resolution state: the known count is a number, and 0 is
+    // the ordinary clear value (never omitted for "all resolved").
+    assert_eq!(
+        row["lastSnapshot"]["threads"]["unresolved"],
+        json!(0),
+        "readable threads pin a numeric unresolved count: {row}"
+    );
 
     // The owning agent's per-turn state snapshot carries the monitor label.
     let snap = fx
@@ -743,6 +763,65 @@ async fn pr_monitor_list_carries_the_ui_payload_over_wss() {
         .await
         .expect("agent snapshot");
     assert_eq!(snap["prMonitors"], json!(["o/r#42"]), "snapshot: {snap}");
+}
+
+/// `threads.unresolved` over the wire (PROTOCOL §5.42 presence-detected
+/// convention): when the forge's per-thread resolution state is unreadable
+/// (a non-rate-limit threads failure → REST review-comments fallback) the key
+/// is OMITTED from `prMonitor.list`'s `lastSnapshot.threads` — never `null`,
+/// never inflated, never defaulted to `0` — while `resolutionRequired` stays
+/// present; a readable forge serves the numeric count again.
+#[tokio::test]
+async fn pr_monitor_list_omits_unreadable_threads_unresolved_over_wss() {
+    let fx = boot().await;
+    fx.forge.edit(|s| s.review_threads_unreadable = true);
+    let (monitor, requirements) = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register");
+    assert_eq!(requirements.threads.unresolved, None);
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        1,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(row["monitorId"], monitor.monitor_id.as_str());
+    let threads = row["lastSnapshot"]["threads"]
+        .as_object()
+        .expect("threads object");
+    assert!(
+        threads.get("unresolved").is_none(),
+        "unreadable resolution state: the key is omitted, not null/0: {row}"
+    );
+    assert_eq!(
+        threads.get("resolutionRequired"),
+        Some(&json!(true)),
+        "resolutionRequired stays present alongside the omitted count: {row}"
+    );
+
+    // The forge becomes readable again: the next poll serves the numeric
+    // count over the wire (0 = every thread resolved, an ordinary value).
+    fx.forge.edit(|s| s.review_threads_unreadable = false);
+    fx.services.poll_pr_monitors().await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let row = &listed["monitors"][0];
+    assert_eq!(
+        row["lastSnapshot"]["threads"]["unresolved"],
+        json!(0),
+        "readable again: the numeric count is back: {row}"
+    );
 }
 
 /// `isInMergeQueue` over the wire (PROTOCOL §5.42 additive-field convention):
@@ -1264,6 +1343,135 @@ async fn a_duplicate_monitor_is_refused_and_the_workspace_list_stays_single_over
     assert_eq!(rows[0]["monitorId"], second_monitor_id);
     assert_eq!(rows[0]["agentId"], second_id.as_str());
     assert_eq!(rows[0]["state"], "active");
+}
+
+/// Orphaned-monitor adoption (intent-hq/intent#5079): once the owner can no
+/// longer receive wakes (its session parked in `error`), a second agent's
+/// `ws.pr.monitor` on the same PR is no longer refused — it ADOPTS the
+/// owner's row: the success payload carries `adoptedFrom`, the SAME
+/// `monitorId` re-parents to the adopter with its stale pending state
+/// cleared, `prMonitor:registered` over the wire marks the adoption, and
+/// `prMonitor.list` stays single. The next change then wakes the adopter,
+/// not the dead owner, and a `prMonitor.flush` over the wire delivers to it.
+#[tokio::test]
+async fn a_monitor_owned_by_a_dead_agent_is_adopted_over_wss() {
+    let fx = boot().await;
+    let second_id = AgentId::from("agent-prmon-second");
+    fx.services
+        .store()
+        .insert_agent_session(&agent_session(&fx.ws_id, second_id.as_str()))
+        .await
+        .expect("seed second agent");
+    let api: Arc<dyn WorkspaceApi> = fx.services.clone();
+
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({
+            "eventTypes": ["prMonitor:registered", "prMonitor:emitted"],
+            "workspaceId": fx.ws_id.as_str(),
+        }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+
+    let started = api
+        .pr_monitor_start(fx.ws_id.clone(), fx.agent_id.clone(), 42, None)
+        .await
+        .expect("owner registers");
+    assert_eq!(started["ok"], json!(true), "{started}");
+    assert!(started.get("adoptedFrom").is_none(), "{started}");
+    let owner_monitor_id = started["monitor"]["monitorId"]
+        .as_str()
+        .expect("owner monitorId")
+        .to_string();
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], owner_monitor_id);
+    assert!(evt["data"].get("adoptedFrom").is_none(), "{evt}");
+
+    // A change accrues under the owner, then the owner dies (terminal
+    // `error` status) with that change still pending.
+    fx.forge.edit(|s| s.conversation_comments = 1);
+    fx.services.poll_pr_monitors().await;
+    fx.services
+        .store()
+        .set_agent_session_status(
+            &fx.ws_id,
+            &fx.agent_id,
+            AgentStatus::Error,
+            false,
+            &now_iso(),
+            None,
+        )
+        .await
+        .expect("owner fails");
+
+    let adopted = api
+        .pr_monitor_start(fx.ws_id.clone(), second_id.clone(), 42, None)
+        .await
+        .expect("adoption is a success payload");
+    assert_eq!(adopted["ok"], json!(true), "{adopted}");
+    assert!(adopted.get("refused").is_none(), "{adopted}");
+    assert_eq!(adopted["adoptedFrom"], fx.agent_id.as_str(), "{adopted}");
+    assert_eq!(
+        adopted["monitor"]["monitorId"], owner_monitor_id,
+        "same row"
+    );
+    assert_eq!(adopted["monitor"]["agentId"], second_id.as_str());
+    assert_eq!(adopted["monitor"]["state"], "active");
+    assert_eq!(adopted["monitor"]["hasPendingChanges"], false, "{adopted}");
+    assert_eq!(adopted["requirements"]["state"], "open");
+    let evt = next_event(&mut sub, "prMonitor:registered").await;
+    assert_eq!(evt["data"]["monitorId"], owner_monitor_id, "{evt}");
+    assert_eq!(evt["data"]["agentId"], second_id.as_str(), "{evt}");
+    assert_eq!(evt["data"]["adoptedFrom"], fx.agent_id.as_str(), "{evt}");
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        2,
+        "prMonitor.list",
+        json!({ "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    let rows = listed["monitors"].as_array().expect("monitors array");
+    assert_eq!(rows.len(), 1, "one monitor: {listed}");
+    assert_eq!(rows[0]["monitorId"], owner_monitor_id);
+    assert_eq!(rows[0]["agentId"], second_id.as_str());
+    assert_eq!(rows[0]["state"], "active");
+    assert_eq!(rows[0]["hasPendingChanges"], false);
+
+    // The next change belongs to the adopter: a wire flush wakes it.
+    fx.forge.edit(|s| s.conversation_comments = 2);
+    fx.services.poll_pr_monitors().await;
+    let flushed = wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.flush",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": owner_monitor_id }),
+    )
+    .await;
+    assert_eq!(flushed, json!({ "ok": true, "flushed": true }));
+    let evt = next_event(&mut sub, "prMonitor:emitted").await;
+    assert_eq!(evt["data"]["agentId"], second_id.as_str(), "{evt}");
+    let second_session = fx
+        .services
+        .store()
+        .get_agent_session(&second_id)
+        .await
+        .expect("second agent session");
+    assert!(
+        serde_json::to_string(&second_session.messages)
+            .unwrap()
+            .contains("[PR monitor o/r#42]"),
+        "the adopter receives the wake"
+    );
+    assert!(
+        !owner_messages(&fx).await.contains("[PR monitor o/r#42]"),
+        "the dead owner receives nothing"
+    );
 }
 
 /// A merged PR terminalizes the monitor: `prMonitor:completed` fires, the
