@@ -2461,6 +2461,7 @@ dependencies = [
  "intent-store",
  "intent-transport",
  "intent-voice",
+ "intentd-test-support",
  "libc",
  "nix 0.31.3",
  "openssl-sys",
@@ -2491,6 +2492,7 @@ version = "0.1.16"
 dependencies = [
  "directories",
  "flate2",
+ "intentd-test-support",
  "liblzma",
  "nix 0.31.3",
  "reqwest",
@@ -2506,6 +2508,14 @@ dependencies = [
  "toml",
  "tracing",
  "zip",
+]
+
+[[package]]
+name = "intentd-test-support"
+version = "0.0.0"
+dependencies = [
+ "nix 0.31.3",
+ "tempfile",
 ]
 
 [[package]]
