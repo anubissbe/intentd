@@ -11257,6 +11257,85 @@ async fn list_busy_reports_only_claimed_agents_with_their_workspace() {
     );
 }
 
+/// `idle_since` is maintained on the busy edges, not sampled: a turn that
+/// begins and ends between two reads still advances it, and a second
+/// concurrent turn keeps it cleared until the last slot releases.
+#[tokio::test]
+async fn idle_since_advances_across_a_turn_between_two_reads() {
+    let (_tmp, mgr) = manager().await;
+    let ws = WorkspaceId::from("ws-idle-since");
+    let (a, b) = (AgentId::from("agent-idle-a"), AgentId::from("agent-idle-b"));
+
+    let before = mgr.idle_since().expect("fresh manager is idle since boot");
+
+    assert!(mgr.try_begin(&a, &ws).await);
+    assert!(mgr.idle_since().is_none(), "a claim clears idle_since");
+    assert!(mgr.try_begin(&b, &ws).await);
+    mgr.end_turn(&a).await;
+    assert!(
+        mgr.idle_since().is_none(),
+        "still busy while another slot is held"
+    );
+    mgr.end_turn(&b).await;
+
+    let after = mgr
+        .idle_since()
+        .expect("idle again once the last slot releases");
+    assert!(
+        after > before,
+        "idle_since must move forward past the turn ({before:?} -> {after:?})"
+    );
+    assert_eq!(
+        mgr.idle_since(),
+        Some(after),
+        "idle_since is stable while nothing runs"
+    );
+}
+
+/// The reader is atomic against the writers: while a claim holds the `busy`
+/// lock with the slot already inserted but `idle_since` not yet cleared (the
+/// stale-`Some` window), `idle_since()` blocks rather than reading the stale
+/// timestamp, and once the writer releases it answers `None` because the
+/// read consults `busy` first.
+#[tokio::test]
+async fn idle_since_is_none_while_a_claim_is_mid_write() {
+    let (_tmp, mgr) = manager().await;
+    let mgr = Arc::new(mgr);
+    let id = AgentId::from("agent-idle-mid-write");
+    assert!(
+        mgr.idle_since().is_some(),
+        "fresh manager is idle since boot"
+    );
+
+    // Stage the writer's mid-critical-section state by hand: the slot is
+    // visible in `busy`, the timestamp is still the pre-turn `Some`.
+    let mut held = mgr.busy.lock().unwrap();
+    held.insert(id.clone());
+    assert!(mgr.idle_since.lock().unwrap().is_some());
+
+    let reader = {
+        let mgr = mgr.clone();
+        std::thread::spawn(move || mgr.idle_since())
+    };
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        !reader.is_finished(),
+        "reader must wait for the writer's busy lock, not read idle_since alone"
+    );
+    drop(held);
+    assert_eq!(
+        reader.join().expect("reader thread"),
+        None,
+        "a slot in busy means not idle even if the timestamp was not cleared yet"
+    );
+
+    // The inverse inconsistency (busy empty, timestamp cleared) cannot occur
+    // under the busy lock, but with busy drained the reader reports the
+    // timestamp as stored.
+    mgr.busy.lock().unwrap().remove(&id);
+    assert!(mgr.idle_since().is_some());
+}
+
 #[tokio::test]
 async fn list_active_projects_busy_agent_with_workspace_and_epoch_timestamp() {
     let tmp = TempDb::new();

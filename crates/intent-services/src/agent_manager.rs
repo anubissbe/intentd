@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use intent_acp::handshake::try_bypass_permissions_mode;
 use intent_acp::session::{ContentBlock, McpServer, SessionModeState, StopReason};
@@ -2215,6 +2215,16 @@ pub struct AgentManager {
     /// `agent.sendMessage` consults this to flip a message to the queue while a
     /// turn is mid-stream (the TS "queue while streaming" semantics).
     busy: Arc<Mutex<HashSet<AgentId>>>,
+    /// Start of the current stretch with no turn in flight: `Some(boot)`
+    /// initially, cleared on the `busy` empty → non-empty edge and re-armed
+    /// on the non-empty → empty edge. Every access — the two writers AND the
+    /// [`Self::idle_since`] reader — happens under the `busy` lock (lock
+    /// order busy → `idle_since`), so the pair (`busy`, `idle_since`) is always
+    /// observed consistently and a turn that starts AND ends between two
+    /// samples still moves the timestamp forward. Consulted by the
+    /// composition root's continuous-idle gate for the sitter update
+    /// handshake.
+    idle_since: Arc<Mutex<Option<Instant>>>,
     /// Agents claimed by the idle-reap sweep for the duration of their kill
     /// (monorepo#2118). The claim is taken under the `busy` lock (lock order
     /// busy → `reap_claims`, matching `try_begin`'s read), so "not busy →
@@ -2406,6 +2416,7 @@ impl AgentManager {
             antigravity_state_root: None,
             chief_cwd_root: None,
             busy: Arc::new(Mutex::new(HashSet::new())),
+            idle_since: Arc::new(Mutex::new(Some(Instant::now()))),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
@@ -5130,7 +5141,9 @@ impl AgentManager {
 
     /// Snapshot every agent with a turn currently in flight together with its
     /// owning workspace. This is the daemon-global source for
-    /// `agent.listActive`; it never scans persisted workspaces or sessions.
+    /// `agent.listActive` and the composition root's idle gate for the
+    /// sitter update handshake; it never scans persisted workspaces or
+    /// sessions.
     ///
     /// Lock-order invariant: `busy` is always acquired before `agent_ws`
     /// (here and in every `busy/agent_ws` mutator — `try_begin`,
@@ -5138,7 +5151,11 @@ impl AgentManager {
     /// while holding the `busy` lock. That makes a claim/release visible
     /// atomically from this snapshot's perspective: a busy agent always has
     /// its `agent_ws` entry.
-    pub(crate) fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn list_busy(&self) -> Vec<(AgentId, WorkspaceId)> {
         let busy = self.busy.lock().unwrap();
         let agent_ws = self.agent_ws.lock().unwrap();
         let mut active = busy
@@ -5308,11 +5325,39 @@ impl AgentManager {
         self.services
             .clear_live_turn_unless_flush_in_flight(agent_id);
         busy.insert(agent_id.clone());
+        if busy.len() == 1 {
+            *self.idle_since.lock().unwrap() = None;
+        }
         self.agent_ws
             .lock()
             .unwrap()
             .insert(agent_id.clone(), workspace_id.clone());
         Ok(claimed)
+    }
+
+    /// Start of the current continuous stretch with no turn in flight, or
+    /// `None` while any agent holds an in-flight slot. Maintained on the
+    /// `busy` empty/non-empty edges under the `busy` lock, so — unlike
+    /// sampling [`Self::list_busy`] — a turn that begins and ends between two
+    /// reads is still reflected: the returned instant is never earlier than
+    /// the end of the most recent turn.
+    ///
+    /// The read takes the `busy` lock first (busy → `idle_since`, the
+    /// writers' order) and answers `None` whenever `busy` is non-empty, so it
+    /// is atomic against [`Self::claim_slot_sync`] / [`Self::release_slot_sync`]:
+    /// it can never return the stale pre-turn `Some` in the window between a
+    /// slot becoming visible in `busy` and the timestamp being cleared — a
+    /// `Some` answer means no turn was in flight at the instant of the read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    pub fn idle_since(&self) -> Option<Instant> {
+        let busy = self.busy.lock().unwrap();
+        if !busy.is_empty() {
+            return None;
+        }
+        *self.idle_since.lock().unwrap()
     }
 
     /// The turn-start side effects of a successful slot claim — the
@@ -5424,6 +5469,9 @@ impl AgentManager {
         let mut busy = self.busy.lock().unwrap();
         if !busy.remove(agent_id) {
             return None;
+        }
+        if busy.is_empty() {
+            *self.idle_since.lock().unwrap() = Some(Instant::now());
         }
         // Drop a stale auto-unarchive prompt flag with the slot: a claim
         // whose turn never built a prompt (harness wake turns, a persist
