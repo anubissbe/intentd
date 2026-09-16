@@ -2724,6 +2724,9 @@ impl AgentManager {
                 // §7.1 deterministic attach: tool dispatch registers resource
                 // payloads into the same registry the transcript writer claims.
                 .with_turn_attachments(Some(self.services.turn_attachments()))
+                // intent-hq/intent#3802: the bundled pi extension's usage
+                // notifications land in the bucket the turn-end seam drains.
+                .with_extension_usage(Some(self.services.extension_usage()))
                 // The session's captured `[agentFeatures]` snapshot: settings
                 // changes after creation never mutate this session's surface,
                 // across respawns included.

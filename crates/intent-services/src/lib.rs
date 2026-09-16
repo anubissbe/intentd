@@ -968,6 +968,12 @@ pub struct Services {
     /// each agent's [`WorkspaceMcpServer`]) so registration and claim observe
     /// the same state.
     turn_attachments: Arc<intent_core::TurnAttachmentRegistry>,
+    /// Extension-reported usage buckets (intent-hq/intent#3802): the bundled
+    /// pi extension forwards each LLM call's usage over the per-agent MCP
+    /// bridge, and the turn-end accounting seam drains the bucket as the
+    /// turn's report. Shared across clones (and with each agent's
+    /// [`WorkspaceMcpServer`]) so record and drain observe the same state.
+    extension_usage: Arc<intent_acp::ExtensionUsageRegistry>,
     /// Per-agent in-flight sandbox-provisioning gates (monorepo#871). A
     /// delegate with `CoW` isolation kicks the clone off in a background task
     /// and returns immediately; the child's turn worker awaits the gate
@@ -1297,6 +1303,7 @@ impl Services {
             disk_usage: Arc::new(disk_usage::DiskUsageCache::new()),
             agent_list_cache: Arc::new(agent_list_cache::AgentListProjectionCache::new()),
             turn_attachments: Arc::new(intent_core::TurnAttachmentRegistry::new()),
+            extension_usage: Arc::new(intent_acp::ExtensionUsageRegistry::new()),
             sandbox_provisioning: Arc::new(Mutex::new(HashMap::new())),
             git_diffs_inflight: Arc::new(git_diff_singleflight::DiffSingleFlight::default()),
             git_diffs_slow_warns: Arc::new(git_diff_singleflight::SlowWalkWarnLimiter::default()),
@@ -1456,6 +1463,15 @@ impl Services {
     #[must_use]
     pub fn turn_attachments(&self) -> Arc<intent_core::TurnAttachmentRegistry> {
         self.turn_attachments.clone()
+    }
+
+    /// The shared extension-usage registry (intent-hq/intent#3802) — the
+    /// [`AgentManager`] hands this to each agent's `WorkspaceMcpServer` so
+    /// the bundled pi extension's usage notifications land in the bucket the
+    /// turn-end seam drains.
+    #[must_use]
+    pub fn extension_usage(&self) -> Arc<intent_acp::ExtensionUsageRegistry> {
+        self.extension_usage.clone()
     }
 
     /// Override the GitHub login host the device flow talks to (§5.27 test

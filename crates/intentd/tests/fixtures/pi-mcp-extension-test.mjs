@@ -27,7 +27,7 @@ const tmpDir = mkdtempSync(path.join(os.tmpdir(), "pi-mcp-ext-test-"));
 const extMjs = path.join(tmpDir, "pi_mcp_extension.mjs");
 copyFileSync(extPath, extMjs);
 const ext = await import(pathToFileURL(extMjs).href);
-const { McpLineClient, mapToolResult } = ext;
+const { McpLineClient, mapToolResult, mapUsageReport, USAGE_NOTIFICATION } = ext;
 
 function spawnMock() {
   return spawn(process.execPath, [mockPath], { stdio: ["pipe", "pipe", "inherit"] });
@@ -101,11 +101,86 @@ function spawnMock() {
   );
 }
 
+// --- 3b. mapUsageReport mapping (intent-hq/intent#3802) -------------------
+{
+  assert.equal(USAGE_NOTIFICATION, "notifications/intentd/usage");
+  const full = mapUsageReport({
+    role: "assistant",
+    usage: {
+      input: 1000,
+      output: 300,
+      cacheRead: 400,
+      cacheWrite: 50,
+      reasoning: 100,
+      totalTokens: 1750,
+      cost: { input: 0.001, output: 0.002, cacheRead: 0, cacheWrite: 0, total: 0.0123 },
+    },
+  });
+  assert.deepEqual(
+    full,
+    {
+      usage: {
+        totalTokens: 1750,
+        inputTokens: 1000,
+        // pi reports reasoning ⊂ output; the daemon stores them disjointly.
+        outputTokens: 200,
+        thoughtTokens: 100,
+        cachedReadTokens: 400,
+        cachedWriteTokens: 50,
+      },
+      cost: { amount: 0.0123, currency: "USD" },
+    },
+    "pi usage maps to ACP wire shape with a USD cost",
+  );
+
+  const noReasoning = mapUsageReport({
+    role: "assistant",
+    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { total: 0 } },
+  });
+  assert.deepEqual(
+    noReasoning,
+    {
+      usage: { totalTokens: 15, inputTokens: 10, outputTokens: 5, cachedReadTokens: 0, cachedWriteTokens: 0 },
+    },
+    "missing reasoning omits thoughtTokens; zero totalTokens is recomputed; zero cost is omitted",
+  );
+
+  assert.equal(mapUsageReport({ role: "user", content: "hi" }), null, "user messages report nothing");
+  assert.equal(mapUsageReport({ role: "assistant" }), null, "usage-less assistant messages report nothing");
+  assert.equal(
+    mapUsageReport({
+      role: "assistant",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { total: 0 } },
+    }),
+    null,
+    "all-zero usage reports nothing",
+  );
+  assert.equal(mapUsageReport(undefined), null, "no message reports nothing");
+}
+
 // --- 4. Extension factory against a TCP bridge stand-in ------------------
 const serverSockets = [];
+// Every frame the extension sends to the bridge, parsed (the usage
+// notification travels this way, so the test can observe it).
+const bridgeFrames = [];
 const bridge = net.createServer((socket) => {
   serverSockets.push(socket);
   const child = spawnMock();
+  let buffer = "";
+  socket.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    let nl;
+    while ((nl = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      try {
+        bridgeFrames.push(JSON.parse(line));
+      } catch {
+        // partial / non-JSON: ignore
+      }
+    }
+  });
   socket.pipe(child.stdin);
   child.stdout.pipe(socket);
   socket.on("close", () => child.kill());
@@ -117,11 +192,24 @@ const addr = `127.0.0.1:${bridge.address().port}`;
 function fakePi() {
   return {
     tools: [],
+    handlers: new Map(),
     registerTool(def) {
       this.tools.push(def);
     },
-    on() {},
+    on(event, handler) {
+      this.handlers.set(event, handler);
+    },
   };
+}
+
+async function waitFor(predicate, what, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const hit = predicate();
+    if (hit) return hit;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`timed out waiting for ${what}`);
 }
 
 {
@@ -146,6 +234,43 @@ function fakePi() {
   await new Promise((resolve) => setTimeout(resolve, 50));
   const retried = await echo.execute("tc-2", { input: "y" });
   assert.equal(retried.content[0].text, "echo:y", "execute reconnects after a dropped connection");
+
+  // intent-hq/intent#3802: a finished assistant message's usage is forwarded
+  // to the bridge as a JSON-RPC notification (no `id`); non-assistant
+  // messages are not.
+  const onTurnEnd = pi.handlers.get("turn_end");
+  assert.equal(typeof onTurnEnd, "function", "factory subscribes to turn_end");
+  const before = bridgeFrames.filter((f) => f.method === USAGE_NOTIFICATION).length;
+  await onTurnEnd({ turnIndex: 0, message: { role: "user", content: "hi" }, toolResults: [] });
+  await onTurnEnd({
+    turnIndex: 1,
+    message: {
+      role: "assistant",
+      content: [],
+      usage: {
+        input: 20,
+        output: 7,
+        cacheRead: 3,
+        cacheWrite: 0,
+        totalTokens: 30,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.005 },
+      },
+    },
+    toolResults: [],
+  });
+  const frames = await waitFor(
+    () => {
+      const hits = bridgeFrames.filter((f) => f.method === USAGE_NOTIFICATION);
+      return hits.length > before ? hits.slice(before) : null;
+    },
+    "the usage notification to reach the bridge",
+  );
+  assert.equal(frames.length, 1, "only the assistant message produces a report");
+  assert.equal(frames[0].id, undefined, "usage report is a notification (no id)");
+  assert.deepEqual(frames[0].params, {
+    usage: { totalTokens: 30, inputTokens: 20, outputTokens: 7, cachedReadTokens: 3, cachedWriteTokens: 0 },
+    cost: { amount: 0.005, currency: "USD" },
+  });
 }
 
 // --- 5. Graceful degradation ----------------------------------------------

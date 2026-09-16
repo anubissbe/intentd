@@ -19,6 +19,11 @@
 //! (intent-hq/intent#3803) and the classification folds that bill as the
 //! per-turn report it is ([`PerTurn`]).
 //!
+//! pi-acp reports nothing on the ACP wire either; the bundled pi extension
+//! forwards each LLM call's usage over the MCP bridge instead
+//! (`intent_acp::ExtensionUsageRegistry`, intent-hq/intent#3802) and the seam
+//! drains those per-turn — the same [`PerTurn`] fold, tokens and cost alike.
+//!
 //! [`PerTurn`]: UsageReportSemantics::PerTurn
 
 use intent_acp::session::{Meta, Usage};
@@ -69,17 +74,33 @@ impl UsageReportSemantics {
 /// - `claude-code` resets its tally every turn → `PerTurn`
 /// - `grok` bills per prompt via `_meta.usage` (#3803, synthesized by
 ///   [`prompt_meta_usage_bill`]) → `PerTurn`
+/// - `pi` reports per LLM call via the bundled extension (#3802, drained
+///   per turn from the `ExtensionUsageRegistry`) → `PerTurn`
 /// - `codex` (#3795), `opencode`, `unsloth` (#3801) report the last request → `LastRequest`
-/// - `pi`, `auggie`, `droid`, `cortex` never report → `NoReport`
+/// - `auggie`, `droid`, `cortex` never report → `NoReport`
 /// - everything else (incl. `mock`) → `Cumulative`
 pub(crate) fn usage_report_semantics(provider_id: Option<&str>) -> UsageReportSemantics {
     let normalized = provider_id.map(|p| p.trim().to_ascii_lowercase());
     match normalized.as_deref() {
-        Some("claude-code" | "grok") => UsageReportSemantics::PerTurn,
+        Some("claude-code" | "grok" | "pi") => UsageReportSemantics::PerTurn,
         Some("codex" | "opencode" | "unsloth") => UsageReportSemantics::LastRequest,
-        Some("pi" | "auggie" | "droid" | "cortex") => UsageReportSemantics::NoReport,
+        Some("auggie" | "droid" | "cortex") => UsageReportSemantics::NoReport,
         _ => UsageReportSemantics::Cumulative,
     }
+}
+
+/// Whether the provider's cost figure covers the just-finished turn only —
+/// grok's `_meta.usage` bill (#3803) and pi's extension-forwarded per-call
+/// costs (#3802) — so `persist_turn_token_usage` SUMS it into the stored
+/// session cost instead of the cumulative `usage_update` REPLACE. Neither
+/// provider ever emits `usage_update` costs (audit §8.1; pi-acp emits no
+/// usage at all), which is what keeps the provider-keyed SUM safe. Matching
+/// is trimmed and case-insensitive like [`usage_report_semantics`].
+pub(crate) fn reports_per_turn_cost(provider_id: Option<&str>) -> bool {
+    provider_id.is_some_and(|p| {
+        let p = p.trim();
+        p.eq_ignore_ascii_case("grok") || p.eq_ignore_ascii_case("pi")
+    })
 }
 
 /// Whether the provider reports usage via the `PromptResponse._meta.usage`
@@ -206,7 +227,9 @@ mod tests {
     fn classifies_every_known_provider() {
         // grok's _meta.usage bill is a whole-prompt (per-turn) report
         // (#3803), same SUM fold as claude-code's per-turn counters.
-        for id in ["claude-code", "grok"] {
+        // pi's extension-forwarded per-call reports drain as one per-turn
+        // report (#3802), same fold again.
+        for id in ["claude-code", "grok", "pi"] {
             assert_eq!(
                 usage_report_semantics(Some(id)),
                 UsageReportSemantics::PerTurn,
@@ -220,7 +243,7 @@ mod tests {
                 "{id}"
             );
         }
-        for id in ["pi", "auggie", "droid", "cortex"] {
+        for id in ["auggie", "droid", "cortex"] {
             assert_eq!(
                 usage_report_semantics(Some(id)),
                 UsageReportSemantics::NoReport,
@@ -259,6 +282,26 @@ mod tests {
             assert!(!reads_prompt_meta_usage(Some(id)), "{id}");
         }
         assert!(!reads_prompt_meta_usage(None));
+    }
+
+    #[test]
+    fn grok_and_pi_report_per_turn_cost() {
+        assert!(reports_per_turn_cost(Some("grok")));
+        assert!(reports_per_turn_cost(Some("pi")));
+        assert!(reports_per_turn_cost(Some("  Pi ")));
+        for id in [
+            "claude-code",
+            "codex",
+            "opencode",
+            "unsloth",
+            "auggie",
+            "droid",
+            "cortex",
+            "mock",
+        ] {
+            assert!(!reports_per_turn_cost(Some(id)), "{id}");
+        }
+        assert!(!reports_per_turn_cost(None));
     }
 
     #[test]

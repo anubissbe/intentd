@@ -14,6 +14,7 @@ use intent_core::settings_file::AgentFeaturesSettings;
 use intent_core::{AgentId, TurnAttachmentRegistry, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
+use crate::extension_usage::{ExtensionUsageRegistry, EXTENSION_USAGE_NOTIFICATION};
 use crate::tool_restrictions::get_tool_denylist_for_agent_type;
 
 mod bindings;
@@ -79,6 +80,12 @@ pub struct WorkspaceMcpServer {
     /// attaches it without depending on the provider's echo fidelity. `None`
     /// keeps the legacy echo-parse-only behavior (FE front door, tests).
     turn_attachments: Option<Arc<TurnAttachmentRegistry>>,
+    /// Extension-reported usage registry (intent-hq/intent#3802). When wired
+    /// — together with a `caller_agent_id` — a
+    /// [`EXTENSION_USAGE_NOTIFICATION`] from the bundled provider extension
+    /// is recorded against this agent for the turn-end accounting seam to
+    /// drain. `None` ignores the notification (FE front door, tests).
+    extension_usage: Option<Arc<ExtensionUsageRegistry>>,
     /// `[agentFeatures]` toggles captured at bridge creation (new sessions
     /// only — mid-session settings changes never affect a live bridge).
     /// Disabled features are pruned from the tool description and JS prelude
@@ -121,6 +128,7 @@ impl WorkspaceMcpServer {
             is_chief,
             workspace_api_timeout: dispatch::default_workspace_api_timeout(),
             turn_attachments: None,
+            extension_usage: None,
             agent_features: AgentFeaturesSettings::default(),
             specialist_model_options: Vec::new(),
             is_sub_agent: false,
@@ -170,6 +178,15 @@ impl WorkspaceMcpServer {
     #[must_use]
     pub fn with_turn_attachments(mut self, registry: Option<Arc<TurnAttachmentRegistry>>) -> Self {
         self.turn_attachments = registry;
+        self
+    }
+
+    /// Wire the daemon-wide extension-usage registry
+    /// (intent-hq/intent#3802). Recording only activates when a
+    /// `caller_agent_id` is also set — the registry keys reports by agent.
+    #[must_use]
+    pub fn with_extension_usage(mut self, registry: Option<Arc<ExtensionUsageRegistry>>) -> Self {
+        self.extension_usage = registry;
         self
     }
 
@@ -308,10 +325,28 @@ impl WorkspaceMcpServer {
     /// `None` for notifications (port of `MCPServer.handleMessage`).
     pub async fn handle_message(&self, message: &Value) -> Option<Value> {
         let method = message.get("method").and_then(Value::as_str)?;
-        let id = message.get("id").cloned();
-        match id {
-            Some(id) => Some(self.handle_request(&id, method, message).await),
-            None => None,
+        if let Some(id) = message.get("id").cloned() {
+            Some(self.handle_request(&id, method, message).await)
+        } else {
+            self.handle_notification(method, message.get("params"));
+            None
+        }
+    }
+
+    /// Notifications carry no response. The only one the daemon acts on is
+    /// the bundled provider extension's usage report
+    /// (intent-hq/intent#3802); everything else (`notifications/initialized`
+    /// included) is ignored as before.
+    fn handle_notification(&self, method: &str, params: Option<&Value>) {
+        if method != EXTENSION_USAGE_NOTIFICATION {
+            return;
+        }
+        let (Some(registry), Some(agent_id)) = (&self.extension_usage, &self.caller_agent_id)
+        else {
+            return;
+        };
+        if !registry.record_notification(agent_id, params) {
+            tracing::warn!(agent = %agent_id, "malformed extension usage notification ignored");
         }
     }
 

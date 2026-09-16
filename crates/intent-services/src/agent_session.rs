@@ -3387,8 +3387,17 @@ impl Services {
                 // present standard report always wins; runs after the
                 // predecessor await so its provider read cannot race turn
                 // N-1's bookkeeping.
+                //
+                // Extension fallback (intent-hq/intent#3802): with neither,
+                // drain the per-LLM-call reports the bundled pi extension
+                // forwarded over the MCP bridge during this turn — one
+                // per-turn report (SUM, pi is PerTurn). A report that lands
+                // after this drain folds into the next turn instead. The
+                // bucket is drained on EVERY turn end so a provider that
+                // starts reporting on the wire can never double-count.
+                let extension_report = services.extension_usage.take(&agent_id_task);
                 let (turn_usage, turn_cost) = if turn_usage.is_none() {
-                    match services
+                    let fallback = match services
                         .prompt_meta_turn_usage(
                             &agent_id_task,
                             &workspace_id_task,
@@ -3396,6 +3405,10 @@ impl Services {
                         )
                         .await
                     {
+                        Some(report) => Some(report),
+                        None => extension_report,
+                    };
+                    match fallback {
                         Some((usage, cost)) => (Some(usage), turn_cost.or(cost)),
                         None => (turn_usage, turn_cost),
                     }
@@ -4445,11 +4458,11 @@ impl Services {
     /// counters, and a counters-only turn never drops a cost already
     /// reported for the session.
     ///
-    /// Exception: for a provider whose cost arrives on the per-turn
-    /// `_meta.usage` bill (grok, #3803 — `reads_prompt_meta_usage`), `cost`
-    /// covers the just-finished prompt only, so it SUMS into the stored cost
-    /// (`UsageCost::merge`) instead of replacing it — mirroring the counters'
-    /// `PerTurn` fold.
+    /// Exception: for a provider whose cost arrives per turn — grok's
+    /// `_meta.usage` bill (#3803) or pi's extension-forwarded per-call costs
+    /// (#3802); `reports_per_turn_cost` — `cost` covers the just-finished
+    /// prompt only, so it SUMS into the stored cost (`UsageCost::merge`)
+    /// instead of replacing it — mirroring the counters' `PerTurn` fold.
     pub(crate) async fn persist_turn_token_usage(
         &self,
         agent_id: &AgentId,
@@ -4478,7 +4491,7 @@ impl Services {
                 (
                     stored,
                     crate::usage_semantics::usage_report_semantics(provider_id.as_deref()),
-                    crate::usage_semantics::reads_prompt_meta_usage(provider_id.as_deref()),
+                    crate::usage_semantics::reports_per_turn_cost(provider_id.as_deref()),
                     crate::usage_semantics::reports_thought_subset_of_output(
                         provider_id.as_deref(),
                     ),
@@ -4521,17 +4534,19 @@ impl Services {
         };
         let stored_cost = stored.and_then(|s| s.cost);
         snapshot.cost = if per_turn_cost {
-            // Per-turn `_meta.usage` bill (#3803): the fresh figure covers
-            // one prompt — SUM with the stored session cost. `merge` also
-            // covers the either-half-absent fallbacks.
+            // Per-turn cost — grok's `_meta.usage` bill (#3803) or pi's
+            // extension-forwarded per-call costs (#3802): the fresh figure
+            // covers one prompt — SUM with the stored session cost. `merge`
+            // also covers the either-half-absent fallbacks.
             //
-            // INVARIANT: SUM is safe only because a `reads_prompt_meta_usage`
-            // provider's costs all originate from per-turn meta bills — grok
-            // never emits `usage_update` costs (audit §8.1), so the cumulative
-            // figures `persist_cost_only_ordered` routes through here (and the
-            // seam's `turn_cost.or(cost)` preference) can never reach this
-            // branch. If grok ever grows `usage_update` costs, key this on the
-            // cost's SOURCE (meta bill vs usage_update), not the provider.
+            // INVARIANT: SUM is safe only because a `reports_per_turn_cost`
+            // provider's costs all originate per turn — grok never emits
+            // `usage_update` costs (audit §8.1) and pi-acp emits no usage at
+            // all, so the cumulative figures `persist_cost_only_ordered`
+            // routes through here (and the seam's `turn_cost.or(cost)`
+            // preference) can never reach this branch. If either grows
+            // `usage_update` costs, key this on the cost's SOURCE (per-turn
+            // vs usage_update), not the provider.
             UsageCost::merge(stored_cost.as_ref(), cost.as_ref())
         } else {
             // Cumulative `usage_update` cost: latest wins, stored fallback.

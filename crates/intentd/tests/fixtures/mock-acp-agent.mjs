@@ -173,6 +173,57 @@ function callWorkspaceTool(toolCall) {
   });
 }
 
+// Out-of-band bridge notifications (intent-hq/intent#3802): over ONE bridge
+// connection, initialize, write each `{ method, params }` as a JSON-RPC
+// notification (no `id`), then await a `tools/list` so the frames have
+// provably reached the daemon before the prompt resolves — the shape of the bundled
+// pi extension's per-LLM-call usage report. Rejects on transport error.
+function sendBridgeNotifications(notifications) {
+  return new Promise((resolve, reject) => {
+    const srv = resolveWorkspaceMcpServer();
+    if (!srv) return reject(new Error('no workspace-mcp server in config'));
+    log(`spawning bridge (notifications): ${srv.command} ${(srv.args || []).join(' ')}`);
+    const child = spawn(srv.command, srv.args || [], {
+      env: { ...process.env, ...(srv.env || {}) },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+    child.on('error', reject);
+    const rl = readline.createInterface({ input: child.stdout });
+    const pending = new Map();
+    rl.on('line', (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let msg;
+      try {
+        msg = JSON.parse(trimmed);
+      } catch {
+        return;
+      }
+      const fn = pending.get(msg.id);
+      if (fn) {
+        pending.delete(msg.id);
+        fn(msg);
+      }
+    });
+    const request = (id, method, params) =>
+      new Promise((res) => {
+        pending.set(id, res);
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+      });
+
+    (async () => {
+      await request(1, 'initialize', {});
+      for (const { method, params } of notifications) {
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params: params || {} }) + '\n');
+      }
+      await request(2, 'tools/list', {});
+      child.stdin.end();
+      child.kill();
+      resolve();
+    })().catch(reject);
+  });
+}
+
 // Bridge-concurrency probe (monorepo#871): over ONE bridge connection, fire a
 // long `tools/call` (agent JS that spins until `releaseFile` exists) and —
 // while it is still in flight — a `tools/list` ping. The release file is only
@@ -655,6 +706,17 @@ async function handlePrompt(id, params) {
     log(`releaseFile: holding turn until ${active.releaseFile} exists`);
     while (!fs.existsSync(active.releaseFile)) {
       await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+  // Out-of-band bridge notifications (intent-hq/intent#3802): sent BEFORE the
+  // prompt resolves so the daemon's turn-end seam sees them. A transport
+  // failure resolves `refusal` so the test fails loudly.
+  if (Array.isArray(active.bridgeNotifications) && active.bridgeNotifications.length > 0) {
+    try {
+      await sendBridgeNotifications(active.bridgeNotifications);
+    } catch (err) {
+      log(`bridge notifications failed: ${err.message}`);
+      return result(id, { stopReason: 'refusal' });
     }
   }
   const toolCalls = Array.isArray(active.toolCalls)

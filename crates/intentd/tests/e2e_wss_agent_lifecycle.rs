@@ -14501,6 +14501,147 @@ async fn grok_meta_usage_bill_captured_over_wss() {
     assert_eq!(usage["byAgentId"][&agent_id]["inputTokens"], 3000);
 }
 
+/// Extension-forwarded usage over the real WSS transport
+/// (intent-hq/intent#3802): pi-acp sends neither `PromptResponse.usage` nor
+/// `usage_update`, so the bundled pi extension forwards each LLM call's
+/// usage over the per-agent MCP bridge as a `notifications/intentd/usage`
+/// JSON-RPC notification. The mock plays the extension's part — during the
+/// prompt it dials the bridge and sends two per-call reports (the prompt
+/// itself carries NO usage) — and the daemon must drain them at the
+/// turn-end seam as one per-turn report and emit
+/// `workspace:tokenUsage-changed` with the SUMMED tokens AND cost;
+/// `workspace.getTokenUsage` returns the same tally over the wire.
+#[tokio::test]
+async fn extension_usage_notifications_captured_over_wss() {
+    let Some(script) = gate("WSS extension usage E2E") else {
+        return;
+    };
+
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let ws_id = seed_workspace_only(&data_dir).await;
+    // Two per-LLM-call reports in the extension's wire shape (ACP `Usage`
+    // camelCase + `cost`), no `usage` on the PromptResponse.
+    let behavior = json!({
+        "response": "pi turn one",
+        "bridgeNotifications": [
+            {
+                "method": "notifications/intentd/usage",
+                "params": {
+                    "usage": {
+                        "totalTokens": 1500,
+                        "inputTokens": 1000,
+                        "outputTokens": 200,
+                        "thoughtTokens": 100,
+                        "cachedReadTokens": 200,
+                        "cachedWriteTokens": 0,
+                    },
+                    "cost": { "amount": 0.01, "currency": "USD" },
+                },
+            },
+            {
+                "method": "notifications/intentd/usage",
+                "params": {
+                    "usage": {
+                        "totalTokens": 700,
+                        "inputTokens": 500,
+                        "outputTokens": 100,
+                        "cachedReadTokens": 100,
+                    },
+                    "cost": { "amount": 0.005, "currency": "USD" },
+                },
+            },
+        ],
+    })
+    .to_string();
+    let env: [(&str, &str); 3] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+    ];
+    let child = spawn_serve(&data_dir, "both", &env);
+    let _daemon = Daemon { child };
+    let socket = data_dir.join("intentd.sock");
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let fingerprint = status["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_string();
+    let cfg = client_config(&fingerprint);
+
+    // SUBSCRIBER conn — subscribe BEFORE the turn so no event is missed.
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let sub_resp = wss_rpc(
+        &mut sub,
+        1,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:tokenUsage-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        sub_resp["subscriptionId"].is_string(),
+        "subscribed: {sub_resp}"
+    );
+
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "ExtUsage", "model": "default", "provider": "mock" }),
+    )
+    .await;
+    let agent_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "first turn" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "sendMessage ok: {sent}");
+    let ev = wss_event(&mut sub, 30).await;
+    let ev = &ev["params"]["event"];
+    assert_eq!(ev["type"], "workspace:tokenUsage-changed");
+    let totals = &ev["data"]["tokenUsage"]["totals"];
+    assert_eq!(
+        totals["inputTokens"], 1500,
+        "both per-call reports SUM into the turn (1000 + 500): {ev}"
+    );
+    assert_eq!(totals["outputTokens"], 300);
+    assert_eq!(totals["thoughtTokens"], 100);
+    assert_eq!(totals["cacheReadTokens"], 300);
+    let cost = totals["cost"]["amount"].as_f64().expect("cost amount");
+    assert!(
+        (cost - 0.015).abs() < 1e-12,
+        "per-call costs SUM ($0.01 + $0.005), got {cost}: {ev}"
+    );
+    assert_eq!(totals["cost"]["currency"], "USD");
+
+    // workspace.getTokenUsage over WSS returns the same durable tally (§5.23).
+    let read = wss_rpc(
+        &mut rpc,
+        12,
+        "workspace.getTokenUsage",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    let usage = &read["tokenUsage"];
+    assert_eq!(usage["totals"]["inputTokens"], 1500, "read: {read}");
+    let read_cost = usage["totals"]["cost"]["amount"]
+        .as_f64()
+        .expect("cost amount");
+    assert!((read_cost - 0.015).abs() < 1e-12, "read cost: {read}");
+    assert_eq!(usage["byAgentId"][&agent_id]["inputTokens"], 1500);
+}
+
 /// Title-preserving tool updates (the claude-code "Run" collapse): ACP
 /// `tool_call_update`s carry **only changed fields** — a richer title/input
 /// arrives on one update, later status-only updates carry no title at all.

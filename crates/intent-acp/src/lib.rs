@@ -18,6 +18,7 @@
 #[cfg(unix)]
 pub mod descendant_sweep;
 pub mod error;
+pub mod extension_usage;
 pub mod fs;
 pub mod handler;
 pub mod handshake;
@@ -38,6 +39,7 @@ pub use error::{
     is_quota_exceeded, is_transient_provider_fetch_failure, is_transient_upstream_disconnect,
     message_is_quota_exceeded, AcpError, AcpResult, JsonRpcError, PROMPT_IDLE_TIMEOUT_PREFIX,
 };
+pub use extension_usage::{ExtensionUsageRegistry, EXTENSION_USAGE_NOTIFICATION};
 pub use fs::FileService;
 pub use handler::{ClientRequestHandler, EventSink, SinkEvent};
 pub use handshake::handshake;

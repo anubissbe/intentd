@@ -247,6 +247,47 @@ export function mapToolResult(result) {
   return { content, details };
 }
 
+/// MCP notification carrying one finished LLM call's usage to intentd
+/// (intent-hq/intent#3802). Must match `intent_acp::EXTENSION_USAGE_NOTIFICATION`.
+export const USAGE_NOTIFICATION = "notifications/intentd/usage";
+
+/// pi-acp never puts usage on the ACP wire (no `PromptResponse.usage`, no
+/// `usage_update`), so a pi session reads as zero tokens / zero cost. pi
+/// itself knows: every finished assistant message carries pi-ai `Usage`
+/// (`input` / `output` / `cacheRead` / `cacheWrite` / optional `reasoning` /
+/// `totalTokens` / `cost.total` in USD). Map it to the ACP `Usage` wire shape
+/// the daemon already understands, plus `cost: { amount, currency }`.
+///
+/// pi reports `reasoning` as a subset of `output`; the daemon stores thought
+/// and output tokens disjointly, so the subset is carved out here. Returns
+/// `null` for anything that is not an assistant message with non-zero usage.
+export function mapUsageReport(message) {
+  if (!message || message.role !== "assistant") return null;
+  const raw = message.usage;
+  if (!raw || typeof raw !== "object") return null;
+  const count = (v) =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.round(v) : 0;
+  const inputTokens = count(raw.input);
+  const cachedReadTokens = count(raw.cacheRead);
+  const cachedWriteTokens = count(raw.cacheWrite);
+  let outputTokens = count(raw.output);
+  const thoughtTokens =
+    typeof raw.reasoning === "number" ? Math.min(count(raw.reasoning), outputTokens) : null;
+  if (thoughtTokens !== null) outputTokens -= thoughtTokens;
+  const totalTokens =
+    count(raw.totalTokens) ||
+    inputTokens + outputTokens + (thoughtTokens ?? 0) + cachedReadTokens + cachedWriteTokens;
+  const usage = { totalTokens, inputTokens, outputTokens };
+  if (thoughtTokens !== null) usage.thoughtTokens = thoughtTokens;
+  usage.cachedReadTokens = cachedReadTokens;
+  usage.cachedWriteTokens = cachedWriteTokens;
+  const total = raw.cost && typeof raw.cost.total === "number" ? raw.cost.total : NaN;
+  const params = { usage };
+  if (Number.isFinite(total) && total > 0) params.cost = { amount: total, currency: "USD" };
+  if (totalTokens === 0 && !params.cost) return null;
+  return params;
+}
+
 /// Extension entry point. pi awaits the async factory before `session_start`,
 /// so the bridge tools are registered before the first prompt.
 export default async function piMcpExtension(pi) {
@@ -329,6 +370,18 @@ export default async function piMcpExtension(pi) {
   log(`registered ${registered} of ${tools.length} workspace tool(s) from ${addr}`);
 
   if (typeof pi.on === "function") {
+    // intent-hq/intent#3802: forward each finished LLM call's usage to the
+    // daemon, which folds the calls into the turn's token/cost tally. Best
+    // effort — a dropped report only under-counts, it never breaks pi.
+    pi.on("turn_end", async (event) => {
+      const report = mapUsageReport(event && event.message);
+      if (!report) return;
+      try {
+        (await ensureClient()).notify(USAGE_NOTIFICATION, report);
+      } catch (err) {
+        log(`usage report dropped (${err.message})`);
+      }
+    });
     pi.on("session_shutdown", async () => {
       const promise = clientPromise;
       clientPromise = null;

@@ -1431,3 +1431,72 @@ async fn file_rename_forwards_pair() {
         ("a.txt".to_string(), "b.txt".to_string())
     );
 }
+
+// --- extension usage notification (intent-hq/intent#3802) -------------------
+
+fn usage_notification(params: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": crate::EXTENSION_USAGE_NOTIFICATION,
+        "params": params,
+    })
+}
+
+#[tokio::test]
+async fn extension_usage_notification_records_against_caller() {
+    let registry = Arc::new(crate::ExtensionUsageRegistry::new());
+    let (srv, _api) = server_with_caller("agent-pi");
+    let srv = srv.with_extension_usage(Some(registry.clone()));
+    let resp = srv
+        .handle_message(&usage_notification(&json!({
+            "usage": { "totalTokens": 30, "inputTokens": 20, "outputTokens": 10 },
+            "cost": { "amount": 0.005, "currency": "USD" }
+        })))
+        .await;
+    assert!(resp.is_none(), "notifications never produce a response");
+    let (usage, cost) = registry
+        .take(&AgentId::from_string("agent-pi"))
+        .expect("report recorded against the caller");
+    assert_eq!(usage.total_tokens, 30);
+    assert_eq!(usage.input_tokens, 20);
+    assert_eq!(cost.map(|c| c.amount), Some(0.005));
+}
+
+#[tokio::test]
+async fn extension_usage_notification_ignored_without_registry_or_caller() {
+    // Registry wired, no caller: nothing to key the report on.
+    let registry = Arc::new(crate::ExtensionUsageRegistry::new());
+    let (srv, _api) = server();
+    let srv = srv.with_extension_usage(Some(registry.clone()));
+    let params = json!({ "usage": { "totalTokens": 3, "inputTokens": 2, "outputTokens": 1 } });
+    assert!(srv
+        .handle_message(&usage_notification(&params))
+        .await
+        .is_none());
+    assert!(!registry.has_pending(&AgentId::from_string("agent-pi")));
+
+    // Caller set, no registry (FE front door): silently ignored, no panic.
+    let (srv, _api) = server_with_caller("agent-pi");
+    assert!(srv
+        .handle_message(&usage_notification(&params))
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn malformed_extension_usage_notification_is_ignored() {
+    let registry = Arc::new(crate::ExtensionUsageRegistry::new());
+    let (srv, _api) = server_with_caller("agent-pi");
+    let srv = srv.with_extension_usage(Some(registry.clone()));
+    assert!(srv
+        .handle_message(&usage_notification(&json!({ "usage": "garbage" })))
+        .await
+        .is_none());
+    assert!(srv
+        .handle_message(
+            &json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} })
+        )
+        .await
+        .is_none());
+    assert!(!registry.has_pending(&AgentId::from_string("agent-pi")));
+}
