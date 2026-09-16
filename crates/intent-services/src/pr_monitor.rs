@@ -697,21 +697,29 @@ pub enum PrMonitorRegistration {
 }
 
 /// Who holds the workspace's ACTIVE monitor on a PR when it is not the
-/// caller: a live agent (the call is refused), or an agent that can no
-/// longer receive wakes — terminal status, soft-retired, or its session row
-/// gone — whose monitor is orphaned and adoptable (intent-hq/intent#5079).
+/// caller: a live agent (the call is refused), an agent that can no longer
+/// receive wakes — terminal status, soft-retired, or its session row gone —
+/// whose monitor is orphaned and adoptable (intent-hq/intent#5079), or a
+/// live DIRECT sub-agent of the caller that has settled (its task is
+/// `complete`/`cancelled`, or it sits `RuntimeIdle` with no waiting reason
+/// other than PR monitors) whose monitor the parent may take over — the
+/// child is still woken with a transfer notice.
 enum PrMonitorHolder {
     Live(PrMonitorRefusal),
     Orphaned(PrMonitor),
+    SettledChild(PrMonitor),
 }
 
 /// A refused `pr.monitor` registration — the ACTIVE monitor another agent in
 /// the same workspace already holds on the PR, plus that owner's session
-/// name when it has one.
+/// name when it has one. `child_of_caller` marks an owner that is the
+/// caller's own direct sub-agent, still mid-work: the refusal instruction
+/// then names the settlement conditions under which a retry adopts.
 #[derive(Debug, Clone)]
 pub struct PrMonitorRefusal {
     pub owner: PrMonitor,
     pub owner_agent_name: Option<String>,
+    pub child_of_caller: bool,
 }
 
 impl PrMonitorRefusal {
@@ -727,6 +735,33 @@ impl PrMonitorRefusal {
             Some(name) => format!("{name} ({owner_id})"),
             None => owner_id.clone(),
         };
+        let instruction = if self.child_of_caller {
+            format!(
+                "{label} is already monitored in this workspace by your sub-agent \
+                 {owner_display}, which is still working; one monitor per PR per \
+                 workspace. A working sub-agent keeps its monitor and receives the \
+                 PR's wakes; do not register a second one. Retry ws.pr.monitor once \
+                 the sub-agent settles — its task is complete or cancelled, or it is \
+                 idle with nothing pending but this monitor (a ws.agent.watch on it \
+                 delivers that as its monitoring-idle advisory): the retry adopts the \
+                 monitor instead of being refused and the sub-agent is notified of the \
+                 transfer. For a one-shot read of the PR's current state use \
+                 ws.pr.snapshot. Only if you need the monitor now, use ws.agent.send \
+                 to ask the sub-agent to relay the events you care about or, as a last \
+                 resort, to relinquish the monitor via ws.pr.unmonitor so you can \
+                 register your own."
+            )
+        } else {
+            format!(
+                "{label} is already monitored in this workspace by agent {owner_display}; \
+                 one monitor per PR per workspace. That agent receives the PR's wakes. \
+                 Instead of registering a second monitor, use ws.agent.send to ask the \
+                 owner either to relay the events you care about to you, or to relinquish \
+                 the monitor via ws.pr.unmonitor so you can register your own; for a \
+                 one-shot read of the PR's current state use ws.pr.snapshot. Retry \
+                 ws.pr.monitor only after the owner cancels its monitor or finishes."
+            )
+        };
         let mut payload = json!({
             "ok": false,
             "refused": true,
@@ -735,15 +770,7 @@ impl PrMonitorRefusal {
             "prNumber": self.owner.pr_number,
             "ownerAgentId": owner_id,
             "monitorId": self.owner.monitor_id,
-            "instruction": format!(
-                "{label} is already monitored in this workspace by agent {owner_display}; \
-                 one monitor per PR per workspace. That agent receives the PR's wakes. \
-                 Instead of registering a second monitor, use ws.agent.send to ask the \
-                 owner either to relay the events you care about to you, or to relinquish \
-                 the monitor via ws.pr.unmonitor so you can register your own; for a \
-                 one-shot read of the PR's current state use ws.pr.snapshot. Retry \
-                 ws.pr.monitor only after the owner cancels its monitor or finishes."
-            ),
+            "instruction": instruction,
         });
         if let Some(name) = &self.owner_agent_name {
             payload["ownerAgentName"] = json!(name);
@@ -980,7 +1007,8 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
 /// (PROTOCOL §5.42): `{ type: "pr_monitor_wake", monitorId, repo, prNumber,
 /// reason, url? }`. `url` is the PR's HTML URL read off the monitor's
 /// persisted baseline snapshot; the key is OMITTED (never null) when the
-/// monitor has no baseline yet.
+/// monitor has no baseline yet. The `transferred` wake
+/// ([`Services::wake_former_owner_after_transfer`]) adds `adoptedBy`.
 fn pr_monitor_wake_metadata(m: &PrMonitor, reason: &str) -> Value {
     let mut metadata = json!({
         "type": "pr_monitor_wake",
@@ -1236,6 +1264,14 @@ impl Services {
     /// `prMonitor:registered` event marks the adoption. Adoption counts
     /// against the adopter's own cap exactly like a fresh registration.
     ///
+    /// A LIVE holder that is the caller's DIRECT sub-agent and has SETTLED
+    /// ([`Services::pr_monitor_child_settled`]: task `complete`/`cancelled`,
+    /// or `RuntimeIdle` with no waiting reason other than PR monitors) is
+    /// adopted the same way — parent takeover — and, unlike a dead owner,
+    /// the child is woken once with a `transferred` notice naming the
+    /// adopter. A grandparent, sibling, or the child itself (once the parent
+    /// holds the row) is refused as before.
+    ///
     /// The initial fetch is load-bearing — a forge that cannot read the PR
     /// (unsupported host, missing PR, no token) fails registration rather
     /// than persisting a monitor that could never poll.
@@ -1256,6 +1292,10 @@ impl Services {
             .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number.cast_signed())
             .await?;
         let mut orphan = None;
+        // The pre-adoption row image of a settled child's monitor: the
+        // former owner is woken with the transfer notice after the adoption
+        // lands (an orphan's dead owner is never woken).
+        let mut transferred_from: Option<PrMonitor> = None;
         if existing.is_none() {
             match self
                 .pr_monitor_holder(workspace_id, agent_id, repo_owner, repo_name, pr_number)
@@ -1265,6 +1305,10 @@ impl Services {
                     return Ok(PrMonitorRegistration::Refused(refusal));
                 }
                 Some(PrMonitorHolder::Orphaned(m)) => orphan = Some(m),
+                Some(PrMonitorHolder::SettledChild(m)) => {
+                    transferred_from = Some(m.clone());
+                    orphan = Some(m);
+                }
                 None => {}
             }
             let cap = self.pr_monitors_max_per_agent as usize;
@@ -1299,7 +1343,32 @@ impl Services {
             None => None,
         };
         if monitor.is_none() {
-            if let Some(o) = orphan.take() {
+            let mut adoptable = orphan.take();
+            if transferred_from.is_some() {
+                // The settled-child verdict predates the forge fetch, and
+                // a child that picked up work meanwhile (a queued message,
+                // a new turn, a fresh hook) never touches the monitor row,
+                // so the adoption CAS below cannot see it: re-evaluate the
+                // holder at the write. Only the CAS itself remains as a
+                // window between this check and the re-parenting.
+                adoptable = None;
+                transferred_from = None;
+                match self
+                    .pr_monitor_holder(workspace_id, agent_id, repo_owner, repo_name, pr_number)
+                    .await?
+                {
+                    Some(PrMonitorHolder::Live(refusal)) => {
+                        return Ok(PrMonitorRegistration::Refused(refusal));
+                    }
+                    Some(PrMonitorHolder::Orphaned(o)) => adoptable = Some(o),
+                    Some(PrMonitorHolder::SettledChild(o)) => {
+                        transferred_from = Some(o.clone());
+                        adoptable = Some(o);
+                    }
+                    None => {}
+                }
+            }
+            if let Some(o) = adoptable {
                 let from = o.agent_id.clone();
                 monitor = self
                     .adopt_pr_monitor(o, agent_id, baseline.clone(), &now)
@@ -1352,6 +1421,13 @@ impl Services {
                     // between the read and the adoption CAS): adopt the
                     // fresh image once more before giving up.
                     Some(PrMonitorHolder::Orphaned(o)) => {
+                        transferred_from = None;
+                        let from = o.agent_id.clone();
+                        monitor = self.adopt_pr_monitor(o, agent_id, baseline, &now).await?;
+                        adopted_from = monitor.is_some().then_some(from);
+                    }
+                    Some(PrMonitorHolder::SettledChild(o)) => {
+                        transferred_from = Some(o.clone());
                         let from = o.agent_id.clone();
                         monitor = self.adopt_pr_monitor(o, agent_id, baseline, &now).await?;
                         adopted_from = monitor.is_some().then_some(from);
@@ -1370,6 +1446,10 @@ impl Services {
             .map(|from| json!({ "adoptedFrom": from }));
         self.emit_pr_monitor_event(PR_MONITOR_REGISTERED, &monitor, extra)
             .await;
+        if let Some(former) = transferred_from.filter(|_| adopted_from.is_some()) {
+            self.wake_former_owner_after_transfer(&former, agent_id)
+                .await;
+        }
         // A newly persisted active monitor on an open PR can move the
         // derived displayStatus to `pr_open`/`pr_ready` (§6.5) and raise
         // the orthogonal `waiting` flag (§5.1).
@@ -1388,10 +1468,12 @@ impl Services {
     /// (a refusal naming that owner, session name included when it has one)
     /// while the owner can still receive wakes, [`PrMonitorHolder::Orphaned`]
     /// once it cannot (terminal status, soft-retired, or session row gone;
-    /// intent-hq/intent#5079). `None` when the PR is unmonitored in the
-    /// workspace or the holder is the caller itself. Any other session
-    /// lookup error fails closed (propagated) rather than adopting a monitor
-    /// whose owner might be live.
+    /// intent-hq/intent#5079), or [`PrMonitorHolder::SettledChild`] when the
+    /// live owner is the caller's DIRECT sub-agent that has settled
+    /// ([`Services::pr_monitor_child_settled`]). `None` when the PR is
+    /// unmonitored in the workspace or the holder is the caller itself. Any
+    /// other session lookup error fails closed (propagated) rather than
+    /// adopting a monitor whose owner might be live.
     async fn pr_monitor_holder(
         &self,
         workspace_id: &WorkspaceId,
@@ -1415,21 +1497,97 @@ impl Services {
         if owner.agent_id == *agent_id {
             return Ok(None);
         }
-        let owner_agent_name = match self.store.get_agent_session_summary(&owner.agent_id).await {
+        let session = match self.store.get_agent_session_summary(&owner.agent_id).await {
             Ok(session)
                 if session.retired_at.is_some()
                     || crate::agent_ops::is_terminal_status(session.status) =>
             {
                 return Ok(Some(PrMonitorHolder::Orphaned(owner)));
             }
-            Ok(session) => Some(session.name).filter(|n| !n.trim().is_empty()),
+            Ok(session) => session,
             Err(Error::NotFound(_)) => return Ok(Some(PrMonitorHolder::Orphaned(owner))),
             Err(e) => return Err(e),
         };
+        let child_of_caller = session.parent_agent_id.as_ref() == Some(agent_id);
+        if child_of_caller && self.pr_monitor_child_settled(&session).await {
+            return Ok(Some(PrMonitorHolder::SettledChild(owner)));
+        }
+        let owner_agent_name = Some(session.name).filter(|n| !n.trim().is_empty());
         Ok(Some(PrMonitorHolder::Live(PrMonitorRefusal {
             owner,
             owner_agent_name,
+            child_of_caller,
         })))
+    }
+
+    /// The parent-takeover predicate behind [`PrMonitorHolder::SettledChild`]:
+    /// a live direct sub-agent has SETTLED when its linked task note is
+    /// `complete` or `cancelled`, or when the session is `RuntimeIdle` with
+    /// no waiting reason other than its active PR monitors
+    /// ([`Services::agent_has_non_monitor_waiting_reason`] — the same set the
+    /// idle-target watch guard consults). A child that is still running,
+    /// has a queued message, an unresolved attention request, pending
+    /// questions, live watches/subscriptions, or active hooks keeps its
+    /// monitor. Every store probe fails CLOSED (not settled → the ordinary
+    /// refusal): a takeover is a re-parenting write on a live agent's row,
+    /// so uncertainty must never adopt — including the pending-question
+    /// read, which the shared helper's convenience API collapses to "none
+    /// pending" and is therefore probed here first in its propagating form
+    /// ([`Services::try_pending_question_count`]). Registration evaluates
+    /// it twice: at the pre-fetch precheck (so a still-working child's
+    /// refusal costs no forge request) and again immediately before the
+    /// adoption write, since none of those waiting reasons touch the
+    /// monitor row the CAS guards; the window left is the CAS itself.
+    async fn pr_monitor_child_settled(&self, child: &intent_core::AgentSession) -> bool {
+        if let Some(task_note_id) = child.task_note_id.as_ref() {
+            match self.store.get_note(&child.workspace_id, task_note_id).await {
+                Ok(note) => {
+                    if matches!(
+                        note.metadata.task.as_ref().map(|t| t.status),
+                        Some(
+                            intent_core::TaskStatus::Complete | intent_core::TaskStatus::Cancelled
+                        )
+                    ) {
+                        return true;
+                    }
+                }
+                Err(Error::NotFound(_)) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %child.id.0,
+                        error = %e,
+                        "pr monitor takeover: task note lookup failed; refusing"
+                    );
+                    return false;
+                }
+            }
+        }
+        if !matches!(child.status, AgentStatus::RuntimeIdle) {
+            return false;
+        }
+        match self.try_pending_question_count(&child.id).await {
+            Ok(0) => {}
+            Ok(_) => return false,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %child.id.0,
+                    error = %e,
+                    "pr monitor takeover: pending-question probe failed; refusing"
+                );
+                return false;
+            }
+        }
+        match self.agent_has_non_monitor_waiting_reason(child).await {
+            Ok(waiting) => !waiting,
+            Err(e) => {
+                tracing::warn!(
+                    agent = %child.id.0,
+                    error = %e,
+                    "pr monitor takeover: waiting-reason probe failed; refusing"
+                );
+                false
+            }
+        }
     }
 
     /// Adopt an ORPHANED monitor for `agent_id` (intent-hq/intent#5079): the
@@ -2659,6 +2817,38 @@ impl Services {
         if reason == "cancelled" || reason == "completed" {
             self.resettle_owner_after_pr_monitor_terminal(monitor).await;
         }
+    }
+
+    /// Wake the FORMER owner of a monitor its parent just took over
+    /// ([`PrMonitorHolder::SettledChild`]): `former` is the pre-adoption
+    /// row image (still naming the child), `reason: "transferred"`, and the
+    /// metadata carries `adoptedBy`. The transfer is terminal for the child
+    /// — it no longer owns the monitor — so the same deferral backstop as
+    /// `cancelled`/`completed` runs afterwards: a child whose last monitor
+    /// just left it must settle its parent's deferred completion watch.
+    async fn wake_former_owner_after_transfer(&self, former: &PrMonitor, adopter: &AgentId) {
+        let label = monitor_label(former);
+        let message =
+            crate::harness::latest().pr_monitor_transferred_to_parent_notice(&label, &adopter.0);
+        let mut metadata = pr_monitor_wake_metadata(former, "transferred");
+        metadata["adoptedBy"] = json!(adopter);
+        if let Err(e) = self
+            .deliver_wake_message(
+                &former.workspace_id,
+                &former.agent_id,
+                &message,
+                Some(&metadata),
+            )
+            .await
+        {
+            tracing::warn!(
+                monitor = %former.monitor_id.0,
+                agent = %former.agent_id.0,
+                error = %e,
+                "pr monitor former-owner transfer wake delivery failed"
+            );
+        }
+        self.resettle_owner_after_pr_monitor_terminal(former).await;
     }
 
     /// Resolve the `(owner, name)` a monitor call targets: an explicit
@@ -4612,6 +4802,10 @@ mod tests {
         let rows = ws_view["monitors"].as_array().expect("array");
         assert_eq!(rows.len(), 1, "no second row: {ws_view}");
         assert_eq!(rows[0]["agentId"], json!(sibling.to_string()));
+        assert!(
+            !owner_messages(&svc, &owner).await.contains("transferred"),
+            "{how:?}: a dead owner gets no transfer notice"
+        );
 
         // The new owner's own re-register is the ordinary idempotent re-arm.
         let rearmed = svc
@@ -4637,6 +4831,474 @@ mod tests {
     #[tokio::test]
     async fn a_monitor_owned_by_a_retired_agent_is_adopted() {
         assert_orphan_adopted_after(OwnerDeath::Retired).await;
+    }
+
+    /// Insert a live agent whose `parent_agent_id` is `parent`, in `status`.
+    async fn child_agent(
+        svc: &Services,
+        ws: &WorkspaceId,
+        id: &str,
+        parent: &AgentId,
+        status: AgentStatus,
+    ) -> AgentId {
+        let mut child = agent(ws, id);
+        child.name = "Child".to_string();
+        child.parent_agent_id = Some(parent.clone());
+        child.status = status;
+        svc.store()
+            .insert_agent_session(&child)
+            .await
+            .expect("child agent");
+        AgentId::from(id)
+    }
+
+    /// Insert a task note in `status` and link it to `agent` as its task.
+    async fn link_task_note(
+        svc: &Services,
+        ws: &WorkspaceId,
+        agent_id: &AgentId,
+        status: intent_core::TaskStatus,
+    ) {
+        let ts = now_iso();
+        let note_id = intent_core::NoteId::from(format!("task-{}", agent_id.0));
+        let note = intent_core::Note {
+            id: note_id.clone(),
+            workspace_id: ws.clone(),
+            title: "Task".to_string(),
+            content: "body".to_string(),
+            content_type: intent_core::ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: None,
+            visibility: intent_core::NoteVisibility::Workspace,
+            metadata: intent_core::NoteMetadata {
+                task: Some(intent_core::TaskMetadata {
+                    status,
+                    ..Default::default()
+                }),
+            },
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        };
+        svc.store().insert_note(&note).await.expect("task note");
+        let mut session = svc.store().get_agent_session(agent_id).await.unwrap();
+        session.task_note_id = Some(note_id);
+        svc.store()
+            .update_agent_session(ws, &session)
+            .await
+            .expect("link task");
+    }
+
+    /// The parent-takeover half of the holder decision: a live DIRECT
+    /// sub-agent's monitor is adoptable by its parent once the child has
+    /// settled — same re-arm semantics as orphan adoption, same
+    /// `adoptedFrom` payload/event — and, unlike an orphan's dead owner,
+    /// the child is woken exactly once with a `transferred` notice naming
+    /// the adopter.
+    async fn assert_parent_takeover(
+        svc: &Services,
+        ws: &WorkspaceId,
+        parent: &AgentId,
+        child: &AgentId,
+        first: &PrMonitor,
+    ) {
+        let registered_before = registered_event_data(svc, ws).await.len();
+        let adopted = svc
+            .pr_monitor_start_op(ws, parent, 42, None)
+            .await
+            .expect("takeover is a success payload");
+        assert_eq!(adopted["ok"], json!(true), "{adopted}");
+        assert!(adopted.get("refused").is_none(), "{adopted}");
+        assert_eq!(
+            adopted["adoptedFrom"],
+            json!(child.to_string()),
+            "{adopted}"
+        );
+        assert_eq!(adopted["monitor"]["monitorId"], json!(first.monitor_id));
+        assert_eq!(adopted["monitor"]["agentId"], json!(parent.to_string()));
+
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.agent_id, *parent, "re-parented");
+        assert_eq!(row.state, PrMonitorState::Active);
+        assert!(row.pending_changes.is_empty(), "pending cleared: {row:?}");
+        assert_eq!(
+            row.baseline_snapshot, row.last_snapshot,
+            "baseline refreshed"
+        );
+        assert_ne!(
+            row.baseline_snapshot, first.baseline_snapshot,
+            "baseline moved"
+        );
+
+        let events = registered_event_data(svc, ws).await;
+        assert_eq!(events.len(), registered_before + 1, "one registered event");
+        assert_eq!(
+            events[0]["adoptedFrom"],
+            json!(child.to_string()),
+            "{}",
+            events[0]
+        );
+        assert!(svc.pr_monitors_for_agent(child).await.unwrap().is_empty());
+        assert_eq!(svc.pr_monitors_for_agent(parent).await.unwrap().len(), 1);
+
+        let child_session = svc.store().get_agent_session(child).await.unwrap();
+        assert_eq!(
+            child_session.messages.len(),
+            1,
+            "one wake: {child_session:?}"
+        );
+        let text = owner_messages(svc, child).await;
+        assert!(text.contains(r#""reason":"transferred""#), "{text}");
+        assert!(
+            text.contains(&format!(r#""adoptedBy":"{}""#, parent.0)),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(r#""monitorId":"{}""#, first.monitor_id.0)),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""url":"https://github.com/o/r/pull/42""#),
+            "{text}"
+        );
+        let notice = format!(
+            "[PR monitor o/r#42] Your parent agent ({}) took over this monitor because \
+             your work had settled — it now receives the PR's wakes and this monitor will \
+             not report to you again. Do not re-register a monitor on this PR \
+             (ws.pr.monitor would be refused while your parent holds it); no other action \
+             is needed.",
+            parent.0
+        );
+        assert!(text.contains(&notice), "{text}");
+        assert!(
+            !owner_messages(svc, parent)
+                .await
+                .contains("pr_monitor_wake"),
+            "the adopter is not woken by its own takeover"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parent_adopts_the_monitor_of_a_child_whose_task_is_complete() {
+        let (_db, _root, svc, forge, ws, parent) = setup().await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::Active).await;
+        let first = register(&svc, &ws, &child).await;
+        forge.edit(|s| s.conversation_comments = 2);
+        svc.poll_pr_monitors().await;
+        link_task_note(&svc, &ws, &child, intent_core::TaskStatus::Complete).await;
+        assert_parent_takeover(&svc, &ws, &parent, &child, &first).await;
+    }
+
+    #[tokio::test]
+    async fn a_parent_adopts_the_monitor_of_a_child_whose_task_is_cancelled() {
+        let (_db, _root, svc, _forge, ws, parent) = setup().await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::Active).await;
+        let first = register(&svc, &ws, &child).await;
+        link_task_note(&svc, &ws, &child, intent_core::TaskStatus::Cancelled).await;
+        assert_parent_takeover(&svc, &ws, &parent, &child, &first).await;
+    }
+
+    #[tokio::test]
+    async fn a_parent_adopts_the_monitor_of_an_idle_child_with_nothing_else_pending() {
+        let (_db, _root, svc, _forge, ws, parent) = setup().await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::RuntimeIdle).await;
+        let first = register(&svc, &ws, &child).await;
+        assert_parent_takeover(&svc, &ws, &parent, &child, &first).await;
+    }
+
+    /// A child still mid-work keeps its monitor: task `in_progress`, or idle
+    /// with a waiting reason other than the monitor (a busy worker here).
+    /// The refusal names the sub-agent relationship and the settlement
+    /// conditions under which a retry adopts.
+    #[tokio::test]
+    async fn a_parent_is_refused_while_its_child_is_still_working() {
+        let (_db, _root, svc, _forge, ws, parent) = setup().await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::Active).await;
+        let first = register(&svc, &ws, &child).await;
+        link_task_note(&svc, &ws, &child, intent_core::TaskStatus::InProgress).await;
+
+        let refused = svc
+            .pr_monitor_start_op(&ws, &parent, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(child.to_string()));
+        assert_eq!(refused["monitorId"], json!(first.monitor_id));
+        let instruction = refused["instruction"].as_str().unwrap();
+        assert!(
+            instruction.contains("by your sub-agent Child (agent-child), which is still working"),
+            "{instruction}"
+        );
+        assert!(
+            instruction.contains("its task is complete or cancelled, or it is idle with nothing pending but this monitor"),
+            "{instruction}"
+        );
+        // Contract first (keep + retry), relinquish only as the explicit
+        // "need it now" fallback.
+        assert!(
+            instruction.contains("A working sub-agent keeps its monitor"),
+            "{instruction}"
+        );
+        let retry_at = instruction.find("Retry ws.pr.monitor").expect("retry");
+        let fallback_at = instruction
+            .find("Only if you need the monitor now")
+            .expect("fallback");
+        let relinquish_at = instruction
+            .find("relinquish the monitor via ws.pr.unmonitor")
+            .expect("relinquish");
+        assert!(
+            retry_at < fallback_at && fallback_at < relinquish_at,
+            "{instruction}"
+        );
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.agent_id, child, "not re-parented");
+        assert!(
+            !owner_messages(&svc, &child)
+                .await
+                .contains("pr_monitor_wake"),
+            "no wake without a transfer"
+        );
+
+        // Idle, but a busy worker is a waiting reason: still refused.
+        svc.store()
+            .set_agent_session_status(
+                &ws,
+                &child,
+                AgentStatus::RuntimeIdle,
+                false,
+                &now_iso(),
+                None,
+            )
+            .await
+            .unwrap();
+        svc.set_test_busy(&child, true);
+        let refused = svc
+            .pr_monitor_start_op(&ws, &parent, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(refused["refused"], json!(true), "busy child: {refused}");
+        svc.set_test_busy(&child, false);
+
+        // Idle holding an active hook: the hook is a waiting reason too.
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &child,
+                &json!({
+                    "name": "watcher",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 10_000,
+                }),
+            )
+            .await
+            .expect("schedule");
+        let hook_id = intent_core::HookId::from(out["hook"]["hookId"].as_str().expect("hookId"));
+        let refused = svc
+            .pr_monitor_start_op(&ws, &parent, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(
+            refused["refused"],
+            json!(true),
+            "hook-holding child: {refused}"
+        );
+        svc.hook_cancel_op(&ws, &hook_id, Some(&child))
+            .await
+            .expect("cancel hook");
+
+        // Task still `in_progress`, but idle with nothing pending: the
+        // predicates are OR'd, so the takeover proceeds.
+        let adopted = svc
+            .pr_monitor_start_op(&ws, &parent, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(adopted["ok"], json!(true), "settled child: {adopted}");
+        assert_eq!(adopted["adoptedFrom"], json!(child.to_string()));
+
+        // The child's own re-register after the takeover is the ordinary
+        // refusal — the parent is a live holder, not the child's child.
+        let refused = svc
+            .pr_monitor_start_op(&ws, &child, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(
+            refused["refused"],
+            json!(true),
+            "child after takeover: {refused}"
+        );
+        assert_eq!(refused["ownerAgentId"], json!(parent.to_string()));
+        assert!(
+            !refused["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("sub-agent"),
+            "{refused}"
+        );
+    }
+
+    /// The settled-child verdict is re-evaluated at the adoption write, not
+    /// only at the pre-fetch precheck: a child that goes busy DURING the
+    /// parent's forge fetch (a new turn, which never touches the monitor
+    /// row the adoption CAS guards) is refused after the fetch, keeps its
+    /// monitor, and receives no transfer notice.
+    #[tokio::test]
+    async fn a_child_that_resumes_work_during_the_parents_fetch_keeps_its_monitor() {
+        let (_db, _root, svc, forge, ws, parent) = setup().await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::RuntimeIdle).await;
+        let first = register(&svc, &ws, &child).await;
+        let fetches_before = forge.fetches();
+
+        // Settled at precheck; the child starts a turn while `get_pr` runs.
+        let svc_in_fetch = svc.clone();
+        let child_in_fetch = child.clone();
+        forge.set_on_get_pr(Some(Box::new(move |_| {
+            svc_in_fetch.set_test_busy(&child_in_fetch, true);
+        })));
+        let refused = svc
+            .pr_monitor_start_op(&ws, &parent, 42, None)
+            .await
+            .expect("a refusal is a payload, not an error");
+        forge.set_on_get_pr(None);
+        assert_eq!(
+            forge.fetches(),
+            fetches_before + 1,
+            "the precheck saw a settled child, so the fetch ran"
+        );
+        assert_eq!(refused["ok"], json!(false), "{refused}");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(child.to_string()));
+        assert_eq!(refused["monitorId"], json!(first.monitor_id));
+        assert!(
+            refused["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("still working"),
+            "{refused}"
+        );
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.agent_id, child, "not re-parented");
+        assert_eq!(row.state, PrMonitorState::Active);
+        assert!(
+            !owner_messages(&svc, &child)
+                .await
+                .contains("pr_monitor_wake"),
+            "no transfer notice without a transfer"
+        );
+
+        // Once the child is idle again the same call adopts.
+        svc.set_test_busy(&child, false);
+        assert_parent_takeover(&svc, &ws, &parent, &child, &first).await;
+    }
+
+    /// Store probes on the takeover path fail CLOSED: an idle child whose
+    /// pending-question state cannot be read (its newest transcript row no
+    /// longer decodes, so the question derivation errors while every other
+    /// probe succeeds) is refused, and the row keeps its owner. The
+    /// convenience count would have collapsed that error to "none pending"
+    /// and adopted.
+    #[tokio::test]
+    async fn a_parent_is_refused_when_the_childs_pending_question_state_is_unreadable() {
+        let (_db, _root, svc, _forge, ws, parent) = setup().await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::RuntimeIdle).await;
+        let first = register(&svc, &ws, &child).await;
+        let msg = svc
+            .store()
+            .append_agent_message(&child, "assistant", &json!([]), &now_iso())
+            .await
+            .expect("assistant row");
+        sqlx::query("UPDATE agent_message SET content = '{bad' WHERE id = ?")
+            .bind(&msg.id)
+            .execute(svc.store().write_pool())
+            .await
+            .expect("corrupt message content");
+        assert!(
+            svc.try_pending_question_count(&child).await.is_err(),
+            "the propagating probe surfaces the decode error"
+        );
+        assert_eq!(
+            svc.pending_question_count(&child).await,
+            0,
+            "the convenience count still fails open"
+        );
+
+        let refused = svc
+            .pr_monitor_start_op(&ws, &parent, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["reason"], json!("already-monitored"), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(child.to_string()));
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.agent_id, child, "not re-parented");
+        assert_eq!(row.state, PrMonitorState::Active);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_message WHERE agent_id = ?")
+            .bind(&child.0)
+            .fetch_one(svc.store().write_pool())
+            .await
+            .expect("count child rows");
+        assert_eq!(rows, 1, "no wake without a transfer");
+    }
+
+    /// Only the DIRECT parent may take over: the parent's own parent is
+    /// refused even though the holder has settled.
+    #[tokio::test]
+    async fn a_grandparent_is_refused_a_settled_grandchilds_monitor() {
+        let (_db, _root, svc, _forge, ws, grandparent) = setup().await;
+        let parent = child_agent(
+            &svc,
+            &ws,
+            "agent-parent",
+            &grandparent,
+            AgentStatus::RuntimeIdle,
+        )
+        .await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::RuntimeIdle).await;
+        let first = register(&svc, &ws, &child).await;
+
+        let refused = svc
+            .pr_monitor_start_op(&ws, &grandparent, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        assert_eq!(refused["ownerAgentId"], json!(child.to_string()));
+        assert!(
+            !refused["instruction"]
+                .as_str()
+                .unwrap()
+                .contains("sub-agent"),
+            "{refused}"
+        );
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.agent_id, child, "not re-parented");
+    }
+
+    /// Settlement only opens the monitor to the DIRECT parent: a sibling
+    /// (or any non-parent) gets the ordinary refusal, no sub-agent wording.
+    #[tokio::test]
+    async fn a_non_parent_is_refused_a_settled_childs_monitor() {
+        let (_db, _root, svc, _forge, ws, parent) = setup().await;
+        let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::RuntimeIdle).await;
+        let first = register(&svc, &ws, &child).await;
+        let sibling = second_agent(&svc, &ws, "agent-sibling").await;
+
+        let refused = svc
+            .pr_monitor_start_op(&ws, &sibling, 42, None)
+            .await
+            .expect("payload");
+        assert_eq!(refused["refused"], json!(true), "{refused}");
+        let instruction = refused["instruction"].as_str().unwrap();
+        assert!(
+            instruction.contains("by agent Child (agent-child);"),
+            "{instruction}"
+        );
+        assert!(!instruction.contains("sub-agent"), "{instruction}");
+        let row = svc.store().get_pr_monitor(&first.monitor_id).await.unwrap();
+        assert_eq!(row.agent_id, child, "not re-parented");
     }
 
     /// Adoption counts against the adopter's own cap, and the direct-service
