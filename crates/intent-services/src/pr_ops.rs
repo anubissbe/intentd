@@ -333,6 +333,47 @@ pub(crate) fn upsert_pr_info(
     true
 }
 
+/// PR URL identity for the passive `github.pulls.get` fold. The forge serves
+/// PR URLs in its canonical slug casing while persisted URLs may carry a
+/// client-supplied variant (`workspace.update` accepts them unchanged), so
+/// two URLs name the same PR when they agree ignoring ASCII case — the
+/// in-memory counterpart of the `COLLATE NOCASE` store lookups
+/// (`list_workspaces_referencing_pr_url` and its git-root sibling).
+pub(crate) fn same_pr_url(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// URL-keyed sibling of [`upsert_pr_info`] for the passive `github.pulls.get`
+/// fold: a fetched snapshot replaces every pool entry sharing its `url`
+/// ([`same_pr_url`]; appending when absent) and never a same-numbered PR from
+/// another repository. Pre-existing same-URL duplicates collapse into the
+/// single fetched snapshot at the first duplicate's position, so no stale
+/// copy outlives the fold. Returns `true` when the list actually changed.
+pub(crate) fn upsert_pr_info_by_url(
+    list: &mut Option<Vec<PullRequestInfo>>,
+    info: &PullRequestInfo,
+) -> bool {
+    let items = list.get_or_insert_with(Vec::new);
+    let same = |p: &PullRequestInfo| same_pr_url(&p.url, &info.url);
+    let matches = items.iter().filter(|p| same(p)).count();
+    if matches == 1 {
+        let existing = items.iter_mut().find(|p| same(p)).unwrap();
+        if *existing == *info {
+            return false;
+        }
+        *existing = info.clone();
+        return true;
+    }
+    if matches == 0 {
+        items.push(info.clone());
+        return true;
+    }
+    let first = items.iter().position(&same).unwrap();
+    items.retain(|p| !same(p));
+    items.insert(first, info.clone());
+    true
+}
+
 /// Cap on stale `pull_requests` re-fetches per git root per sweep
 /// (monorepo#3127). Bounds the forge calls added by
 /// [`refresh_stale_pool_entries`] so a long PR history stays within the
@@ -976,24 +1017,24 @@ pub(crate) async fn fetch_merge_requirements(
     repo_ref: &RepoRef,
     number: u64,
 ) -> Result<MergeRequirements> {
-    let (_, requirements, _, _) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
-    Ok(requirements)
+    let (_, read) = fetch_merge_requirements_detailed(sc, repo_ref, number).await?;
+    Ok(read.requirements)
 }
 
 /// [`fetch_merge_requirements`] plus the by-products the PR monitor needs
 /// for its own snapshot — the [`PullRequest`] the checklist was composed from
-/// (title / url / head SHA), the review-comment count from the same thread
-/// fetch, and the probe-answered flag (see [`merge_requirements_for_pr`]) —
-/// so a poll never repeats the `get_pr` / thread reads.
+/// (title / url / head SHA) and the [`MergeRequirementsRead`] it came with
+/// (review-comment count from the same thread fetch, probe-answered flag,
+/// sub-read completeness) — so a poll never repeats the `get_pr` / thread
+/// reads.
 pub(crate) async fn fetch_merge_requirements_detailed(
     sc: &dyn SourceControl,
     repo_ref: &RepoRef,
     number: u64,
-) -> Result<(PullRequest, MergeRequirements, i64, bool)> {
+) -> Result<(PullRequest, MergeRequirementsRead)> {
     let pr = sc.get_pr(repo_ref, number).await.map_err(map_sc_err)?;
-    let (requirements, review_comments, ejection_known) =
-        merge_requirements_for_pr(sc, repo_ref, number, &pr).await?;
-    Ok((pr, requirements, review_comments, ejection_known))
+    let read = merge_requirements_for_pr_detailed(sc, repo_ref, number, &pr).await?;
+    Ok((pr, read))
 }
 
 /// Split a best-effort forge read into "answered" / "degraded" while
@@ -1031,6 +1072,40 @@ pub(crate) async fn merge_requirements_for_pr(
     number: u64,
     pr: &PullRequest,
 ) -> Result<(MergeRequirements, i64, bool)> {
+    let read = merge_requirements_for_pr_detailed(sc, repo_ref, number, pr).await?;
+    Ok((
+        read.requirements,
+        read.review_comment_count,
+        read.ejection_known,
+    ))
+}
+
+/// [`merge_requirements_for_pr`]'s result plus whether EVERY sub-read behind
+/// it answered — the PR monitor's precondition for reusing a checklist on
+/// later polls instead of re-fetching it.
+#[derive(Debug, Clone)]
+pub(crate) struct MergeRequirementsRead {
+    pub(crate) requirements: MergeRequirements,
+    /// Review-comment count from the same thread fetch.
+    pub(crate) review_comment_count: i64,
+    /// Whether the merge-requirements probe itself answered (the only source
+    /// of the merge-queue ejection signal).
+    pub(crate) ejection_known: bool,
+    /// `false` when ANY sub-read degraded — probe, reviews, review decision,
+    /// fallback check runs, or review threads (whose fallback cannot report
+    /// thread resolution) — so the checklist carries a default in place of a
+    /// signal the forge may answer on the next read.
+    pub(crate) complete: bool,
+}
+
+/// [`merge_requirements_for_pr`] reporting per-sub-read completeness (see
+/// [`MergeRequirementsRead::complete`]).
+pub(crate) async fn merge_requirements_for_pr_detailed(
+    sc: &dyn SourceControl,
+    repo_ref: &RepoRef,
+    number: u64,
+    pr: &PullRequest,
+) -> Result<MergeRequirementsRead> {
     let (signals, reviews) = tokio::join!(
         sc.merge_requirements(repo_ref, number),
         sc.list_reviews(repo_ref, number)
@@ -1046,6 +1121,7 @@ pub(crate) async fn merge_requirements_for_pr(
     // Captured BEFORE the review-decision backfill below can fabricate a
     // stub `signals` for a failed probe.
     let ejection_known = signals.is_some();
+    let mut complete = ejection_known && reviews.is_some();
     let agg = aggregate_reviews(&reviews.unwrap_or_default());
 
     // The probe carries the forge's `reviewDecision`; when it did not — no
@@ -1062,9 +1138,9 @@ pub(crate) async fn merge_requirements_for_pr(
                     "merge requirements: review_decision fetch failed, falling back to aggregate"
                 );
             }),
-        )?
-        .flatten();
-        if let Some(decision) = decision {
+        )?;
+        complete &= decision.is_some();
+        if let Some(decision) = decision.flatten() {
             signals.get_or_insert_with(Default::default).review_decision = Some(decision);
         }
     }
@@ -1078,8 +1154,9 @@ pub(crate) async fn merge_requirements_for_pr(
         .or_else(|| Some(pr.source_branch.clone()).filter(|s| !s.is_empty()));
     let fallback_runs = match head_ref {
         Some(git_ref) if !rollup_known && sc.capabilities().check_runs => {
-            degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?
-                .unwrap_or_default()
+            let runs = degrade_unless_rate_limited(sc.check_runs(repo_ref, &git_ref).await)?;
+            complete &= runs.is_some();
+            runs.unwrap_or_default()
         }
         _ => Vec::new(),
     };
@@ -1108,6 +1185,7 @@ pub(crate) async fn merge_requirements_for_pr(
                 pr_number = number,
                 "merge requirements: review threads unavailable, falling back to REST comments (thread resolution state unavailable, unresolved count reported as unknown)"
             );
+            complete = false;
             match fetch_all_pages(|p| sc.list_review_comments(repo_ref, number, p)).await {
                 Ok((comments, _, _)) => {
                     (count_thread_comments(&fallback_threads(comments)).0, None)
@@ -1128,7 +1206,12 @@ pub(crate) async fn merge_requirements_for_pr(
     };
 
     let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
-    Ok((requirements, review_comments, ejection_known))
+    Ok(MergeRequirementsRead {
+        requirements,
+        review_comment_count: review_comments,
+        ejection_known,
+        complete,
+    })
 }
 
 // ===========================================================================
@@ -1352,6 +1435,81 @@ mod tests {
         assert_eq!(items[0].number, merged.number);
         assert_eq!(items[0].status, PullRequestStatus::Merged);
         assert_eq!(items[1].number, 2);
+    }
+
+    #[test]
+    fn upserts_pr_info_by_url_never_touches_a_same_numbered_stranger() {
+        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut list: Option<Vec<PullRequestInfo>> = None;
+
+        // Insert into an absent list; identical snapshot is a no-op.
+        assert!(upsert_pr_info_by_url(&mut list, &open));
+        assert!(!upsert_pr_info_by_url(&mut list, &open));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+
+        // Same URL, different snapshot: replaced in place.
+        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info_by_url(&mut list, &merged));
+        assert_eq!(list.as_ref().unwrap().len(), 1);
+        assert_eq!(list.as_ref().unwrap()[0].status, PullRequestStatus::Merged);
+
+        // Same number from another repository (cross-repo pool): appended,
+        // and the original entry is left untouched.
+        let mut other_repo = pr(PrState::Open, false, None, None);
+        other_repo.url = "https://github.com/other/repo/pull/1".into();
+        let other_info = build_pr_info(&other_repo);
+        assert!(upsert_pr_info_by_url(&mut list, &other_info));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].number, items[1].number);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[1].url, other_info.url);
+    }
+
+    /// Regression (intent-hq/intentd#1923 review): a persisted pool holding
+    /// the same URL twice (`workspace.update` accepts duplicates) collapses
+    /// into the single fetched snapshot at the first duplicate's position —
+    /// never `[Merged, Open]` with a stale copy keeping the rollup at
+    /// `pr_ready` — while a distinct cross-repo URL survives.
+    #[test]
+    fn upserts_pr_info_by_url_collapses_same_url_duplicates() {
+        let open = build_pr_info(&pr(PrState::Open, false, Some(true), Some("clean")));
+        let mut other_repo = pr(PrState::Open, false, None, None);
+        other_repo.url = "https://github.com/other/repo/pull/1".into();
+        let other_info = build_pr_info(&other_repo);
+        let mut list = Some(vec![open.clone(), other_info.clone(), open.clone()]);
+
+        let merged = build_pr_info(&pr(PrState::Merged, false, None, None));
+        assert!(upsert_pr_info_by_url(&mut list, &merged));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[1].url, other_info.url);
+        // The collapsed pool is stable: an identical re-fetch is a no-op.
+        assert!(!upsert_pr_info_by_url(&mut list, &merged));
+    }
+
+    /// Regression (intent-hq/intentd#1923 review): PR URL identity folds
+    /// ASCII case — a persisted `example/repo` URL is the same PR as the
+    /// forge's canonical `Example/Repo` casing, so the fetched snapshot
+    /// replaces it (adopting the forge casing) instead of appending a
+    /// duplicate.
+    #[test]
+    fn upserts_pr_info_by_url_matches_case_variant_urls() {
+        let mut persisted = pr(PrState::Open, false, Some(true), Some("clean"));
+        persisted.url = "https://github.com/example/repo/pull/42".into();
+        let mut list = Some(vec![build_pr_info(&persisted)]);
+
+        let mut fetched = pr(PrState::Merged, false, None, None);
+        fetched.url = "https://github.com/Example/Repo/pull/42".into();
+        let fetched_info = build_pr_info(&fetched);
+        assert!(same_pr_url(&persisted.url, &fetched.url));
+        assert!(upsert_pr_info_by_url(&mut list, &fetched_info));
+        let items = list.as_ref().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, PullRequestStatus::Merged);
+        assert_eq!(items[0].url, fetched_info.url);
+        assert!(!upsert_pr_info_by_url(&mut list, &fetched_info));
     }
 
     #[test]
