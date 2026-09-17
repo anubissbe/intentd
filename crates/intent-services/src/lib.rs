@@ -4513,6 +4513,32 @@ impl Services {
         self.sweep_rate_limit.paused_remaining().is_some()
     }
 
+    /// The RFC 3339 (whole-second) deadline of the active global rate-limit
+    /// pause, or `None` while the gate is open — the `pausedUntil` value the
+    /// PR-monitor surfaces carry so a checklist can be labelled stale.
+    pub(crate) fn sweep_rate_limit_paused_until(&self) -> Option<String> {
+        let until = self.sweep_rate_limit.paused_until()?;
+        let until = time::OffsetDateTime::from(until)
+            .replace_nanosecond(0)
+            .ok()?;
+        until
+            .format(&time::format_description::well_known::Rfc3339)
+            .ok()
+    }
+
+    /// The pause annotation carried as `lastError` by PR monitors while the
+    /// global rate-limit pause is active, naming the pause deadline. This is
+    /// the error value a rate-limited fetch resolves to (and the cache
+    /// shares with the sibling monitors of the same PR); it is never the
+    /// annotation a write-back LANDS — the store strips any annotation from
+    /// the caller's `last_error` and keeps the row's own
+    /// (`PrMonitorPollUpdate::last_error`): the rows are stamped and cleared
+    /// only by the serialized gate transitions, so a poll's gate read can
+    /// neither strip, resurrect, nor re-extend the pause the row carries.
+    pub(crate) fn rate_limit_pause_error(&self) -> String {
+        rate_limit::pause_error(self.sweep_rate_limit_paused_until().as_deref())
+    }
+
     /// A sweep forge call failed with [`Error::RateLimited`]: pause all
     /// forge-touching sweep work globally until the quota window resets.
     /// The pause honors the forge-reported reset timestamp (GitHub's free
@@ -4521,23 +4547,169 @@ impl Services {
     /// pause window (the opening trigger); repeat triggers while paused
     /// extend the deadline silently, coalescing what used to be one WARN
     /// per root/workspace per tick.
+    ///
+    /// Opening the window also annotates `lastError` on EVERY active PR
+    /// monitor across workspaces with the pause deadline: whichever sweep
+    /// tripped the limit, no monitor is polled until the window elapses, and
+    /// a monitor whose checklist is going stale must say so instead of
+    /// sitting on an empty `lastError` with a frozen `lastPolledAt`. A
+    /// genuine fetch error already on a row is kept (the pause is appended),
+    /// and a trigger that EXTENDS the deadline re-annotates so every row
+    /// names the current deadline — independent of the WARN coalescing. The
+    /// annotation leaves the rows' concurrency token alone (see
+    /// [`Store::annotate_active_pr_monitors_pause`]) and an in-flight poll's
+    /// write-back composes with it in SQL, whichever lands first; the first
+    /// successful post-pause poll clears it. The gate transition and the
+    /// stamp run under the gate's reconcile lock
+    /// ([`rate_limit::RateLimitGate::reconcile`]), so a lift's clear cannot
+    /// land between them and erase the fresh stamp; the probe runs before
+    /// the lock, never under it.
     async fn pause_sweeps_for_rate_limit(
         &self,
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
         detail: &str,
     ) {
-        let reset_unix = sc.rate_limit_reset_at().await.ok().flatten();
+        let reset_unix = sc
+            .rate_limit_status()
+            .await
+            .ok()
+            .and_then(|status| status.reset_at);
+        let _reconcile = self.sweep_rate_limit.reconcile().await;
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let pause = rate_limit::pause_duration(reset_unix, now_unix);
-        if self.sweep_rate_limit.pause_for(pause) {
+        let before = self.sweep_rate_limit_paused_until();
+        let opened = self.sweep_rate_limit.pause_for(pause);
+        if opened {
             tracing::warn!(
                 pause_secs = pause.as_secs(),
                 reset_unix,
                 detail,
                 "forge rate limit hit: pausing pr refresh, git root + pr monitor sweeps globally"
             );
+        }
+        let until = self.sweep_rate_limit_paused_until();
+        if !opened && until == before {
+            return;
+        }
+        match self
+            .store
+            .annotate_active_pr_monitors_pause(&rate_limit::pause_error(until.as_deref()))
+            .await
+        {
+            Ok(stamped) => tracing::debug!(
+                stamped,
+                opened,
+                "forge rate limit hit: pause recorded as lastError on active pr monitors"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "forge rate limit hit: failed to record the pause on active pr monitors"
+            ),
+        }
+    }
+
+    /// While the gate is paused, re-probe the forge's quota-free
+    /// `rate_limit` endpoint and lift the pause early once the quota has
+    /// recovered ([`rate_limit::quota_recovered`]: a reported `remaining`
+    /// at or above `max(500, 10% of limit)`), instead of sitting out the
+    /// full `reset + margin` blackout — the reported reset is the window's
+    /// nominal turnover, and the quota is routinely back well before it.
+    /// Called once at the top of each forge-touching sweep tick, so a
+    /// paused tick costs at most one (free) probe. A probe failure, a host
+    /// without the signal, or a quota still below the floor keeps the
+    /// existing deadline — no behavior change from the fixed window.
+    ///
+    /// Returns `true` when this call lifted the pause: one INFO is logged
+    /// and the pause annotation every active PR monitor carries
+    /// ([`Self::pause_sweeps_for_rate_limit`]) is cleared
+    /// ([`Store::clear_active_pr_monitors_pause`]) — the guarded
+    /// write-backs deliberately keep an annotation whose deadline has not
+    /// passed, so without the clear `ws.pr.monitors` / `ws.pr.snapshot`
+    /// would keep reporting a pause no longer in force until the stale
+    /// deadline aged out. The lift and the clear run under the gate's
+    /// reconcile lock ([`rate_limit::RateLimitGate::reconcile`]), after the
+    /// probe: a trigger that re-paused (and re-stamped) meanwhile either
+    /// moved the deadline — the probe's verdict was about the window it
+    /// probed, so the lift is skipped and the next tick re-probes — or
+    /// waits for the clear to finish and stamps the rows afterwards; and
+    /// the clear is scoped to the lifted deadline, so a stamp naming a
+    /// later one is never erased by it. A poll write-back racing the lift
+    /// cannot undo it either: write-backs never land an annotation of their
+    /// own, only keep or drop the row's (`PrMonitorPollUpdate::last_error`)
+    /// — so one that read the row under the lifted pause neither
+    /// resurrects it on a cleared row nor re-extends a shorter pause
+    /// stamped since.
+    async fn maybe_lift_rate_limit_pause(
+        &self,
+        sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
+    ) -> bool {
+        let Some(until) = self.sweep_rate_limit_paused_until() else {
+            return false;
+        };
+        let status = match sc.rate_limit_status().await {
+            Ok(status) => status,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    until,
+                    "forge rate limit pause: quota probe failed; keeping the deadline"
+                );
+                return false;
+            }
+        };
+        if !rate_limit::quota_recovered(status.remaining, status.limit) {
+            tracing::debug!(
+                remaining = status.remaining,
+                limit = status.limit,
+                until,
+                "forge rate limit pause: quota not recovered; keeping the deadline"
+            );
+            return false;
+        }
+        let _reconcile = self.sweep_rate_limit.reconcile().await;
+        if self.sweep_rate_limit_paused_until().as_deref() != Some(until.as_str()) {
+            tracing::debug!(
+                until,
+                now = ?self.sweep_rate_limit_paused_until(),
+                "forge rate limit pause: the window moved during the probe; not lifting"
+            );
+            return false;
+        }
+        if !self.sweep_rate_limit.lift() {
+            return false;
+        }
+        tracing::info!(
+            remaining = status.remaining,
+            limit = status.limit,
+            until,
+            "forge quota recovered: lifting the sweep rate-limit pause early"
+        );
+        self.clear_pr_monitor_pause_annotations(Some(&rate_limit::pause_error(Some(&until))))
+            .await;
+        true
+    }
+
+    /// Strip the persisted pause annotation from every active PR monitor
+    /// ([`Store::clear_active_pr_monitors_pause`]) once the in-memory gate
+    /// is open before the deadline those annotations name — an early lift
+    /// ([`Self::maybe_lift_rate_limit_pause`]), which passes the annotation
+    /// it lifted so a newer pause's stamp survives, or a daemon restart
+    /// ([`Services::rehydrate_pr_monitors`]), which passes `None` to strip
+    /// them all. Callers hold the gate's reconcile lock. Fail-soft: a store
+    /// error is logged, the sweep goes on and the first successful poll
+    /// after the stale deadline clears each row on its own.
+    pub(crate) async fn clear_pr_monitor_pause_annotations(&self, lifted: Option<&str>) {
+        match self.store.clear_active_pr_monitors_pause(lifted).await {
+            Ok(cleared) => tracing::debug!(
+                cleared,
+                "forge rate limit pause lifted: cleared the pause from active pr monitors"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "forge rate limit pause lifted: failed to clear the pause from active pr monitors"
+            ),
         }
     }
 
@@ -5126,6 +5298,11 @@ impl Services {
                 None
             }
         };
+        // A paused tick spends its one free quota probe here: the pause
+        // lifts early once the quota has recovered (monorepo#2961).
+        if let Some(sc) = sc.as_ref() {
+            self.maybe_lift_rate_limit_pause(sc).await;
+        }
         for ws in workspaces {
             // STAB-3 fix: refresh all workspaces (discovery + update), not just
             // those already linked. `refresh_workspace_pr_with_sc` skips
@@ -28146,6 +28323,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let injected = self.source_control.clone();
+        let paused_until = self.sweep_rate_limit_paused_until();
         Box::pin(async move {
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
@@ -28249,6 +28427,13 @@ impl WorkspaceApi for Services {
             // resolution state was unreadable.
             if let Some(count) = unresolved_thread_count {
                 snapshot["comments"]["unresolvedThreadCount"] = serde_json::json!(count);
+            }
+            // Presence-detected: while the daemon's global forge rate-limit
+            // pause is active, the PR monitors' checklists are not being
+            // refreshed — the deadline lets the caller label them stale.
+            // This one-shot read itself is not gated.
+            if let Some(until) = paused_until {
+                snapshot["pausedUntil"] = serde_json::json!(until);
             }
             Ok(snapshot)
         })
