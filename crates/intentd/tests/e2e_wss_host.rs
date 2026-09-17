@@ -15,7 +15,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,9 +59,8 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve")
-        .env("INTENTD_DATA_DIR", data_dir)
+    let mut cmd = common::serve_command();
+    cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
@@ -223,7 +222,7 @@ where
 async fn boot() -> (Daemon, u16, Arc<ClientConfig>) {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
@@ -698,7 +697,6 @@ exit "$code"
     let path = format!("{}:/usr/bin:/bin", bin_dir.display());
     let env = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("PATH", path.as_str()),
         ("HOME", home_dir.to_str().unwrap()),
         ("SHELL", "/bin/sh"),
@@ -1571,9 +1569,8 @@ async fn host_find_binary_uses_login_shell_path() {
     }
 
     // Spawn daemon with minimal PATH and fake SHELL
-    let env: [(&str, &str); 4] = [
+    let env: [(&str, &str); 3] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("PATH", "/usr/bin:/bin"), // Minimal PATH that won't find our binary
         ("SHELL", fake_shell_path.to_str().unwrap()),
     ];
@@ -1630,7 +1627,7 @@ async fn host_find_binary_uses_login_shell_path() {
 async fn host_provider_discovery_over_wss() {
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
@@ -1878,9 +1875,8 @@ async fn host_provider_discovery_gates_pi_on_old_cli_over_wss() {
     }
 
     let fake_pi_str = fake_pi.to_str().unwrap();
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("PI_ACP_PI_COMMAND", fake_pi_str),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -1969,7 +1965,7 @@ async fn host_provider_discovery_honors_path_overrides_over_wss() {
     )
     .expect("seed config.toml with providers.paths");
 
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
@@ -2060,7 +2056,7 @@ async fn host_provider_discovery_self_heals_default_provider_over_wss() {
     )
     .expect("seed config.toml with providers.paths");
 
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,
@@ -2154,9 +2150,8 @@ async fn host_create_directory_over_wss() {
     // Pin the daemon-host home so the tilde-expansion assertion is exact.
     let home = data_dir.join("home");
     std::fs::create_dir_all(&home).expect("mkdir fake home");
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", home.to_str().unwrap()),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -2293,9 +2288,8 @@ async fn host_list_directory_over_wss() {
         "XDG_DOWNLOAD_DIR=\"$HOME/Fetched\"\n",
     )
     .expect("write user-dirs.dirs");
-    let env: [(&str, &str); 3] = [
+    let env: [(&str, &str); 2] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
-        ("INTENTD_TCP_PORT", "0"),
         ("HOME", home.to_str().unwrap()),
     ];
     let child = spawn_serve(&data_dir, "both", &env);
@@ -2365,7 +2359,7 @@ async fn host_discovery_cache_positive_and_negative_over_wss() {
 
     let data_dir_guard = temp_data_dir();
     let data_dir = data_dir_guard.path().to_path_buf();
-    let env: [(&str, &str); 2] = [("INTENTD_AUTH_TOKEN", TOKEN), ("INTENTD_TCP_PORT", "0")];
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
     let child = spawn_serve(&data_dir, "both", &env);
     let daemon = Daemon {
         child,

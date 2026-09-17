@@ -173,10 +173,10 @@ pub use config_watcher::ConfigWatcher;
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
-    import_legacy_settings, max_concurrent_adapters, max_concurrent_agents,
-    migrate_active_provider_setting, migrate_cow_isolation_to_sandbox, migrate_default_vocabulary,
-    migrate_quick_action_settings, report_to_parent_debounce_seconds, tool_payload_retention_days,
-    InMemorySecretStore, SecretStore,
+    host_total_memory_bytes, import_legacy_settings, max_concurrent_adapters,
+    max_concurrent_agents, migrate_active_provider_setting, migrate_cow_isolation_to_sandbox,
+    migrate_default_vocabulary, migrate_quick_action_settings, report_to_parent_debounce_seconds,
+    tool_payload_retention_days, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
@@ -193,7 +193,7 @@ pub mod auggie_discovery {
 
 pub use agent_manager::{
     compute_process_cap, default_process_cap, recommended_memory_budget_bytes, AgentManager,
-    BusEventSink, ProcessRegistry, TreeMemoryProbe,
+    BusEventSink, ProcessRegistry, TreeMemoryProbe, TreeSample,
 };
 // Re-export the suspend-overlap query trait (Task C) so the composition root
 // can implement it on the daemon's `SuspendTracker` and wire it via
@@ -344,7 +344,11 @@ struct WorkspaceAggregateSnapshot {
     unread: Option<HashSet<WorkspaceId>>,
     active_hooks: HashSet<WorkspaceId>,
     active_pr_monitors: HashSet<WorkspaceId>,
-    monitor_pr_signals: HashMap<WorkspaceId, workspace_status::MonitorPrSignals>,
+    /// Each workspace's displayStatus-relevant PR monitor rows from the
+    /// list's ONE bulk monitor read; folded per row during enrichment,
+    /// once the workspace's own PR copies are at hand
+    /// ([`pr_monitor::fold_monitor_pr_signals`]).
+    monitor_rows: HashMap<WorkspaceId, Vec<intent_core::PrMonitor>>,
     /// PRs persisted on each workspace's secondary git roots
     /// (`workspace_git_root.pull_requests`): the list's ONE bulk git-root
     /// read, fed to the displayStatus PR rungs during enrichment and then
@@ -746,6 +750,14 @@ pub struct Services {
     /// interleave a concurrent row mutation. `None` in production wiring;
     /// tests inject via the `#[cfg(test)]`-only `with_attention_write_park`.
     attention_write_park: Option<Arc<script_ops::SupervisePark>>,
+    /// Test park seam (intent-hq/intent#5137) at the ENTRY of
+    /// `settle_workspace_unread_after_seen` — after the caller's write, before
+    /// the settle's unread probe — so two concurrent settles can be held
+    /// until both writes have landed, and neither early-returns on a probe
+    /// that still sees the other's session unread. `None` in production
+    /// wiring; tests inject via the `#[cfg(test)]`-only
+    /// `with_unread_settle_entry_park`.
+    unread_settle_entry_park: Option<Arc<script_ops::SupervisePark>>,
     /// Test park seam (intent-hq/monorepo#2739) for the
     /// `deliver_wake_message` archived-gate read → enqueue window: parks the
     /// wake delivery after the gate observed the workspace archived and
@@ -1065,6 +1077,12 @@ pub struct Services {
     /// [`Services::rehydrate_pr_monitors`] and consumed by the first poll
     /// that acts on each entry; shared across clones.
     pr_monitor_catch_up: pr_monitor::PrMonitorCatchUp,
+    /// Per-PR memory of the sweep's last FULL forge fetch (change
+    /// fingerprint + shared snapshot), so a poll whose `get_pr` reports an
+    /// unchanged fingerprint reuses the previous sub-fetches instead of
+    /// re-issuing them (see [`pr_monitor::PrMonitorFetchCache`]). In-memory
+    /// only; shared across clones.
+    pr_monitor_fetch_cache: pr_monitor::PrMonitorFetchCache,
     /// Explicit override for the centralized PR-monitor loop's poll cadence
     /// (seconds). `None` — the production wiring — reads
     /// `prMonitor.pollSeconds` live from the settings registry; values below
@@ -1263,6 +1281,7 @@ impl Services {
             completion_claim_park: None,
             completion_flip_take_park: None,
             attention_write_park: None,
+            unread_settle_entry_park: None,
             wake_archived_park: None,
             task_update_projection_park: None,
             secrets: Arc::new(settings::AsyncSecretStore::new(Arc::new(
@@ -1317,6 +1336,7 @@ impl Services {
             hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
+            pr_monitor_fetch_cache: Arc::new(Mutex::new(HashMap::new())),
             pr_monitor_poll_seconds: None,
             pr_monitor_hourly_request_budget: None,
             pr_monitor_logged_interval: Arc::new(Mutex::new(None)),
@@ -2008,6 +2028,19 @@ impl Services {
         self
     }
 
+    /// Test seam (intent-hq/intent#5137): park
+    /// `settle_workspace_unread_after_seen` at its entry — after the caller's
+    /// write, before the unread probe — so concurrent settles hold until every
+    /// racing write has landed. Production wiring keeps `None` (no parking).
+    #[cfg(test)]
+    pub(crate) fn with_unread_settle_entry_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.unread_settle_entry_park = Some(park);
+        self
+    }
+
     /// Test seam (intent-hq/monorepo#2739): park `deliver_wake_message` in
     /// its archived-gate read → enqueue window so a concurrent
     /// `workspace.unarchive` inside that window is deterministic. Production
@@ -2070,6 +2103,15 @@ impl Services {
     /// is armed (no-op in production wiring).
     async fn park_attention_write(&self) {
         if let Some(park) = &self.attention_write_park {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
+    }
+
+    /// Park at the entry of the unread settle when the test seam is armed
+    /// (no-op in production wiring).
+    async fn park_unread_settle_entry(&self) {
+        if let Some(park) = &self.unread_settle_entry_park {
             park.entered.notify_one();
             park.release.notified().await;
         }
@@ -2710,10 +2752,6 @@ impl Services {
                     .push(monitor);
             }
         }
-        let monitor_pr_signals = monitor_rows
-            .into_iter()
-            .map(|(id, monitors)| (id, pr_monitor::fold_monitor_pr_signals(&monitors)))
-            .collect();
         // A read failure degrades to no git-root PRs (the pre-fold
         // derivation) rather than failing the list.
         let mut git_root_prs: HashMap<WorkspaceId, Vec<PullRequestInfo>> = HashMap::new();
@@ -2782,7 +2820,7 @@ impl Services {
             unread: unread.ok(),
             active_hooks: active_hooks.unwrap_or_default(),
             active_pr_monitors,
-            monitor_pr_signals,
+            monitor_rows,
             git_root_prs,
             legacy_question_holds,
             cow_supported,
@@ -2851,10 +2889,10 @@ impl Services {
             unread,
             Some(workspace_status::WorkspaceStatusSnapshot {
                 waiting,
-                monitor_pr_signals: snapshot
-                    .monitor_pr_signals
+                monitor_rows: snapshot
+                    .monitor_rows
                     .get(&ws.id)
-                    .copied()
+                    .map(Vec::as_slice)
                     .unwrap_or_default(),
                 git_root_prs: snapshot
                     .git_root_prs
@@ -3693,6 +3731,7 @@ impl Services {
         if workspace_id.is_chief() {
             return;
         }
+        self.park_unread_settle_entry().await;
         let still_unread = self
             .store
             .workspace_has_unread_top_level_session(workspace_id)
@@ -5030,6 +5069,113 @@ impl Services {
                 None => Ok(PrRefreshOutcome::Unchanged),
             }
         }
+    }
+
+    /// Passively fold a PR snapshot fetched on demand (`github.pulls.get`,
+    /// the FE hover card) into the daemon-owned PR state, so the sidebar's
+    /// `displayStatus` grouping reflects the fresh status through the
+    /// existing event plumbing instead of waiting for the next sweep.
+    ///
+    /// Every live (non-archived, non-remote) workspace referencing the PR by
+    /// URL — linked via `prUrl` or carrying a `pullRequests` pool entry,
+    /// compared ignoring ASCII case ([`pr_ops::same_pr_url`]) so a
+    /// client-cased persisted URL still folds — gets the pool entry
+    /// upserted (URL-keyed: pools can be cross-repo, so a same-numbered PR
+    /// from another repository is never touched; same-URL duplicates
+    /// collapse into the fetched snapshot); when
+    /// the PR is the workspace's linked one (same repo and number) the
+    /// linked columns update exactly like the update path of
+    /// [`Self::refresh_workspace_pr_with_sc`]. Git roots whose pool holds
+    /// the URL (or whose linked PR it is) fold the same way. Deltas persist
+    /// through the scoped PR-linkage writes and emit `pr:updated` /
+    /// `gitRoot:updated` plus the displayStatus transition. This is a
+    /// passive fold: it never runs relink discovery or the stale-unlink
+    /// rule (a hover must not re-shape linkage), and a PR nobody references
+    /// writes nothing. Per-row persist failures WARN and continue; only the
+    /// lookups themselves surface as `Err`, and the RPC caller treats that
+    /// as fail-soft too.
+    pub(crate) async fn fold_fetched_pr(
+        &self,
+        repo_ref: &intent_sourcecontrol::RepoRef,
+        pr: &intent_sourcecontrol::PullRequest,
+    ) -> Result<()> {
+        let info = pr_ops::build_pr_info(pr);
+        let workspaces = self
+            .store
+            .list_workspaces_referencing_pr_url(&pr.url)
+            .await?;
+        for mut ws in workspaces {
+            let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
+            let linked = ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
+            if linked
+                && (ws.pr_status != Some(info.status)
+                    || ws.active_pull_request.as_ref() != Some(&info)
+                    || ws.pr_url.as_deref() != Some(pr.url.as_str()))
+            {
+                ws.pr_status = Some(info.status);
+                ws.pr_url = Some(pr.url.clone());
+                ws.active_pull_request = Some(info.clone());
+                changed = true;
+            }
+            if !changed {
+                continue;
+            }
+            ws.updated_at = now_iso();
+            if let Err(e) = self.store.update_workspace_pr_linkage(&ws).await {
+                tracing::warn!(
+                    workspace_id = %ws.id.as_str(),
+                    error = %e,
+                    "pr fold: persisting workspace PR delta failed"
+                );
+                continue;
+            }
+            publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
+            self.maybe_emit_display_status_changed(&ws.id).await;
+        }
+        let roots = self
+            .store
+            .list_workspace_git_roots_referencing_pr_url(&pr.url)
+            .await?;
+        for mut root in roots {
+            let mut changed = false;
+            if root
+                .pull_requests
+                .as_deref()
+                .is_some_and(|items| items.iter().any(|p| pr_ops::same_pr_url(&p.url, &pr.url)))
+            {
+                changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
+            }
+            let linked =
+                root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
+            if linked
+                && (root.pr_status != Some(info.status)
+                    || root.pr_url.as_deref() != Some(pr.url.as_str()))
+            {
+                root.pr_status = Some(info.status);
+                root.pr_url = Some(pr.url.clone());
+                changed = true;
+            }
+            if !changed {
+                continue;
+            }
+            root.updated_at = now_iso();
+            if let Err(e) = self.store.update_workspace_git_root_pr(&root).await {
+                tracing::warn!(
+                    git_root = %root.id.as_str(),
+                    error = %e,
+                    "pr fold: persisting git root PR delta failed"
+                );
+                continue;
+            }
+            publish_event(
+                self.event_bus.as_ref(),
+                git_root_changed_event(GIT_ROOT_UPDATED, &root),
+            )
+            .await;
+            self.maybe_emit_display_status_changed(&root.workspace_id)
+                .await;
+        }
+        Ok(())
     }
 
     /// Refresh active workspaces' PR linkage: existing links are re-fetched
@@ -20920,7 +21066,7 @@ impl WorkspaceApi for Services {
                                     if let Some(w) = &wrapper_path {
                                         let _ = tokio::fs::remove_file(w).await;
                                     }
-                                    (true, exit.ok().map(|e| e.exit_code))
+                                    (true, exit.ok().filter(|e| e.observed).map(|e| e.exit_code))
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -29679,6 +29825,17 @@ impl WorkspaceApi for Services {
                 .get_pr(&repo_ref, number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
+            // Fail-soft: the hover card always gets its `{ pull }`; a fold
+            // failure only costs the daemon-owned state its early refresh.
+            if let Err(e) = self.fold_fetched_pr(&repo_ref, &pr).await {
+                tracing::warn!(
+                    owner = %repo_ref.owner,
+                    repo = %repo_ref.name,
+                    pr_number = number,
+                    error = %e,
+                    "github.pulls.get: folding the fetched PR into workspace PR state failed"
+                );
+            }
             Ok(serde_json::json!({ "pull": github_ops::pull_to_json(&pr) }))
         })
     }

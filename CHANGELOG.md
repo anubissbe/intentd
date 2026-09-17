@@ -2,6 +2,64 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.68] - 2026-09-17
+
+### 🧪 Testing
+
+- *(install.ps1)* Pester coverage for the startup wait and Scheduled Task registration ([#1944](https://github.com/intent-hq/intentd/pull/1944))
+
+
+## [0.9.67] - 2026-09-17
+
+### 🐛 Bug Fixes
+
+- *(scripts)* Make the saved-script terminal state total so lost processes reach exited ([#1942](https://github.com/intent-hq/intentd/pull/1942))
+
+
+## [0.9.66] - 2026-09-16
+
+### 🧪 Testing
+
+- *(services)* Deflake concurrent retire unread settle test ([#1938](https://github.com/intent-hq/intentd/pull/1938))
+
+
+## [0.9.65] - 2026-09-16
+
+### 🚀 Features
+
+- *(pr-monitor)* Let a parent adopt a settled child's monitor ([#1935](https://github.com/intent-hq/intentd/pull/1935))
+
+### ⚙️ Miscellaneous Tasks
+
+- Select source lints by the *_lint convention and lint their discovery ([#1937](https://github.com/intent-hq/intentd/pull/1937))
+
+
+## [0.9.64] - 2026-09-16
+
+### 🧪 Testing
+
+- Share a process-group GuardedChild across e2e suites and lint raw Child ([#1928](https://github.com/intent-hq/intentd/pull/1928))
+
+
+## [0.9.63] - 2026-09-16
+
+### 🐛 Bug Fixes
+
+- Keep workspace PR status fresh (hover fold + cheap monitor polls) ([#1923](https://github.com/intent-hq/intentd/pull/1923))
+
+### 🧪 Testing
+
+- *(core)* Repo-wide fixed-sleep annotation lint with ratcheting baseline ([#1926](https://github.com/intent-hq/intentd/pull/1926))
+- *(e2e)* Centralize intentd serve spawns in common::serve_command and add serve_spawn_guard ([#1927](https://github.com/intent-hq/intentd/pull/1927))
+
+
+## [0.9.62] - 2026-09-16
+
+### 🧪 Testing
+
+- *(sitter,intentd)* Deterministic release-file barriers for the signal-handshake e2e suites ([#1924](https://github.com/intent-hq/intentd/pull/1924))
+
+
 ## [0.9.61] - 2026-09-16
 
 ### 🚀 Features

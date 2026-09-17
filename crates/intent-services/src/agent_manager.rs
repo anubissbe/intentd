@@ -621,6 +621,14 @@ pub fn compute_process_cap(total_memory_bytes: u64) -> usize {
 ///
 /// The recommended default: `agents.memoryBudgetMb` defaults to auto (the
 /// absent key; explicit 0 = off), and boot wiring resolves auto to this value.
+///
+/// The budget alone does not deny a spawn: [`budget_admits`] queues only when
+/// the tree is over budget *and* the host's available memory is below
+/// [`HOST_MEMORY_RESERVE_BYTES`]. The tree the probe sums is resident set
+/// sizes of every daemon descendant — dev servers, test runs, and headless
+/// browsers started through `ws.script` / `host.exec` included, with shared
+/// pages double-counted — so on a large host it crosses this number while
+/// tens of gigabytes are still free.
 #[must_use]
 pub fn recommended_memory_budget_bytes(total_memory_bytes: u64) -> u64 {
     (total_memory_bytes.saturating_sub(8 * GB) / 2).max(4 * GB)
@@ -740,20 +748,47 @@ struct RegistryInner {
     budget_pending_bytes: i64,
 }
 
-fn pop_waiter(
-    inner: &mut RegistryInner,
-) -> Option<(AgentId, tokio::sync::oneshot::Sender<()>, &'static str)> {
+/// Pop the first live waiter and deliver its wakeup while still holding the
+/// registry lock; returns the woken agent and the reason it queued under so
+/// the caller can emit `agent:process:resumed` for it.
+///
+/// The pop and the send are one locked step on purpose: a timed waiter whose
+/// re-check elapsed decides under the same lock whether a wakeup reached it
+/// (see the `stale_rx` handling in [`ProcessRegistry::acquire`]), so exactly
+/// one side — this sender or the waiter itself — emits `resumed`. Sending
+/// after the lock was released would leave a window where the waiter sees no
+/// wakeup, retires its receiver, and admits itself while this side also emits.
+fn pop_and_wake_waiter(inner: &mut RegistryInner) -> Option<(AgentId, &'static str)> {
     // Skip senders whose receiver is gone. A memory-budget waiter re-queues
     // after each [`BUDGET_RECHECK`] and an abandoned `acquire` future drops its
     // receiver outright, so handing the wakeup to a dead entry would consume it
-    // and starve a waiter that is still listening.
+    // and starve a waiter that is still listening. A send that still fails
+    // (the receiver dropped between the `is_closed` check and here) is an
+    // abandoned waiter too: skip it rather than announce a `resumed` nobody
+    // is waiting on.
     while !inner.wait_queue.is_empty() {
-        let waiter = inner.wait_queue.remove(0);
-        if !waiter.1.is_closed() {
-            return Some(waiter);
+        let (agent_id, tx, reason) = inner.wait_queue.remove(0);
+        if !tx.is_closed() && tx.send(()).is_ok() {
+            return Some((agent_id, reason));
         }
     }
     None
+}
+
+/// Settle a timed waiter's receiver after its re-check elapsed; returns true
+/// when a wakeup had already been delivered to it.
+///
+/// Must run while holding the registry lock, the same lock under which
+/// [`pop_and_wake_waiter`] pops and sends. A delivered value means the sender
+/// popped this entry and owns the `resumed` emit; otherwise the entry is still
+/// queued, and dropping the receiver here retires it (`is_closed`) before any
+/// later pop could wake an entry nobody is listening on — so the waiter's own
+/// admission is the single `resumed` for this wait.
+fn settle_stale_waiter(rx: Option<tokio::sync::oneshot::Receiver<()>>) -> bool {
+    match rx {
+        Some(mut rx) => rx.try_recv().is_ok(),
+        None => false,
+    }
 }
 
 /// Idle entries ordered least-recently-used first — the eviction candidate
@@ -1000,17 +1035,35 @@ impl BusEventSink {
     }
 }
 
+/// One sweep of the daemon's descendant tree as the spawn budget consumes it
+/// (monorepo#2063). Published as a single value so an admission decision
+/// reads the tree total, the sample id that identifies it, and the host
+/// headroom measured alongside it from the same instant — three separate
+/// reads could straddle a sweep and pair a byte total from one sample with
+/// the headroom of the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeSample {
+    /// Resident bytes across the whole descendant tree.
+    pub memory_bytes: u64,
+    /// Monotonic sample id. Lets the registry tell a fresh reading from a
+    /// repeat of the one it already corrected for; it only has to change when
+    /// the bytes are re-measured, and never has to mean anything else.
+    pub seq: u64,
+    /// Host memory available for new allocations (Linux `MemAvailable`) in
+    /// the same sweep, or `None` when the probe does not measure it. `None`
+    /// keeps the tree-only criterion: the budget denies whenever the tree is
+    /// over budget, as it did before host headroom was consulted.
+    pub available_memory: Option<u64>,
+}
+
 /// Source of the daemon's aggregate descendant-tree memory, implemented by the
 /// composition root's `system.status` sampler (intentd#1139) and by fakes in
 /// tests.
 pub trait TreeMemoryProbe: Send + Sync {
-    /// `(resident bytes across the whole descendant tree, monotonic sample id)`,
-    /// or `None` before the first sample lands.
-    ///
-    /// The sample id lets the registry tell a fresh reading from a repeat of the
-    /// one it already corrected for; it only has to change when the bytes are
-    /// re-measured, and never has to mean anything else.
-    fn sample(&self) -> Option<(u64, u64)>;
+    /// The latest sweep, or `None` before the first sample lands. One call
+    /// returns everything an admission decision needs, so the registry never
+    /// has to reconcile fields read across a sweep boundary.
+    fn sample(&self) -> Option<TreeSample>;
 
     /// Per-agent attribution of the same tree: resident bytes bucketed by
     /// nearest registered agent root, from the same sweep as [`Self::sample`]
@@ -1021,10 +1074,27 @@ pub trait TreeMemoryProbe: Send + Sync {
     }
 }
 
+/// Host headroom the budget defends (monorepo#2063 follow-up). Below this much
+/// available memory the host is genuinely short and an over-budget tree
+/// queues; at or above it the tree total is a measurement artifact of
+/// processes the daemon does not control and the spawn is admitted. Reuses
+/// [`compute_process_cap`]'s 8 GB OS/other-apps reserve plus one provisional
+/// agent's worth so the admitted spawn itself fits inside the reserve.
+pub const HOST_MEMORY_RESERVE_BYTES: u64 = 8 * GB + PROVISIONAL_AGENT_BYTES;
+
 /// An installed aggregate memory budget (monorepo#2063).
 struct MemoryBudget {
     budget_bytes: u64,
     probe: Arc<dyn TreeMemoryProbe>,
+}
+
+/// What [`ProcessRegistry::budget_denies`] saw when it refused a spawn, for
+/// the `queued` log lines: the charged tree bytes and the host headroom
+/// reading (`None` when the probe does not measure it).
+#[derive(Clone, Copy, Debug)]
+struct BudgetDenial {
+    charged: u64,
+    available_memory: Option<u64>,
 }
 
 /// Provisional cost charged against the budget for a spawn that has been
@@ -1075,8 +1145,22 @@ fn charged_bytes(sampled: u64, pending: i64) -> u64 {
 /// registry does not own (one-shot adapter chains, model probes) and, on a busy
 /// host, is simply not something the daemon controls; without this the daemon
 /// could refuse every spawn forever and never make progress.
-fn budget_admits(charged: u64, budget_bytes: u64, live: usize) -> bool {
-    live == 0 || charged < budget_bytes
+///
+/// Otherwise the budget denies only when the tree is over budget **and** the
+/// host is actually short: `available_memory` below
+/// [`HOST_MEMORY_RESERVE_BYTES`]. An over-budget tree with ample host headroom
+/// admits — the tree sums RSS of every descendant, dev servers and test runs
+/// included, and crossed a 63 GB budget with 63 GB still available. `None`
+/// (probe does not measure host memory) keeps the tree-only criterion.
+fn budget_admits(
+    charged: u64,
+    budget_bytes: u64,
+    live: usize,
+    available_memory: Option<u64>,
+) -> bool {
+    live == 0
+        || charged < budget_bytes
+        || available_memory.is_some_and(|available| available >= HOST_MEMORY_RESERVE_BYTES)
 }
 
 impl ProcessRegistry {
@@ -1105,19 +1189,38 @@ impl ProcessRegistry {
     }
 
     /// Consult the budget under the already-held lock, refreshing the pending
-    /// correction when a newer sample has landed. Returns `Some(charged_bytes)`
-    /// when the budget denies this spawn; `None` when it admits — including when
-    /// no budget is installed and when no sample exists yet, so an unconfigured
-    /// or not-yet-sampled daemon behaves exactly as before.
-    fn budget_denies(&self, inner: &mut RegistryInner) -> Option<u64> {
+    /// correction when a newer sample has landed. Returns
+    /// `Some((charged_bytes, available_memory))` when the budget denies this
+    /// spawn; `None` when it admits — including when no budget is installed,
+    /// when no sample exists yet, and when the host still has
+    /// [`HOST_MEMORY_RESERVE_BYTES`] available (see [`budget_admits`]), so an
+    /// unconfigured or not-yet-sampled daemon behaves exactly as before.
+    ///
+    /// The probe is read exactly once: tree bytes, sample id and host headroom
+    /// come out of one [`TreeSample`], so a sweep landing mid-decision cannot
+    /// pair an over-budget total from one sample with the headroom of the next.
+    fn budget_denies(&self, inner: &mut RegistryInner) -> Option<BudgetDenial> {
         let budget = self.memory.get()?;
-        let (sampled, seq) = budget.probe.sample()?;
+        let TreeSample {
+            memory_bytes: sampled,
+            seq,
+            available_memory,
+        } = budget.probe.sample()?;
         if inner.budget_sample_seq != Some(seq) {
             inner.budget_sample_seq = Some(seq);
             inner.budget_pending_bytes = 0;
         }
         let charged = charged_bytes(sampled, inner.budget_pending_bytes);
-        (!budget_admits(charged, budget.budget_bytes, inner.entries.len())).then_some(charged)
+        (!budget_admits(
+            charged,
+            budget.budget_bytes,
+            inner.entries.len(),
+            available_memory,
+        ))
+        .then_some(BudgetDenial {
+            charged,
+            available_memory,
+        })
     }
 
     /// Read-only budget visibility for `system.status` (monorepo#2063):
@@ -1138,11 +1241,11 @@ impl ProcessRegistry {
     pub fn budget_status(&self) -> Option<(u64, Option<u64>, u64)> {
         let budget = self.memory.get()?;
         let inner = self.inner.lock().unwrap();
-        let charged = budget.probe.sample().map(|(sampled, seq)| {
-            if inner.budget_sample_seq == Some(seq) {
-                charged_bytes(sampled, inner.budget_pending_bytes)
+        let charged = budget.probe.sample().map(|s| {
+            if inner.budget_sample_seq == Some(s.seq) {
+                charged_bytes(s.memory_bytes, inner.budget_pending_bytes)
             } else {
-                sampled
+                s.memory_bytes
             }
         });
         let queued = inner
@@ -1244,10 +1347,9 @@ impl ProcessRegistry {
             // provisional cost back so a spawn queued behind the budget is not
             // held off for up to a full sample period by memory already freed.
             self.budget_adjust(&mut inner, -1);
-            pop_waiter(&mut inner)
+            pop_and_wake_waiter(&mut inner)
         };
-        if let Some((resumed_id, tx, reason)) = resumed_agent {
-            let _ = tx.send(());
+        if let Some((resumed_id, reason)) = resumed_agent {
             let used = self.size();
             tracing::info!(
                 agent = %resumed_id,
@@ -1290,10 +1392,9 @@ impl ProcessRegistry {
             if !existed {
                 return;
             }
-            pop_waiter(&mut inner)
+            pop_and_wake_waiter(&mut inner)
         };
-        if let Some((resumed_id, tx, reason)) = resumed_agent {
-            let _ = tx.send(());
+        if let Some((resumed_id, reason)) = resumed_agent {
             let used = self.size();
             tracing::info!(
                 agent = %resumed_id,
@@ -1309,9 +1410,35 @@ impl ProcessRegistry {
         }
     }
 
+    /// Log + emit `agent:process:resumed` for a waiter that admitted itself —
+    /// on its timed re-check or after an eviction pass — rather than through a
+    /// [`Self::deregister`] / [`Self::mark_idle`] wakeup (those emit it when
+    /// they pop the waiter). `reason` is the label the waiter last queued
+    /// under; `None` means it never queued, or the wakeup already delivered
+    /// the event for this wait, and nothing is emitted.
+    fn emit_self_resumed(&self, agent_id: &AgentId, reason: Option<&'static str>) {
+        let Some(reason) = reason else { return };
+        let used = self.size();
+        tracing::info!(
+            agent = %agent_id,
+            used = used,
+            cap = self.cap,
+            reason = reason,
+            "process registry: queued spawn resumed"
+        );
+        if let Some(ref f) = self.event_fn {
+            let fut = f(agent_id, "agent:process:resumed", used, self.cap, reason);
+            tokio::spawn(fut);
+        }
+    }
+
     /// Ensure a slot is free before spawning: returns immediately under the cap,
     /// otherwise evicts the LRU idle process, or queues until one frees. Logs +
-    /// emits `agent:process:queued` / `agent:process:evicted` via the event callback.
+    /// emits `agent:process:queued` / `agent:process:evicted` via the event
+    /// callback, and `agent:process:resumed` when a waiter that queued is
+    /// admitted by its own re-check (a wakeup from [`Self::deregister`] /
+    /// [`Self::mark_idle`] emits it there instead) — every `queued` is
+    /// answered by exactly one `resumed` whichever path admits.
     ///
     /// When an aggregate memory budget is installed (monorepo#2063), being over
     /// budget denies admission on exactly the same terms as being at the slot
@@ -1361,6 +1488,16 @@ impl ProcessRegistry {
         // them: the next iteration queues as a waiter (timed) instead of
         // re-snapshotting the same unclaimable candidates in a hot loop.
         let mut wait_pass = false;
+        // The reason this waiter last emitted `agent:process:queued` under and
+        // still owes a `resumed` for. Cleared when a `deregister` / `mark_idle`
+        // wakeup lands (that path emits `resumed` as it pops the waiter); an
+        // admission reached any other way emits it via `emit_self_resumed`.
+        let mut owed_resume: Option<&'static str> = None;
+        // The receiver of a timed wait whose re-check elapsed. It is settled
+        // under the registry lock on the next pass (see below) rather than
+        // where the timeout fired, so the decision "did a wakeup reach me?"
+        // cannot interleave with a `pop_and_wake_waiter` on another thread.
+        let mut stale_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
         loop {
             enum Action {
                 Slot,
@@ -1377,6 +1514,9 @@ impl ProcessRegistry {
             let forced_wait = std::mem::take(&mut wait_pass);
             let action = {
                 let mut inner = self.inner.lock().unwrap();
+                if settle_stale_waiter(stale_rx.take()) {
+                    owed_resume = None;
+                }
                 let over_budget = self.budget_denies(&mut inner);
                 // Which admission constraint is binding right now. When both
                 // bind at once, the budget wins the label — matching the log
@@ -1405,13 +1545,15 @@ impl ProcessRegistry {
                     inner.wait_queue.retain(|(_, tx, _)| !tx.is_closed());
                     inner.wait_queue.push((agent_id.clone(), tx, reason));
                     let used = inner.entries.len();
-                    if let Some(charged) = over_budget {
+                    if let Some(denial) = over_budget {
                         tracing::info!(
                             agent = %agent_id,
                             used = used,
                             cap = self.cap,
-                            charged_memory_bytes = charged,
+                            charged_memory_bytes = denial.charged,
                             budget_bytes = self.memory.get().map(|b| b.budget_bytes),
+                            host_available_memory_bytes = denial.available_memory,
+                            host_memory_reserve_bytes = HOST_MEMORY_RESERVE_BYTES,
                             "process registry: spawn queued (aggregate memory budget)"
                         );
                     } else {
@@ -1426,6 +1568,7 @@ impl ProcessRegistry {
                         let fut = f(agent_id, "agent:process:queued", used, self.cap, reason);
                         tokio::spawn(fut);
                     }
+                    owed_resume = Some(reason);
                     // A claim-contention wait re-checks on a timer too: the
                     // contending sweep may release its claim (re-validation
                     // reject) without any deregister to wake this waiter.
@@ -1433,7 +1576,10 @@ impl ProcessRegistry {
                 }
             };
             match action {
-                Action::Slot => return,
+                Action::Slot => {
+                    self.emit_self_resumed(agent_id, owed_resume);
+                    return;
+                }
                 Action::Evict(candidates, reason) => {
                     let mut evicted_one = false;
                     for (id, kill) in candidates {
@@ -1487,14 +1633,28 @@ impl ProcessRegistry {
                     // same candidates in a hot loop.
                     wait_pass = !evicted_one;
                 }
-                Action::Wait(rx, true) => {
+                Action::Wait(mut rx, true) => {
                     // Memory can fall with no registry event to wake us — an
                     // agent's own children exiting frees the tree without any
                     // process being deregistered — so re-evaluate on a timer.
-                    let _ = tokio::time::timeout(BUDGET_RECHECK, rx).await;
+                    // On timeout the receiver is kept and settled under the
+                    // lock on the next pass: a wakeup that raced the timer
+                    // still counts as delivered (its sender emitted `resumed`),
+                    // and otherwise the entry is retired before any pop can
+                    // hand it a wakeup we would no longer be listening for.
+                    match tokio::time::timeout(BUDGET_RECHECK, &mut rx).await {
+                        Ok(received) => {
+                            if received.is_ok() {
+                                owed_resume = None;
+                            }
+                        }
+                        Err(_elapsed) => stale_rx = Some(rx),
+                    }
                 }
                 Action::Wait(rx, false) => {
-                    let _ = rx.await;
+                    if rx.await.is_ok() {
+                        owed_resume = None;
+                    }
                 }
             }
         }
@@ -1536,6 +1696,11 @@ impl ProcessRegistry {
         // Same forced-wait handoff as `acquire`: an eviction pass that could
         // claim nothing queues (timed) instead of re-snapshotting hot.
         let mut wait_pass = false;
+        // Same `resumed` bookkeeping as `acquire`: the label this waiter still
+        // owes a `resumed` for, if it queued and no wakeup delivered it.
+        let mut owed_resume: Option<&'static str> = None;
+        // Same lock-settled timeout handoff as `acquire`.
+        let mut stale_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
         loop {
             enum Action {
                 Admit,
@@ -1545,13 +1710,16 @@ impl ProcessRegistry {
             let forced_wait = std::mem::take(&mut wait_pass);
             let action = {
                 let mut inner = self.inner.lock().unwrap();
+                if settle_stale_waiter(stale_rx.take()) {
+                    owed_resume = None;
+                }
                 let idle_here = matches!(inner.entries.get(agent_id), Some(e) if !e.is_active);
                 let over_budget = if idle_here {
                     self.budget_denies(&mut inner)
                 } else {
                     None
                 };
-                if let Some(charged) = over_budget {
+                if let Some(denial) = over_budget {
                     let candidates = if forced_wait {
                         Vec::new()
                     } else {
@@ -1570,8 +1738,10 @@ impl ProcessRegistry {
                             agent = %agent_id,
                             used = used,
                             cap = self.cap,
-                            charged_memory_bytes = charged,
+                            charged_memory_bytes = denial.charged,
                             budget_bytes = self.memory.get().map(|b| b.budget_bytes),
+                            host_available_memory_bytes = denial.available_memory,
+                            host_memory_reserve_bytes = HOST_MEMORY_RESERVE_BYTES,
                             "process registry: turn start queued (aggregate memory budget)"
                         );
                         if let Some(ref f) = self.event_fn {
@@ -1584,6 +1754,7 @@ impl ProcessRegistry {
                             );
                             tokio::spawn(fut);
                         }
+                        owed_resume = Some(REASON_MEMORY_BUDGET);
                         Action::Wait(rx)
                     } else {
                         Action::Evict(candidates)
@@ -1593,7 +1764,10 @@ impl ProcessRegistry {
                 }
             };
             match action {
-                Action::Admit => return,
+                Action::Admit => {
+                    self.emit_self_resumed(agent_id, owed_resume);
+                    return;
+                }
                 Action::Evict(candidates) => {
                     let mut evicted_one = false;
                     for (id, kill) in candidates {
@@ -1640,10 +1814,19 @@ impl ProcessRegistry {
                     }
                     wait_pass = !evicted_one;
                 }
-                Action::Wait(rx) => {
+                Action::Wait(mut rx) => {
                     // Memory can fall with no registry event to wake us (same
                     // as the `acquire` budget wait), so re-evaluate on a timer.
-                    let _ = tokio::time::timeout(BUDGET_RECHECK, rx).await;
+                    // On timeout the receiver is settled under the lock on the
+                    // next pass, exactly as in `acquire`.
+                    match tokio::time::timeout(BUDGET_RECHECK, &mut rx).await {
+                        Ok(received) => {
+                            if received.is_ok() {
+                                owed_resume = None;
+                            }
+                        }
+                        Err(_elapsed) => stale_rx = Some(rx),
+                    }
                 }
             }
         }
