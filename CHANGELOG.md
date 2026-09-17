@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.71] - 2026-09-17
+
+### 🚀 Features
+
+- *(pr-monitor)* Stretch the sweep cadence on the remaining forge quota ([#1948](https://github.com/intent-hq/intentd/pull/1948))
+
+
 ## [0.9.70] - 2026-09-17
 
 ### 🐛 Bug Fixes
