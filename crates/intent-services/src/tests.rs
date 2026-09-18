@@ -355,6 +355,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
     store
         .insert_agent_session(&mk_agent(
@@ -532,6 +533,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store
         .insert_agent_session(&mk_session("agent-1", &ws_active))
@@ -664,6 +666,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
 
     for i in 0..WORKSPACES {
@@ -1009,6 +1012,7 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store
         .insert_agent_session(&session(&healthy, "agent-healthy-projection"))
@@ -1340,6 +1344,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -2117,6 +2122,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -4434,6 +4440,7 @@ async fn flipped_completion_recorded_on_agent_complete_boundary() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .expect("session");
@@ -6555,6 +6562,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     svc.store
         .insert_agent_session(&session)
@@ -9141,6 +9149,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .expect("insert agent session");
@@ -9506,6 +9515,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -9589,6 +9599,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         let task_id = intent_core::NoteId::from("task-guard");
         // `linked-session` is linked via its session row; `linked-assigned`
@@ -9910,6 +9921,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -10064,6 +10076,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -11047,6 +11060,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -14677,6 +14691,7 @@ mod mcp_callback {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -24843,6 +24858,7 @@ mod search_adapters {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -26721,6 +26737,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -26868,6 +26885,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27005,6 +27023,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27138,6 +27157,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27271,6 +27291,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27408,6 +27429,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -31836,6 +31858,7 @@ mod file_ops_service {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store
             .insert_agent_session(&agent)
@@ -32868,6 +32891,7 @@ mod heal_stale_agent_sessions {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -36841,6 +36865,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         is_background: false,
         metadata: None,
     };
@@ -36887,6 +36912,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         is_background: false,
         metadata: None,
     };
@@ -37012,6 +37038,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         is_background: false,
         metadata: None,
     };
@@ -38339,6 +38366,7 @@ mod last_activity_events {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -38600,6 +38628,7 @@ mod turn_end_unread_gate {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -38694,6 +38723,32 @@ mod turn_end_unread_gate {
         assert!(
             should_raise_turn_end_unread(&h.services, &agent_id).await,
             "a restored top-level foreground agent raises again"
+        );
+    }
+
+    /// A muted top-level foreground session (`notifications_muted`) must NOT
+    /// raise the blue dot at drain end. Unmuting brings the raise back.
+    #[tokio::test]
+    async fn muted_agent_skips_raise_until_unmuted() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.notifications_muted = true;
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a muted agent must not raise the turn-end blue dot"
+        );
+        h.store
+            .set_agent_notifications_muted(&h.ws, &agent_id, false, &now_iso())
+            .await
+            .expect("unmute session");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "an unmuted top-level foreground agent raises again"
         );
     }
 
@@ -39040,6 +39095,7 @@ mod turn_token_usage {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -42282,6 +42338,7 @@ mod agent_delete_grace_window {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             created_at: ts.clone(),
             updated_at: ts,
         }
@@ -43251,6 +43308,7 @@ mod derived_workspace_unread {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 

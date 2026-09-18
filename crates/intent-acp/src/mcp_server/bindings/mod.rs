@@ -322,6 +322,54 @@ pub(crate) fn map_err(e: intent_core::Error) -> String {
     e.to_string()
 }
 
+/// Per-session fields the agent must never learn about
+/// (`intent_core::model::AGENT_HIDDEN_FIELDS`): stripped from every
+/// `ws.agent.*` and `ws.event.*` result (however deeply nested) before it
+/// reaches the caller. The same scrub runs in `intent-services` on the
+/// per-event `data` copied into parent-wake message metadata, so the shared
+/// definition lives in `intent-core`.
+pub(crate) use intent_core::model::strip_agent_hidden_fields;
+
+#[cfg(test)]
+mod hidden_field_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The scrub removes `notificationsMuted` from a bare object, a list of
+    /// them, and nested envelopes (`{ agent }`, event `data`), leaving every
+    /// other key.
+    #[test]
+    fn strip_agent_hidden_fields_removes_notifications_muted_everywhere() {
+        let mut v = json!({
+            "ok": true,
+            "notificationsMuted": true,
+            "agent": { "id": "agent-1", "notificationsMuted": false, "metadata": { "isBackground": true } },
+            "agents": [
+                { "id": "agent-2", "notificationsMuted": true },
+                { "id": "agent-3", "status": "idle" }
+            ],
+            "events": [
+                { "eventType": "agent:idle", "data": { "agentId": "agent-2", "notificationsMuted": true } }
+            ],
+        });
+        strip_agent_hidden_fields(&mut v);
+        assert_eq!(
+            v,
+            json!({
+                "ok": true,
+                "agent": { "id": "agent-1", "metadata": { "isBackground": true } },
+                "agents": [
+                    { "id": "agent-2" },
+                    { "id": "agent-3", "status": "idle" }
+                ],
+                "events": [
+                    { "eventType": "agent:idle", "data": { "agentId": "agent-2" } }
+                ],
+            })
+        );
+    }
+}
+
 #[cfg(test)]
 mod prelude_tests {
     use super::*;
