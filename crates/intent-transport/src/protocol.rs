@@ -534,7 +534,20 @@
 //! attempt; `error.data.code` `proof-invalid` / `proof-expired` /
 //! `github-unreachable`). The gist proof replaces the host-side device flow:
 //! `invite.redeem` is no longer served (an `/invite` connection naming it
-//! gets `-32001` like any other non-invite method). The catalog contains
+//! gets `-32001` like any other non-invite method). Also within 10.3
+//! (behavior only), the collaborator sender preamble: a human message sent
+//! by a per-principal wire caller whose role in the target workspace is
+//! `collaborator` (`agent.sendMessage` user-origin, `agent.sendToTask`,
+//! `agent.queueMessage`, `agent.editAndRegenerate`, `agent.wakeOrCreate`,
+//! and a collaborator's `agent.editQueuedMessage` of a human-authored
+//! entry) is persisted — and delivered to the model — with the daemon-
+//! prepended single-line paragraph `Message from @{login} ({displayName}),
+//! a collaborator (guest) of this workspace — not the workspace owner.`
+//! plus a blank line above the caller's text (login-only / display-name-
+//! only / `principal {id}` fallbacks). Idempotent by exact match, like the
+//! `[MESSAGE FROM AGENT …]` header; the owner's, the administrator's and
+//! every UDS / legacy-token send stay byte-identical, and the
+//! `fromPrincipalId` stamp is unchanged. The catalog contains
 //! 326 router methods, 56 fast-path methods, and two aliases: 384
 //! client-callable names.
 
