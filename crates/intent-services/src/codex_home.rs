@@ -153,11 +153,34 @@ fn write_config_file(source: &Path, home: &Path, name: &str) -> io::Result<()> {
 }
 
 /// These paths are relative to the declaring configuration, unlike MCP
-/// command arguments and subprocess working directories. Point role config
+/// command arguments. Provider token-helper directories also use this base.
+/// Point role config
 /// files at their originals so their own relative references stay anchored.
 fn rebase_paths(table: &mut dyn toml_edit::TableLike, source: &Path, skills: bool) {
     for (name, item) in table.iter_mut() {
         let name = name.get();
+        if name == "model_providers" {
+            if let Some(providers) = item.as_table_like_mut() {
+                for (_, provider) in providers.iter_mut() {
+                    if let Some(auth) = provider
+                        .as_table_like_mut()
+                        .and_then(|provider| provider.get_mut("auth"))
+                        .and_then(|auth| auth.as_table_like_mut())
+                    {
+                        let cwd = match auth.get("cwd") {
+                            None => Some(source.to_path_buf()),
+                            Some(value) => value.as_str().and_then(|path| {
+                                (Path::new(path).is_relative() && !path.starts_with('~'))
+                                    .then(|| source.join(path))
+                            }),
+                        };
+                        if let Some(cwd) = cwd {
+                            auth.insert("cwd", toml_edit::value(cwd.to_string_lossy().as_ref()));
+                        }
+                    }
+                }
+            }
+        }
         if matches!(
             name,
             "config_file"
@@ -319,6 +342,71 @@ mod tests {
         std::fs::write(&target, "keep-me").unwrap();
         assert!(link(&tmp.path().join("source"), &target).is_err());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "keep-me");
+    }
+
+    #[test]
+    fn preserves_token_helper_working_directories() {
+        let tmp = crate::test_support::test_tempdir("codex-token-helper-");
+        let source = tmp.path().join("user");
+        std::fs::create_dir(&source).unwrap();
+        let text = r#"
+[model_providers.relative.auth]
+command = "./token"
+args = ["relative-argument"]
+cwd = "auth-helper"
+[model_providers.default.auth]
+command = "./token"
+[model_providers.absolute.auth]
+command = "token"
+cwd = "/opt/token-helper"
+[model_providers.no_auth]
+env_key = "TEST_TOKEN"
+[profiles.work.model_providers.inline]
+auth = {command = "token", cwd = "profile-helper"}
+[mcp_servers.example]
+cwd = "unchanged"
+"#;
+        for name in ["config.toml", "work.config.toml"] {
+            std::fs::write(source.join(name), text).unwrap();
+        }
+        let home = prepare(&tmp.path().join("intent"), &source, "agent", false).unwrap();
+        for name in ["config.toml", "work.config.toml"] {
+            let config = std::fs::read_to_string(home.join(name))
+                .unwrap()
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+            let providers = &config["model_providers"];
+            assert_eq!(
+                providers["relative"]["auth"]["cwd"].as_str(),
+                source.join("auth-helper").to_str()
+            );
+            assert_eq!(
+                providers["default"]["auth"]["cwd"].as_str(),
+                source.to_str()
+            );
+            assert_eq!(
+                providers["absolute"]["auth"]["cwd"].as_str(),
+                Some("/opt/token-helper")
+            );
+            assert_eq!(
+                providers["relative"]["auth"]["command"].as_str(),
+                Some("./token")
+            );
+            assert_eq!(
+                providers["relative"]["auth"]["args"][0].as_str(),
+                Some("relative-argument")
+            );
+            assert!(providers["no_auth"].get("auth").is_none());
+            assert_eq!(
+                config["profiles"]["work"]["model_providers"]["inline"]["auth"]["cwd"].as_str(),
+                source.join("profile-helper").to_str()
+            );
+            assert_eq!(
+                config["mcp_servers"]["example"]["cwd"].as_str(),
+                Some("unchanged")
+            );
+            assert_eq!(std::fs::read_to_string(source.join(name)).unwrap(), text);
+        }
     }
 
     #[test]
