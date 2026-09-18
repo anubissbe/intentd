@@ -551,8 +551,11 @@
 //! caller's text (login-only / display-name-only / `principal {id}`
 //! fallbacks). Idempotent by exact match, like the `[MESSAGE FROM AGENT …]`
 //! header; the owner's, the administrator's and every UDS / legacy-token
-//! send stay byte-identical, and the `fromPrincipalId` stamp is unchanged.
-//! Intentional exception: a collaborator's `agent.editQueuedMessage` of an
+//! send stay byte-identical, and the `fromPrincipalId` stamp is unchanged
+//! (the caller-supplied `agent.delegate` free text now carries the same
+//! stamp as an `agent.sendMessage` row, so the child's first user row is
+//! served as authored by its sender; the task-note fallback stays
+//! unstamped). Intentional exception: a collaborator's `agent.editQueuedMessage` of an
 //! agent-authored (A2A / automatic) entry is not preambled — its sender
 //! stays the originating agent's header; the edit is recorded by the stamp
 //! only. The catalog contains
