@@ -549,7 +549,31 @@
 //! `redemptionCount`, with `redeemedAt` / `redeemedByPrincipalId` naming
 //! the latest redemption; `openInviteCount` / `guestCount` count a
 //! reusable invite as open while it is unexpired and unrevoked, redeemed
-//! or not. The catalog contains
+//! or not. Also within 10.3
+//! (behavior only), the collaborator sender preamble: a human message sent
+//! by a per-principal wire caller whose role in the target workspace is
+//! `collaborator` (`agent.sendMessage` user-origin, `agent.sendToTask`,
+//! `agent.queueMessage`, `agent.editAndRegenerate`, `agent.wakeOrCreate`,
+//! a collaborator's `agent.editQueuedMessage` of a human-authored entry,
+//! a `role: user` row of `agent.appendMessage` (string content, or the
+//! first `text` block of a block array — a text-less array gains a leading
+//! text block; other roles byte-identical), and the caller-supplied
+//! `agentInstructions` / `taskText` of `agent.delegate` — the task-note
+//! fallback is note content and is not annotated) is persisted — and
+//! delivered to the model — with the daemon-prepended single-line paragraph
+//! `Message from @{login} ({displayName}), a collaborator (guest) of this
+//! workspace — not the workspace owner.` plus a blank line above the
+//! caller's text (login-only / display-name-only / `principal {id}`
+//! fallbacks). Idempotent by exact match, like the `[MESSAGE FROM AGENT …]`
+//! header; the owner's, the administrator's and every UDS / legacy-token
+//! send stay byte-identical, and the `fromPrincipalId` stamp is unchanged
+//! (the caller-supplied `agent.delegate` free text now carries the same
+//! stamp as an `agent.sendMessage` row, so the child's first user row is
+//! served as authored by its sender; the task-note fallback stays
+//! unstamped). Intentional exception: a collaborator's `agent.editQueuedMessage` of an
+//! agent-authored (A2A / automatic) entry is not preambled — its sender
+//! stays the originating agent's header; the edit is recorded by the stamp
+//! only. The catalog contains
 //! 326 router methods, 56 fast-path methods, and two aliases: 384
 //! client-callable names.
 
