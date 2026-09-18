@@ -29,7 +29,8 @@ use intent_sourcecontrol::{
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
     PrState, PullRequest, Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewDecision,
-    ReviewThread, ReviewVerdict, RollupCheck, ScCapabilities, SourceControl, UserIdentity,
+    ReviewThread, ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, SourceControl,
+    UserIdentity,
 };
 use intent_store::{PrMonitorPollUpdate, Store};
 use intent_transport::{
@@ -339,9 +340,11 @@ impl SourceControl for StubForge {
                 .iter()
                 .map(|(name, state, required)| RollupCheck {
                     name: name.clone(),
+                    kind: RollupCheckKind::CheckRun,
                     state: *state,
                     is_required: *required,
                     url: None,
+                    started_at: None,
                 })
                 .collect(),
             checks_known: true,

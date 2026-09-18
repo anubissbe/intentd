@@ -15271,7 +15271,7 @@ mod pr {
         MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
         PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Result as ScResult, Review,
         ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
-        RollupCheck, ScCapabilities, SourceControl, UserIdentity,
+        RollupCheck, RollupCheckKind, ScCapabilities, SourceControl, UserIdentity,
     };
     use intent_store::Store;
     use serde_json::json;
@@ -15883,16 +15883,19 @@ mod pr {
                     name: "build".into(),
                     state: CheckState::Success,
                     url: None,
+                    started_at: None,
                 },
                 CheckRun {
                     name: "test".into(),
                     state: CheckState::Failure,
                     url: None,
+                    started_at: None,
                 },
                 CheckRun {
                     name: "lint".into(),
                     state: CheckState::Pending,
                     url: None,
+                    started_at: None,
                 },
             ])
         }
@@ -16000,21 +16003,27 @@ mod pr {
                 checks: vec![
                     RollupCheck {
                         name: "build".into(),
+                        kind: RollupCheckKind::CheckRun,
                         state: CheckState::Success,
                         is_required: true,
                         url: None,
+                        started_at: None,
                     },
                     RollupCheck {
                         name: "test".into(),
+                        kind: RollupCheckKind::CheckRun,
                         state: CheckState::Failure,
                         is_required: true,
                         url: None,
+                        started_at: None,
                     },
                     RollupCheck {
                         name: "flaky".into(),
+                        kind: RollupCheckKind::CheckRun,
                         state: CheckState::Failure,
                         is_required: false,
                         url: None,
+                        started_at: None,
                     },
                 ],
                 checks_known: true,
