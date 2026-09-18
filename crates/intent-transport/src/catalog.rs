@@ -506,7 +506,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows. Workspace-scoped, no host reach."),
     ("agent.cancelSubscriptions", "Steer: cancels an agent's own event subscriptions / delegation groups. Agent-scoped bookkeeping, no host reach."),
     ("agent.create", "Steer: creates an agent in a workspace. The agent acts with the owner's capabilities (decided); the guest only starts it."),
-    ("agent.delegate", "Steer: delegates a task note to a new agent in the workspace. Same trust as agent.create."),
+    ("agent.delegate", "Steer: delegates a task note to a new agent in the workspace; a collaborator's agentInstructions / taskText carry the sender preamble (the task-note fallback does not). Same trust as agent.create."),
     ("agent.dismissQuestions", "Steer: dismisses an agent's pending structured questions. Agent-scoped state only."),
     ("agent.editAndRegenerate", "Steer: edits a user message and regenerates from it; the edited content carries the collaborator sender preamble. Conversation write, workspace-scoped."),
     ("agent.editQueuedMessage", "Steer: edits a queued message; a collaborator's edit of a human-authored entry carries the sender preamble. Queue write, agent-scoped."),

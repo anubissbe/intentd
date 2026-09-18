@@ -539,8 +539,10 @@
 //! by a per-principal wire caller whose role in the target workspace is
 //! `collaborator` (`agent.sendMessage` user-origin, `agent.sendToTask`,
 //! `agent.queueMessage`, `agent.editAndRegenerate`, `agent.wakeOrCreate`,
-//! and a collaborator's `agent.editQueuedMessage` of a human-authored
-//! entry) is persisted — and delivered to the model — with the daemon-
+//! a collaborator's `agent.editQueuedMessage` of a human-authored entry,
+//! and the caller-supplied `agentInstructions` / `taskText` of
+//! `agent.delegate` — the task-note fallback is note content and is not
+//! annotated) is persisted — and delivered to the model — with the daemon-
 //! prepended single-line paragraph `Message from @{login} ({displayName}),
 //! a collaborator (guest) of this workspace — not the workspace owner.`
 //! plus a blank line above the caller's text (login-only / display-name-
