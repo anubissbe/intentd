@@ -6580,6 +6580,9 @@ impl Services {
             "agentName": session.name,
             "isBackground": session.is_background,
         });
+        if session.notifications_muted {
+            data["notificationsMuted"] = serde_json::Value::Bool(true);
+        }
         // monorepo#2532 Gap B (PR #1250 review): a stale-provenance marker
         // means the persisted report predates every remaining watcher (they
         // armed AFTER the report) and no child turn ran since — dropping the
@@ -9869,6 +9872,12 @@ impl Services {
 /// unique `eventTypes` (order-preserving), and a compact per-event array
 /// carrying only `id`, `type`, `data`, `timestamp`, `actor`. Feeds
 /// `EventWakeupBanner` so it can render a real count / label / per-agent cards.
+///
+/// The wake is delivered INTO the parent agent's transcript, so each event's
+/// `data` is scrubbed of [`intent_core::model::AGENT_HIDDEN_FIELDS`] first:
+/// the published `agent:idle` carries the child's `notificationsMuted` stamp
+/// for notification clients, and copying it verbatim here would hand a
+/// watching agent the user's mute preference despite the MCP-side scrub.
 fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut event_types: Vec<String> = Vec::new();
@@ -9880,10 +9889,12 @@ fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
     let events_json: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
+            let mut data = e.data.clone();
+            intent_core::model::strip_agent_hidden_fields(&mut data);
             serde_json::json!({
                 "id": e.id,
                 "type": e.event_type,
-                "data": e.data,
+                "data": data,
                 "timestamp": e.timestamp,
                 "actor": e.actor,
             })
@@ -9909,6 +9920,64 @@ fn build_event_notification_metadata(events: &[&Event]) -> serde_json::Value {
         }
     }
     metadata
+}
+
+#[cfg(test)]
+mod event_notification_metadata_tests {
+    use super::build_event_notification_metadata;
+    use intent_core::{ActorType, Event, EventActor, WorkspaceId};
+    use serde_json::json;
+
+    /// The per-event `data` copied into a parent wake's metadata drops the
+    /// child's `notificationsMuted` stamp (an agent must not learn the user's
+    /// mute preference through a completion / subscription wake) while every
+    /// other key — including the stall lift — is preserved.
+    #[test]
+    fn build_event_notification_metadata_scrubs_agent_hidden_fields() {
+        let event = Event {
+            id: "evt-1".to_string(),
+            workspace_id: WorkspaceId("ws-1".to_string()),
+            timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+            event_type: intent_core::events::AGENT_IDLE.to_string(),
+            actor: EventActor {
+                actor_type: ActorType::Agent,
+                id: Some("agent-child".to_string()),
+                name: Some("Child".to_string()),
+                email: None,
+                model: None,
+                metadata: None,
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({
+                "agentId": "agent-child",
+                "status": "idle",
+                "isBackground": false,
+                "notificationsMuted": true,
+                "stallSuspected": true,
+                "taskStatus": "in_progress",
+            }),
+        };
+        let metadata = build_event_notification_metadata(&[&event]);
+        assert_eq!(metadata["eventCount"], json!(1));
+        assert_eq!(metadata["stallSuspected"], json!(true));
+        assert_eq!(
+            metadata["events"][0]["data"],
+            json!({
+                "agentId": "agent-child",
+                "status": "idle",
+                "isBackground": false,
+                "stallSuspected": true,
+                "taskStatus": "in_progress",
+            })
+        );
+        assert!(
+            event.data.get("notificationsMuted").is_some(),
+            "the published event itself keeps the stamp for notification clients"
+        );
+    }
 }
 
 /// Fold a retracted held report wake's metadata into a terminal wake's
@@ -11612,6 +11681,7 @@ fn build_agent_summary(sessions: &[AgentSession]) -> WorkspaceAgentSummary {
             is_responding: false,
             parent_agent_id: s.parent_agent_id.clone(),
             is_background: s.is_background,
+            notifications_muted: s.notifications_muted,
         })
         .collect();
     let agent_ids: Vec<_> = live.iter().map(|s| s.id.clone()).collect();
@@ -12598,15 +12668,31 @@ fn cleanup_workspace_worktree_locked(
     branch_auto_generated: bool,
 ) -> Option<PathBuf> {
     let checked_out = intent_git::worktree::worktree_branch(worktree);
-    let trash = match intent_git::worktree::detach_worktree(repo, worktree) {
-        Ok(trash) => trash,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                worktree = %worktree.display(),
-                "failed to detach git worktree"
-            );
-            None
+    // An already-absent repository (retried delete, swept repo cache,
+    // orphaned row) is an expected state, not a failure: there is no
+    // registration to prune and nothing to rename, and the workspace-dir
+    // sweep after this phase still removes whatever is left on disk. Only a
+    // confirmed absence (`try_exists` → `Ok(false)`) takes the quiet path: a
+    // stat error (EACCES, EIO) may hide a present repository, so it falls
+    // through to the detach attempt and keeps its WARN (intent-hq/intent#5337).
+    let trash = if matches!(repo.try_exists(), Ok(false)) {
+        tracing::debug!(
+            repo = %repo.display(),
+            worktree = %worktree.display(),
+            "workspace.delete: repository already absent; skipping worktree detach"
+        );
+        None
+    } else {
+        match intent_git::worktree::detach_worktree(repo, worktree) {
+            Ok(trash) => trash,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    worktree = %worktree.display(),
+                    "failed to detach git worktree"
+                );
+                None
+            }
         }
     };
     // The provisioned layout is `<root>/<workspaceId>/<repo-slug>` alongside

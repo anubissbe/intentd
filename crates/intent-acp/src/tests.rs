@@ -482,6 +482,271 @@ async fn stderr_capture_written_to_daily_log_file() {
     agent.kill().await.ok();
 }
 
+/// intent-hq/intent#4971: a bare provider command that is not on `PATH`
+/// (nothing resolved a provider binary, no npx fallback) fails with the typed
+/// [`AcpError::ProviderNotFound`] naming the bare-command tier — not an
+/// unclassified `Spawn("…: No such file or directory")`.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_classifies_missing_bare_command() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+
+    let base = *intent_providers::find_provider("auggie").unwrap();
+    let provider = intent_providers::ProviderConfig {
+        command: "intentd-no-such-provider-command-4971",
+        base_args: &[],
+        ..base
+    };
+    let opts = SpawnOptions::new(&provider);
+    assert_eq!(opts.launch_target().0, LaunchMode::BareCommand);
+    let err = spawn_provider(&opts, ConnectionHooks::default())
+        .err()
+        .expect("missing bare command must fail to spawn");
+    assert!(
+        matches!(
+            &err,
+            AcpError::ProviderNotFound { command, launch: LaunchMode::BareCommand }
+                if command == "intentd-no-such-provider-command-4971"
+        ),
+        "expected ProviderNotFound(BareCommand), got {err:?}"
+    );
+    let rendered = err.to_string();
+    assert!(rendered.contains("bare command"), "{rendered}");
+    assert!(rendered.contains("providers.paths"), "{rendered}");
+}
+
+/// The resolved-binary tier is classified separately: an override / discovered
+/// path that no longer exists reports `ResolvedBinary`, not the bare command.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_classifies_missing_resolved_binary() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+
+    let tmp = test_temp_dir("intent-acp-missing-bin-");
+    let missing = tmp.path().join("vanished-acp");
+    let provider = *intent_providers::find_provider("auggie").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.provider_binary = Some(&missing);
+    assert_eq!(opts.launch_target().0, LaunchMode::ResolvedBinary);
+    let err = spawn_provider(&opts, ConnectionHooks::default())
+        .err()
+        .expect("missing resolved binary must fail to spawn");
+    assert!(
+        matches!(
+            &err,
+            AcpError::ProviderNotFound { command, launch: LaunchMode::ResolvedBinary }
+                if *command == missing.display().to_string()
+        ),
+        "expected ProviderNotFound(ResolvedBinary), got {err:?}"
+    );
+    assert!(!err.to_string().contains("bare command"), "{err}");
+}
+
+/// `ENOENT` from a missing working directory is not a missing provider: the
+/// program exists, so the error stays `Spawn` and names the directory.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_keeps_missing_cwd_enoent_as_spawn() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+
+    let tmp = test_temp_dir("intent-acp-missing-cwd-");
+    let gone = tmp.path().join("deleted-workspace");
+    let sh = std::path::Path::new("/bin/sh");
+    let provider = *intent_providers::find_provider("auggie").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.provider_binary = Some(sh);
+    opts.cwd = Some(&gone);
+    assert_eq!(opts.launch_target().0, LaunchMode::ResolvedBinary);
+    let err = spawn_provider(&opts, ConnectionHooks::default())
+        .err()
+        .expect("missing cwd must fail to spawn");
+    match &err {
+        AcpError::Spawn(msg) => {
+            assert!(msg.contains("working directory"), "{msg}");
+            assert!(msg.contains(&gone.display().to_string()), "{msg}");
+        }
+        other => panic!("expected Spawn for a missing cwd, got {other:?}"),
+    }
+}
+
+/// `ENOENT` from an executable whose shebang interpreter is missing is not a
+/// missing provider either — the program itself exists.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_keeps_missing_interpreter_enoent_as_spawn() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = test_temp_dir("intent-acp-missing-interp-");
+    let script = tmp.path().join("acp-with-missing-interpreter");
+    std::fs::write(&script, "#!/nonexistent/intentd-4971-interpreter\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let provider = *intent_providers::find_provider("auggie").unwrap();
+    let mut opts = SpawnOptions::new(&provider);
+    opts.provider_binary = Some(&script);
+    assert_eq!(opts.launch_target().0, LaunchMode::ResolvedBinary);
+    let err = spawn_provider(&opts, ConnectionHooks::default())
+        .err()
+        .expect("missing interpreter must fail to spawn");
+    match &err {
+        AcpError::Spawn(msg) => assert!(msg.contains("the program exists"), "{msg}"),
+        other => panic!("expected Spawn for a missing interpreter, got {other:?}"),
+    }
+}
+
+/// A bare command given as a relative path (`./x`) is resolved against the
+/// child's working directory, not the daemon's: when it exists there and fails
+/// with `ENOENT` for another reason (missing shebang interpreter) it is not
+/// `ProviderNotFound`.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_provider_relative_bare_command_present_in_cwd_is_not_provider_not_found() {
+    use crate::spawn::{spawn_provider, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = test_temp_dir("intent-acp-bare-relative-");
+    let script = tmp.path().join("intentd-4971-bare-present");
+    std::fs::write(&script, "#!/nonexistent/intentd-4971-interpreter\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let provider = *intent_providers::find_provider("auggie").unwrap();
+    let provider = intent_providers::ProviderConfig {
+        command: "./intentd-4971-bare-present",
+        base_args: &[],
+        ..provider
+    };
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(tmp.path());
+    assert_eq!(opts.launch_target().0, LaunchMode::BareCommand);
+    let err = spawn_provider(&opts, ConnectionHooks::default())
+        .err()
+        .expect("missing interpreter must fail to spawn");
+    match &err {
+        AcpError::Spawn(msg) => assert!(msg.contains("the program exists"), "{msg}"),
+        other => panic!("expected Spawn for a present relative bare command, got {other:?}"),
+    }
+}
+
+/// The bare-command `PATH` search of `classify_not_found` walks the child's
+/// enhanced `PATH`: a command present there (`sh`) is "program exists" and a
+/// name absent from every directory is `ProviderNotFound`.
+#[cfg(unix)]
+#[test]
+fn classify_not_found_searches_the_child_path_for_bare_commands() {
+    use crate::spawn::{classify_not_found, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+
+    let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
+    let base = *intent_providers::find_provider("auggie").unwrap();
+
+    let present = intent_providers::ProviderConfig {
+        command: "sh",
+        ..base
+    };
+    let opts = SpawnOptions::new(&present);
+    let (launch, target) = opts.launch_target();
+    assert_eq!(launch, LaunchMode::BareCommand);
+    let err = classify_not_found(&opts, launch, target, "sh", &enoent);
+    match &err {
+        AcpError::Spawn(msg) => assert!(msg.contains("the program exists"), "{msg}"),
+        other => panic!("expected Spawn for a bare command on PATH, got {other:?}"),
+    }
+
+    let absent = intent_providers::ProviderConfig {
+        command: "intentd-no-such-provider-command-4971",
+        ..base
+    };
+    let opts = SpawnOptions::new(&absent);
+    let (launch, target) = opts.launch_target();
+    let err = classify_not_found(
+        &opts,
+        launch,
+        target,
+        "intentd-no-such-provider-command-4971",
+        &enoent,
+    );
+    assert!(
+        matches!(
+            err,
+            AcpError::ProviderNotFound {
+                launch: LaunchMode::BareCommand,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+/// A relative `PATH` entry (`bin`) is resolved by the exec against the
+/// child's working directory, not the daemon's: a child-local `bin/<cmd>` that
+/// exists but fails with `ENOENT` (missing shebang interpreter) is "program
+/// exists", not `ProviderNotFound` — and is `ProviderNotFound` once no `cwd`
+/// makes that entry resolve there.
+#[cfg(unix)]
+#[test]
+fn classify_not_found_resolves_relative_path_entries_against_child_cwd() {
+    use crate::spawn::{classify_not_found_with_path, LaunchMode, SpawnOptions};
+    use crate::AcpError;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = test_temp_dir("intent-acp-relative-path-entry-");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("intentd-4971-child-local");
+    std::fs::write(&script, "#!/nonexistent/intentd-4971-interpreter\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
+    let base = *intent_providers::find_provider("auggie").unwrap();
+    let provider = intent_providers::ProviderConfig {
+        command: "intentd-4971-child-local",
+        ..base
+    };
+    let child_path = std::ffi::OsStr::new("bin");
+
+    let mut opts = SpawnOptions::new(&provider);
+    opts.cwd = Some(tmp.path());
+    let (launch, target) = opts.launch_target();
+    assert_eq!(launch, LaunchMode::BareCommand);
+    let err = classify_not_found_with_path(
+        &opts,
+        launch,
+        target,
+        "intentd-4971-child-local",
+        &enoent,
+        child_path,
+    );
+    match &err {
+        AcpError::Spawn(msg) => assert!(msg.contains("the program exists"), "{msg}"),
+        other => panic!("expected Spawn for a child-local bin/ command, got {other:?}"),
+    }
+
+    let opts = SpawnOptions::new(&provider);
+    let (launch, target) = opts.launch_target();
+    let err = classify_not_found_with_path(
+        &opts,
+        launch,
+        target,
+        "intentd-4971-child-local",
+        &enoent,
+        child_path,
+    );
+    assert!(
+        matches!(
+            err,
+            AcpError::ProviderNotFound {
+                launch: LaunchMode::BareCommand,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
 /// Concatenate every daily capture file under `dir` (empty when the dir does
 /// not exist yet). Rotation-proof like the daily-log test above.
 async fn read_capture_dir(dir: &std::path::Path) -> String {
@@ -3623,6 +3888,22 @@ mod error_tests {
             (
                 AcpError::Spawn("pipe".into()),
                 "failed to spawn provider: pipe",
+            ),
+            (
+                AcpError::ProviderNotFound {
+                    command: "antigravity-acp".into(),
+                    launch: crate::spawn::LaunchMode::BareCommand,
+                },
+                "provider executable not found: `antigravity-acp` (bare command; no \
+                 providers.paths override or discovered binary resolved, so it was looked up \
+                 on the daemon PATH)",
+            ),
+            (
+                AcpError::ProviderNotFound {
+                    command: "/opt/x/bin/acp".into(),
+                    launch: crate::spawn::LaunchMode::ResolvedBinary,
+                },
+                "provider executable not found: `/opt/x/bin/acp` (resolved provider binary)",
             ),
             (AcpError::Transport("eof".into()), "transport closed: eof"),
             (AcpError::Timeout("foo".into()), "request `foo` timed out"),
@@ -9348,6 +9629,11 @@ mod wsapi4_bindings_tests {
         /// Agent ids `agent_get` serves with `isBackground: true` metadata
         /// (background-caller denial tests for `create({ topLevel: true })`).
         background_agent_ids: Mutex<Vec<String>>,
+        /// Agent ids `agent_get` / `agent_list` serve with
+        /// `notificationsMuted: true` (MCP scrub tests).
+        muted_agent_ids: Mutex<Vec<String>>,
+        /// When set, overrides the `event_query` result (MCP scrub tests).
+        event_query_result: Mutex<Option<Value>>,
         /// Agent ids `agent_is_retired` reports as retired (same-turn
         /// dispatch-guard tests).
         retired_agent_ids: Mutex<Vec<String>>,
@@ -9431,6 +9717,7 @@ mod wsapi4_bindings_tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             metadata: AgentMetadata {
                 is_background: false,
                 specialist: None,
@@ -9481,8 +9768,14 @@ mod wsapi4_bindings_tests {
         fn agent_list(&self, ws: WorkspaceId) -> BoxFuture<'_, Result<Vec<AgentLite>>> {
             *self.agent_list_calls.lock().unwrap() += 1;
             let rows = self.agent_list_rows.lock().unwrap().clone();
+            let muted = self.muted_agent_ids.lock().unwrap().clone();
             Box::pin(async move {
-                Ok(rows.unwrap_or_else(|| vec![stub_agent("a-1", &ws), stub_agent("a-2", &ws)]))
+                let mut rows =
+                    rows.unwrap_or_else(|| vec![stub_agent("a-1", &ws), stub_agent("a-2", &ws)]);
+                for row in &mut rows {
+                    row.notifications_muted = muted.contains(&row.id.as_str().to_string());
+                }
+                Ok(rows)
             })
         }
 
@@ -9497,6 +9790,7 @@ mod wsapi4_bindings_tests {
             let error = self.agent_get_error.lock().unwrap().clone();
             let sandboxed = *self.sandboxed.lock().unwrap();
             let is_background = self.background_agent_ids.lock().unwrap().contains(&id);
+            let muted = self.muted_agent_ids.lock().unwrap().contains(&id);
             Box::pin(async move {
                 if let Some(e) = error {
                     return Err(Error::NotFound(e));
@@ -9508,6 +9802,7 @@ mod wsapi4_bindings_tests {
                     agent.metadata.sandbox_path = Some("/tmp/sb-1".to_string());
                     agent.metadata.sandbox_branch = Some(format!("sb/{id}"));
                 }
+                agent.notifications_muted = muted;
                 Ok(agent)
             })
         }
@@ -9850,7 +10145,8 @@ mod wsapi4_bindings_tests {
             params: EventQueryParams,
         ) -> BoxFuture<'_, Result<Value>> {
             self.event_query_calls.lock().unwrap().push(params);
-            Box::pin(async move { Ok(json!([])) })
+            let result = self.event_query_result.lock().unwrap().clone();
+            Box::pin(async move { Ok(result.unwrap_or_else(|| json!([]))) })
         }
 
         fn event_subscribe(
@@ -10129,6 +10425,37 @@ mod wsapi4_bindings_tests {
         assert_eq!(resp["result"]["isError"], json!(false));
         let flags = api.agent_delegate_merge_flags.lock().unwrap();
         assert_eq!(flags.as_slice(), [Some(false), None]);
+    }
+
+    /// `notificationsMuted` is a user-facing preference the agent must never
+    /// read: the `ws.agent.*` dispatch scrubs it from `status` (a bare
+    /// `AgentLite`) and from every `list` row, leaving the other keys intact.
+    #[tokio::test]
+    async fn agent_status_and_list_never_expose_notifications_muted() {
+        let (srv, api) = server();
+        *api.muted_agent_ids.lock().unwrap() = vec!["a-42".to_string(), "a-1".to_string()];
+
+        let resp = call(&srv, "return await ws.agent.status('a-42');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["id"], json!("a-42"));
+        assert!(
+            v.get("notificationsMuted").is_none(),
+            "ws.agent.status must not carry notificationsMuted: {v}"
+        );
+        assert_eq!(v["metadata"]["isBackground"], json!(false));
+
+        let resp = call(&srv, "return await ws.agent.list();").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let rows = body(&resp);
+        let rows = rows.as_array().expect("list is an array");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(
+                row.get("notificationsMuted").is_none(),
+                "ws.agent.list row must not carry notificationsMuted: {row}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -11630,6 +11957,75 @@ mod wsapi4_bindings_tests {
         assert_eq!(p.path.as_deref(), Some("src/"));
         assert_eq!(p.minutes_ago, Some(10));
         assert_eq!(p.limit, Some(25));
+    }
+
+    /// Persisted `agent:updated` / `agent:idle` payloads carry the user's
+    /// `notificationsMuted` preference; `ws.event.query` (flat and paginated
+    /// `{ events, nextPageToken }` shapes) and `ws.event.agentActivity(agentId)`
+    /// serve event history, so the `ws.event.*` dispatch scrubs the key from
+    /// every nested `data` object while leaving the rest of the row intact.
+    #[tokio::test]
+    async fn event_query_and_agent_activity_never_expose_notifications_muted() {
+        let (srv, api) = server();
+        let rows = json!([
+            {
+                "eventType": "agent:updated",
+                "actorId": "a-1",
+                "data": { "agentId": "a-1", "notificationsMuted": true, "isBackground": false }
+            },
+            {
+                "eventType": "agent:idle",
+                "actorId": "a-1",
+                "data": { "agentId": "a-1", "notificationsMuted": true }
+            },
+            { "eventType": "file:changed", "actorId": "a-1", "data": { "path": "src/a.rs" } }
+        ]);
+
+        *api.event_query_result.lock().unwrap() = Some(rows.clone());
+        let resp = call(
+            &srv,
+            "return await ws.event.query({ eventType: 'agent:*' });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(
+            v,
+            json!([
+                { "eventType": "agent:updated", "actorId": "a-1", "data": { "agentId": "a-1", "isBackground": false } },
+                { "eventType": "agent:idle", "actorId": "a-1", "data": { "agentId": "a-1" } },
+                { "eventType": "file:changed", "actorId": "a-1", "data": { "path": "src/a.rs" } }
+            ]),
+            "flat event.query result must be scrubbed: {v}"
+        );
+
+        *api.event_query_result.lock().unwrap() =
+            Some(json!({ "events": rows, "nextPageToken": "tok-2" }));
+        let resp = call(
+            &srv,
+            "return await ws.event.query({ eventType: 'agent:*', paginate: true });",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        assert_eq!(v["nextPageToken"], json!("tok-2"));
+        for ev in v["events"].as_array().expect("paginated events") {
+            assert!(
+                ev["data"].get("notificationsMuted").is_none(),
+                "paginated event.query row must be scrubbed: {ev}"
+            );
+        }
+
+        let resp = call(&srv, "return await ws.event.agentActivity('a-1');").await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let v = body(&resp);
+        for ev in v["events"].as_array().expect("agentActivity events") {
+            assert!(
+                ev["data"].get("notificationsMuted").is_none(),
+                "event.agentActivity row must be scrubbed: {ev}"
+            );
+        }
+        assert_eq!(v["events"][0]["data"]["isBackground"], json!(false));
     }
 
     #[tokio::test]

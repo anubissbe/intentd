@@ -20,7 +20,7 @@ use intent_core::{
 };
 use serde_json::{json, Value};
 
-use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str};
+use super::{map_err, opt_bool, opt_str, opt_vec_str, req_str, strip_agent_hidden_fields};
 
 /// SUB-1 blurb surfaced by `send` / `sendToTask` when the sender is auto-
 /// subscribed to the target's completion (parity with the TS `SendMessageTool`
@@ -116,7 +116,22 @@ pub(crate) fn prelude_for(features: &AgentFeaturesSettings) -> Cow<'static, str>
     Cow::Owned(js)
 }
 
+/// Every `ws.agent.*` result passes through
+/// [`strip_agent_hidden_fields`] (see `bindings/mod.rs`): the agent must never
+/// read the user's `notificationsMuted` preference.
 pub(crate) async fn dispatch(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    method: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    let mut out = dispatch_inner(api, ws, caller, method, args).await?;
+    strip_agent_hidden_fields(&mut out);
+    Ok(out)
+}
+
+async fn dispatch_inner(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,

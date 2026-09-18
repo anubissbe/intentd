@@ -550,7 +550,8 @@ impl Services {
     /// The `unread` workspace attention flag never feeds the signals — it
     /// is the flag's own contract (§9.9), not a displayStatus axis.
     /// Child/background sessions never count — their attention surface is
-    /// the parent/subscriber (attention-retire taxonomy). A pending request
+    /// the parent/subscriber (attention-retire taxonomy) — and neither do
+    /// soft-retired or muted (`notificationsMuted`) sessions. A pending request
     /// raised MID-TURN whose surfacing is still parked on the
     /// deferred-attention registry does not count either: the workspace
     /// stays `in_progress` until the raising agent's turn-end flush
@@ -604,6 +605,7 @@ impl Services {
                     && !s.is_background
                     && s.status != intent_core::AgentStatus::Deleted
                     && s.retired_at.is_none()
+                    && !s.notifications_muted
             })
             .collect();
         for s in &top_level {
@@ -3387,6 +3389,7 @@ mod workspace_needs_attention {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -3565,6 +3568,66 @@ mod workspace_needs_attention {
             );
             svc.store
                 .set_agent_session_retired_at(&ws, id, Some(&now_iso()), &now_iso())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A muted top-level session (`notifications_muted`) feeds none of the
+    /// axes: its `error` status, pending blocker/discussion request, and
+    /// pending questions marker are all silenced. Unmuting brings each
+    /// signal back.
+    #[tokio::test]
+    async fn muted_top_level_sessions_never_count_until_unmuted() {
+        let (svc, ws, _tmp) = setup().await;
+
+        let mut failed = mk_session(&ws, "agent-muted-error");
+        failed.status = AgentStatus::Error;
+        failed.notifications_muted = true;
+        svc.store.insert_agent_session(&failed).await.unwrap();
+
+        let mut blocker = mk_session(&ws, "agent-muted-blocker");
+        blocker.attention_request_kind = Some("blocker".to_string());
+        blocker.notifications_muted = true;
+        svc.store.insert_agent_session(&blocker).await.unwrap();
+
+        let mut discuss = mk_session(&ws, "agent-muted-discussion");
+        discuss.attention_request_kind = Some("discussion".to_string());
+        discuss.notifications_muted = true;
+        svc.store.insert_agent_session(&discuss).await.unwrap();
+
+        let mut questions = mk_session(&ws, "agent-muted-questions");
+        questions.metadata = Some(json!({
+            (intent_core::PENDING_QUESTIONS_MESSAGE_ID_KEY): "msg-pending"
+        }));
+        questions.notifications_muted = true;
+        svc.store.insert_agent_session(&questions).await.unwrap();
+
+        assert_eq!(
+            signals(&svc, &ws).await,
+            AttentionSignals::default(),
+            "muted sessions feed no attention axis"
+        );
+
+        let cases: [(&AgentSession, Axis); 4] = [
+            (&failed, |s| s.failed),
+            (&blocker, |s| s.blocked),
+            (&discuss, |s| s.needs_attention),
+            (&questions, |s| s.needs_attention),
+        ];
+        for (session, expect) in cases {
+            let ts = intent_core::now_iso();
+            svc.store
+                .set_agent_notifications_muted(&ws, &session.id, false, &ts)
+                .await
+                .unwrap();
+            assert!(
+                expect(&signals(&svc, &ws).await),
+                "unmuting {} surfaces its signal again",
+                session.id.0
+            );
+            svc.store
+                .set_agent_notifications_muted(&ws, &session.id, true, &ts)
                 .await
                 .unwrap();
         }
@@ -4330,6 +4393,130 @@ mod display_status_events {
         assert_eq!(
             ev["data"],
             json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+    }
+
+    /// `agent.update { notificationsMuted: true }` on the only
+    /// attention-raising agent removes it from the derivation and emits the
+    /// `needs_attention` → idle demotion; unmuting emits the promotion back.
+    #[tokio::test]
+    async fn agent_update_notifications_muted_transition_emits() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-muted");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .set_attention_request(&h.ws, &session.id, "discussion", "input", &now_iso())
+            .await
+            .expect("set attention");
+        h.services.maybe_emit_display_status_changed(&h.ws).await;
+
+        let mut sub = subscribe(&h);
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": true }))
+            .await
+            .expect("mute agent");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
+        );
+
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": false }))
+            .await
+            .expect("unmute agent");
+        let ev = recv_one(&mut sub).await;
+        assert_eq!(ev["type"], "workspace:displayStatus-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "displayStatus": "needs_attention" })
+        );
+    }
+
+    /// Muting the LAST unread top-level agent settles the derived workspace
+    /// `unread` like the last seen-marker advance: the stored flag clears and
+    /// exactly one `workspace:attention-changed { none }` fires. A no-op
+    /// re-mute and the later unmute write nothing at the workspace level (an
+    /// unmuted unseen tail re-derives `unread` on the next read).
+    #[tokio::test]
+    async fn muting_last_unread_agent_settles_workspace_unread() {
+        let h = harness().await;
+        let session = super::workspace_needs_attention::mk_session(&h.ws, "agent-unread-muted");
+        h.store
+            .insert_agent_session(&session)
+            .await
+            .expect("session");
+        h.store
+            .append_agent_message(
+                &session.id,
+                "assistant",
+                &json!([{ "type": "text", "text": "done" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("append assistant tail");
+        h.services
+            .raise_attention(&h.ws, intent_core::WorkspaceAttention::Unread)
+            .await
+            .expect("raise unread");
+        assert!(
+            h.store
+                .workspace_has_unread_top_level_session(&h.ws)
+                .await
+                .expect("probe"),
+            "unmuted unseen tail derives unread"
+        );
+
+        let mut attn_sub = h.bus.subscribe(SubscriptionFilter {
+            workspace_id: Some(h.ws.0.clone()),
+            event_types: vec!["workspace:attention-changed".to_string()],
+            ..Default::default()
+        });
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": true }))
+            .await
+            .expect("mute agent");
+        let ev = recv_one(&mut attn_sub).await;
+        assert_eq!(ev["type"], "workspace:attention-changed");
+        assert_eq!(
+            ev["data"],
+            json!({ "workspaceId": h.ws.0, "attention": "none" })
+        );
+        assert_silent(&mut attn_sub).await;
+        let ws = h.store.get_workspace(&h.ws).await.expect("reload");
+        assert_eq!(ws.attention, intent_core::WorkspaceAttention::None);
+        assert!(
+            !h.store
+                .workspace_has_unread_top_level_session(&h.ws)
+                .await
+                .expect("probe"),
+            "a muted session never derives unread"
+        );
+
+        // Idempotent re-mute: no transition, no event.
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": true }))
+            .await
+            .expect("re-mute agent");
+        assert_silent(&mut attn_sub).await;
+
+        // Unmute: silent at the workspace level; the derivation reads unread
+        // again on the next probe.
+        h.services
+            .agent_update_op(session.id.clone(), json!({ "notificationsMuted": false }))
+            .await
+            .expect("unmute agent");
+        assert_silent(&mut attn_sub).await;
+        assert!(
+            h.store
+                .workspace_has_unread_top_level_session(&h.ws)
+                .await
+                .expect("probe"),
+            "unmuting re-derives unread"
         );
     }
 

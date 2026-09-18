@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.78] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(transport)* Drop Chief workspace from workspace subscription deltas ([#1989](https://github.com/intent-hq/intentd/pull/1989))
+- *(agent)* Skip preemption when no live turn is registered ([#1991](https://github.com/intent-hq/intentd/pull/1991))
+- *(pr-monitor)* Dedupe same-name check runs so a cancelled duplicate cannot flap the checklist ([#1985](https://github.com/intent-hq/intentd/pull/1985))
+
+
+## [0.9.77] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(events)* Give the bus writer a wall-clock retry budget so bulk workspace.delete never drops a batch ([#1980](https://github.com/intent-hq/intentd/pull/1980))
+
+### ⚙️ Miscellaneous Tasks
+
+- Isolate pwsh startup cache in install.ps1 guard tests ([#1982](https://github.com/intent-hq/intentd/pull/1982))
+
+
+## [0.9.76] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(acp)* Classify missing bare-command launches and harden Antigravity e2es under load ([#1978](https://github.com/intent-hq/intentd/pull/1978))
+
+
+## [0.9.75] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(git)* Remove origin and overlay-fetch safely under a global remote.origin.prune ([#1975](https://github.com/intent-hq/intentd/pull/1975))
+
+
+## [0.9.74] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- Make agent questions and blockers plain and self-contained ([#1798](https://github.com/intent-hq/intentd/pull/1798))
+
+
+## [0.9.73] - 2026-09-18
+
+### 🐛 Bug Fixes
+
+- *(hooks)* Default hook.list to active hooks and lighten retired rows ([#1971](https://github.com/intent-hq/intentd/pull/1971))
+
+
 ## [0.9.72] - 2026-09-17
 
 ### 🐛 Bug Fixes

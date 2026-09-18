@@ -1740,6 +1740,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
     }
@@ -1884,6 +1885,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -2042,6 +2044,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -2182,6 +2185,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -2369,6 +2373,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 
@@ -2459,6 +2464,7 @@ mod tests {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&agent).await.unwrap();
 

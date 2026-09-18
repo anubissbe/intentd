@@ -356,6 +356,7 @@ async fn workspace_list_and_get_populate_card_aggregates() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
     store
         .insert_agent_session(&mk_agent(
@@ -533,6 +534,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store
         .insert_agent_session(&mk_session("agent-1", &ws_active))
@@ -665,6 +667,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
 
     for i in 0..WORKSPACES {
@@ -1010,6 +1013,7 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store
         .insert_agent_session(&session(&healthy, "agent-healthy-projection"))
@@ -1341,6 +1345,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -2118,6 +2123,7 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     store.insert_agent_session(&session).await.expect("session");
 
@@ -4435,6 +4441,7 @@ async fn flipped_completion_recorded_on_agent_complete_boundary() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .expect("session");
@@ -6556,6 +6563,7 @@ async fn note_add_stamps_agent_author_with_session_name() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
     };
     svc.store
         .insert_agent_session(&session)
@@ -9142,6 +9150,7 @@ async fn agent_subscriptions_reject_agent_events_and_narrow_star() {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         })
         .await
         .expect("insert agent session");
@@ -9507,6 +9516,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -9590,6 +9600,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         let task_id = intent_core::NoteId::from("task-guard");
         // `linked-session` is linked via its session row; `linked-assigned`
@@ -9911,6 +9922,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -10065,6 +10077,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         h.store
             .insert_agent_session(&session)
@@ -11048,6 +11061,7 @@ mod change_event_parity {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -14678,6 +14692,7 @@ mod mcp_callback {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
 
@@ -15272,7 +15287,7 @@ mod pr {
         MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
         PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Result as ScResult, Review,
         ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
-        RollupCheck, ScCapabilities, SourceControl, UserIdentity,
+        RollupCheck, RollupCheckKind, ScCapabilities, SourceControl, UserIdentity,
     };
     use intent_store::Store;
     use serde_json::json;
@@ -15884,16 +15899,19 @@ mod pr {
                     name: "build".into(),
                     state: CheckState::Success,
                     url: None,
+                    started_at: None,
                 },
                 CheckRun {
                     name: "test".into(),
                     state: CheckState::Failure,
                     url: None,
+                    started_at: None,
                 },
                 CheckRun {
                     name: "lint".into(),
                     state: CheckState::Pending,
                     url: None,
+                    started_at: None,
                 },
             ])
         }
@@ -16001,21 +16019,27 @@ mod pr {
                 checks: vec![
                     RollupCheck {
                         name: "build".into(),
+                        kind: RollupCheckKind::CheckRun,
                         state: CheckState::Success,
                         is_required: true,
                         url: None,
+                        started_at: None,
                     },
                     RollupCheck {
                         name: "test".into(),
+                        kind: RollupCheckKind::CheckRun,
                         state: CheckState::Failure,
                         is_required: true,
                         url: None,
+                        started_at: None,
                     },
                     RollupCheck {
                         name: "flaky".into(),
+                        kind: RollupCheckKind::CheckRun,
                         state: CheckState::Failure,
                         is_required: false,
                         url: None,
+                        started_at: None,
                     },
                 ],
                 checks_known: true,
@@ -24835,6 +24859,7 @@ mod search_adapters {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store.insert_agent_session(&session).await.expect("session");
         for (role, content) in messages {
@@ -26714,6 +26739,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -26862,6 +26888,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27000,6 +27027,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27134,6 +27162,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27268,6 +27297,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27406,6 +27436,7 @@ mod rules {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             is_background: false,
             metadata: None,
             created_at: "2026-01-01T00:00:00Z".into(),
@@ -27532,6 +27563,7 @@ mod rules {
             completion_report: None,
             completion_report_timestamp: None,
             retired_at: None,
+            notifications_muted: false,
             attention_request_kind: None,
             attention_request_reason: None,
             attention_request_timestamp: None,
@@ -27693,6 +27725,7 @@ mod rules {
             completion_report: None,
             completion_report_timestamp: None,
             retired_at: None,
+            notifications_muted: false,
             attention_request_kind: None,
             attention_request_reason: None,
             attention_request_timestamp: None,
@@ -27961,6 +27994,7 @@ mod rules {
             completion_report: None,
             completion_report_timestamp: None,
             retired_at: None,
+            notifications_muted: false,
             attention_request_kind: None,
             attention_request_reason: None,
             attention_request_timestamp: None,
@@ -29679,6 +29713,7 @@ mod worktree_provisioning {
             completion_report: None,
             completion_report_timestamp: None,
             retired_at: None,
+            notifications_muted: false,
             attention_request_kind: None,
             attention_request_reason: None,
             attention_request_timestamp: None,
@@ -33291,6 +33326,7 @@ mod file_ops_service {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         };
         store
             .insert_agent_session(&agent)
@@ -34325,6 +34361,7 @@ mod heal_stale_agent_sessions {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -38315,6 +38352,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         is_background: false,
         metadata: None,
     };
@@ -38361,6 +38399,7 @@ async fn scan_workspace_token_usage_tallies_and_detects_change() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         is_background: false,
         metadata: None,
     };
@@ -38486,6 +38525,7 @@ async fn scan_all_token_usage_sweeps_multiple_workspaces() {
         session_corrupted: false,
         pending_delete_at: None,
         retired_at: None,
+        notifications_muted: false,
         is_background: false,
         metadata: None,
     };
@@ -39813,6 +39853,7 @@ mod last_activity_events {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -40074,6 +40115,7 @@ mod turn_end_unread_gate {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -40168,6 +40210,32 @@ mod turn_end_unread_gate {
         assert!(
             should_raise_turn_end_unread(&h.services, &agent_id).await,
             "a restored top-level foreground agent raises again"
+        );
+    }
+
+    /// A muted top-level foreground session (`notifications_muted`) must NOT
+    /// raise the blue dot at drain end. Unmuting brings the raise back.
+    #[tokio::test]
+    async fn muted_agent_skips_raise_until_unmuted() {
+        let h = harness().await;
+        let agent_id = AgentId::new();
+        let mut s = session(&agent_id, &h.ws);
+        s.notifications_muted = true;
+        h.store
+            .insert_agent_session(&s)
+            .await
+            .expect("insert session");
+        assert!(
+            !should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "a muted agent must not raise the turn-end blue dot"
+        );
+        h.store
+            .set_agent_notifications_muted(&h.ws, &agent_id, false, &now_iso())
+            .await
+            .expect("unmute session");
+        assert!(
+            should_raise_turn_end_unread(&h.services, &agent_id).await,
+            "an unmuted top-level foreground agent raises again"
         );
     }
 
@@ -40514,6 +40582,7 @@ mod turn_token_usage {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
@@ -43453,6 +43522,241 @@ mod delete_grace_window {
     }
 }
 
+/// Bulk `workspace.delete` vs. the event bus (intent-hq/intent#5337): a burst
+/// of deletes — some checkouts still on disk, some already gone — must not
+/// make the bus drop a batch, and an already-absent repository must not WARN
+/// from the detach step.
+mod bulk_delete_pool_pressure {
+    use std::sync::{Arc, Mutex};
+
+    use intent_core::{now_iso, WorkspaceApi, WorkspaceId};
+    use intent_store::{NewEvent, Store};
+
+    use super::{workspace, TempDb, WorkspacesRoot};
+    use crate::{cleanup_workspace_worktree_locked, system_actor, EventBus, Services};
+
+    /// Thread-local `tracing` capture of `(level, message + fields)`.
+    #[derive(Clone, Default)]
+    struct LevelCapture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl LevelCapture {
+        fn at_or_above(&self, level: tracing::Level) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(l, _)| *l <= level)
+                .map(|(_, line)| line.clone())
+                .collect()
+        }
+    }
+
+    impl tracing::Subscriber for LevelCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{}={value:?} ", field.name());
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The observed log signature: the repository behind the worktree was
+    /// already gone (`Repository::open` → "failed to resolve path … No such
+    /// file or directory"), so there is nothing to detach. That is an
+    /// expected state on a retried/orphaned delete, not a WARN-worthy failure.
+    #[test]
+    fn absent_repository_detach_does_not_warn() {
+        let root = WorkspacesRoot::new();
+        let repo = root.path().join("gone-repo");
+        let worktree = root.path().join("ws-1").join("gone-repo");
+        assert!(!repo.exists() && !worktree.exists());
+
+        let capture = LevelCapture::default();
+        let guard = crate::test_tracing::set_capture_default(capture.clone());
+        let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
+        drop(guard);
+
+        assert!(trash.is_none(), "nothing to detach");
+        let loud = capture.at_or_above(tracing::Level::WARN);
+        assert!(
+            loud.is_empty(),
+            "absent repository must not log at WARN or above: {loud:?}"
+        );
+    }
+
+    /// Only a confirmed absence is quiet. A repository that is present but
+    /// unreadable (`try_exists` → `PermissionDenied`, standing in for EIO on
+    /// a flaky mount) must still reach the detach attempt and keep its WARN,
+    /// or a real failure would be silently swallowed.
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_repository_detach_still_warns() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Restores the guard dir's permissions on drop — including during
+        /// unwinding — so the tempdir sweep can traverse it after a failed
+        /// assertion.
+        struct RestorePerms(std::path::PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        if unsafe { libc::geteuid() } == 0 {
+            // Root bypasses permission checks, so the PermissionDenied seam
+            // cannot be produced; skip.
+            return;
+        }
+
+        let root = WorkspacesRoot::new();
+        let guard_dir = root.path().join("guard");
+        let repo = guard_dir.join("repo");
+        std::fs::create_dir_all(&repo).expect("present repo");
+        let worktree = root.path().join("ws-1").join("repo");
+        std::fs::set_permissions(&guard_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod guard");
+        let _restore = RestorePerms(guard_dir.clone());
+        assert_eq!(
+            repo.try_exists().unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "seam must produce a non-NotFound stat error"
+        );
+
+        let capture = LevelCapture::default();
+        let guard = crate::test_tracing::set_capture_default(capture.clone());
+        let trash = cleanup_workspace_worktree_locked(&repo, &worktree, "b54b/x", true);
+        drop(guard);
+
+        assert!(trash.is_none(), "nothing detached");
+        let loud = capture.at_or_above(tracing::Level::WARN);
+        assert!(
+            loud.iter()
+                .any(|line| line.contains("failed to detach git worktree")),
+            "inaccessible repository must keep the detach WARN: {loud:?}"
+        );
+    }
+
+    /// Concurrent deletes (checkouts present and absent) while the bus keeps
+    /// publishing: every delete succeeds, every publish resolves `Ok` (no
+    /// dropped batch), and the writer never logs a drop.
+    #[tokio::test]
+    async fn concurrent_deletes_do_not_drop_event_batches() {
+        const DELETES: usize = 12;
+        const PUBLISHES: usize = 200;
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let root = WorkspacesRoot::new();
+        let bus = EventBus::new(store.clone());
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.path().to_path_buf())
+            .with_event_bus(bus.clone());
+
+        let missing_repo = root.path().join("missing-repo");
+        let mut ids = Vec::new();
+        for i in 0..DELETES {
+            let id = WorkspaceId::new();
+            let checkout = root.path().join(id.as_str()).join("missing-repo");
+            if i % 2 == 0 {
+                std::fs::create_dir_all(&checkout).expect("present checkout");
+            }
+            let mut ws = workspace(&id);
+            ws.repository_path = Some(missing_repo.to_string_lossy().into_owned());
+            ws.worktree_path = Some(checkout.to_string_lossy().into_owned());
+            store.insert_workspace(&ws).await.expect("insert");
+            ids.push(id);
+        }
+        let live = WorkspaceId::new();
+        store
+            .insert_workspace(&workspace(&live))
+            .await
+            .expect("live workspace");
+
+        let capture = LevelCapture::default();
+        let guard = crate::test_tracing::set_capture_default(capture.clone());
+
+        let publisher = {
+            let bus = bus.clone();
+            let live = live.clone();
+            tokio::spawn(async move {
+                let mut failures = Vec::new();
+                for i in 0..PUBLISHES {
+                    let ev = NewEvent {
+                        workspace_id: live.clone(),
+                        timestamp: now_iso(),
+                        event_type: "note:updated".to_string(),
+                        actor: system_actor(),
+                        session_id: None,
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: serde_json::json!({ "i": i }),
+                    };
+                    if let Err(e) = bus.publish(&ev).await {
+                        failures.push(e.to_string());
+                    }
+                    tokio::task::yield_now().await;
+                }
+                failures
+            })
+        };
+        let mut deletes = tokio::task::JoinSet::new();
+        for id in &ids {
+            let svc = svc.clone();
+            let id = id.clone();
+            deletes.spawn(async move { (id.clone(), svc.delete_workspace(id).await) });
+        }
+        let mut done = 0;
+        while let Some(joined) = deletes.join_next().await {
+            let (id, res) = joined.expect("delete task");
+            res.unwrap_or_else(|e| panic!("delete {id} failed: {e}"));
+            done += 1;
+        }
+        assert_eq!(done, DELETES);
+        let failures = publisher.await.expect("publisher task");
+        assert!(failures.is_empty(), "publishes failed: {failures:?}");
+        drop(guard);
+
+        let errors = capture.at_or_above(tracing::Level::ERROR);
+        assert!(
+            !errors.iter().any(|l| l.contains("dropping batch")),
+            "bus dropped a batch under bulk delete: {errors:?}"
+        );
+        for id in &ids {
+            assert!(
+                matches!(
+                    svc.get_workspace(id.clone()).await,
+                    Err(intent_core::Error::NotFound(_))
+                ),
+                "{id} deleted"
+            );
+        }
+    }
+}
+
 /// Agent delete grace window (§5.5): `agent_schedule_delete_op` /
 /// `agent_cancel_delete_op` semantics — schedule→commit, schedule→cancel,
 /// cancel-after-commit race, `pendingDeleteAt` projections, the agent keeps
@@ -43521,6 +43825,7 @@ mod agent_delete_grace_window {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
             created_at: ts.clone(),
             updated_at: ts,
         }
@@ -44490,6 +44795,7 @@ mod derived_workspace_unread {
             session_corrupted: false,
             pending_delete_at: None,
             retired_at: None,
+            notifications_muted: false,
         }
     }
 
