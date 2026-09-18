@@ -1502,6 +1502,40 @@ fn chat_tool_delta_without_result_id_emits_only_the_use_block() {
 }
 
 #[test]
+fn chat_snapshot_overlap_does_not_duplicate_queued_text_chunks() {
+    for encoding in [DeltaEncoding::Full, DeltaEncoding::Incremental] {
+        for kind in ["text", "thinking"] {
+            let mut state = ChatDeltaState::new(&agent(), encoding, None);
+            state.seed_from_snapshot(&json!({"messages": [{
+                "id": "live", "isStreaming": true,
+                "contentBlocks": [{"id": "live:0", "type": kind, "text": "écho"}]
+            }]}));
+            let mut queued = chunk_event("live", "live:0", kind, &json!("écho"));
+            queued.data["textOffset"] = json!(0);
+            assert!(state.chunk_delta(&queued).is_none());
+
+            let mut next = chunk_event("live", "live:0", kind, &json!("écho"));
+            next.data["textOffset"] = json!(5);
+            let delta = state.chunk_delta(&next).expect("new repeated text");
+            let block = &delta["updated"][0]["block"];
+            match encoding {
+                DeltaEncoding::Full => assert_eq!(block["text"], "échoécho"),
+                DeltaEncoding::Incremental => assert_eq!(block["textDelta"], "écho"),
+            }
+            assert!(state.chunk_delta(&next).is_none());
+            let mut overlap = chunk_event("live", "live:0", kind, &json!("écho!"));
+            overlap.data["textOffset"] = json!(5);
+            let delta = state.chunk_delta(&overlap).expect("unseen suffix");
+            let block = &delta["updated"][0]["block"];
+            match encoding {
+                DeltaEncoding::Full => assert_eq!(block["text"], "échoécho!"),
+                DeltaEncoding::Incremental => assert_eq!(block["textDelta"], "!"),
+            }
+        }
+    }
+}
+
+#[test]
 fn chat_seed_from_snapshot_primes_in_flight_message_state() {
     let mut s = ChatDeltaState::new(&agent(), DeltaEncoding::Full, None);
     let snapshot = json!({

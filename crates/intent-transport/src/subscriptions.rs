@@ -1328,6 +1328,19 @@ impl ChatDeltaState {
         let block = if block_type == "text" || block_type == "thinking" {
             let chunk = content.as_str().unwrap_or_default();
             let acc = self.text_acc.entry(block_id.clone()).or_default();
+            // The snapshot read and bus delivery overlap: queued chunks may
+            // already be included in the seeded prefix. Producer offsets let
+            // us discard precisely that overlap, even for repeated text.
+            let chunk = if let Some(offset) = d.get("textOffset").and_then(Value::as_u64) {
+                let offset = usize::try_from(offset).ok()?;
+                let overlap = acc.len().saturating_sub(offset);
+                if overlap >= chunk.len() {
+                    return None;
+                }
+                chunk.get(overlap..)?
+            } else {
+                chunk
+            };
             acc.push_str(chunk);
             let block = match self.encoding {
                 DeltaEncoding::Full => {
