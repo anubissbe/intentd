@@ -207,7 +207,7 @@ fn stamp_delta_encoding_echoes_only_incremental() {
 }
 
 #[test]
-fn chat_channel_tails_stream_family_and_message() {
+fn chat_channel_tails_stream_family_message_and_transcript_mutations() {
     let chat = channel_event_types(Channel::Chat);
     assert_eq!(
         chat,
@@ -216,6 +216,7 @@ fn chat_channel_tails_stream_family_and_message() {
             "agent:tool:call".to_string(),
             "agent:stream:end".to_string(),
             "agent:message".to_string(),
+            "agent:updated".to_string(),
         ]
     );
     assert!(!channel_is_global(Channel::Chat));

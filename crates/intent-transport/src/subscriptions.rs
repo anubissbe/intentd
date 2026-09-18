@@ -687,6 +687,7 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             AGENT_TOOL_CALL,
             AGENT_STREAM_END,
             AGENT_MESSAGE,
+            AGENT_UPDATED,
         ],
     };
     types.iter().map(std::string::ToString::to_string).collect()
