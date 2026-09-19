@@ -13003,6 +13003,7 @@ mod workspace_apply_proposal_tests {
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
+            execution_environment: None,
         }
     }
 

@@ -2098,9 +2098,10 @@ mod tests {
     }
 
     // Size budget for the system-prompt copy: the all-defaults non-chief
-    // rendering (the common case for truncating providers) stays under 22k
-    // chars — roughly half the ~40k full text (budget includes the execution
-    // environment doc lines and the `ws.workspace.applyProposal` line).
+    // rendering (the common case for truncating providers) stays under 22.5k
+    // chars — roughly half the ~40k full text. The 22k budget was consumed by
+    // the execution-environment / sandbox doc lines together with the
+    // `ws.workspace.applyProposal` line (the combination lands at ~22.1k).
     #[test]
     fn condensed_description_size_budget() {
         let condensed = condensed_workspace_api_description(
@@ -2111,8 +2112,8 @@ mod tests {
             None,
         );
         assert!(
-            condensed.len() < 22_000,
-            "condensed all-on description is {} bytes, over the 22k budget",
+            condensed.len() < 22_500,
+            "condensed all-on description is {} bytes, over the 22.5k budget",
             condensed.len()
         );
     }
