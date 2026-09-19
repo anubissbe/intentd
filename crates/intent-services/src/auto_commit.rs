@@ -85,16 +85,25 @@ fn is_normal_finish_reason(reason: Option<&str>) -> bool {
 }
 
 /// Whether a `agent.completeOnce` failure is the generation budget running
-/// out — the only failure that starts the per-workspace cool-down. Covers
-/// the auggie route ("One-shot completion timed out after Nms"), the ACP
-/// route's setup/prompt timeouts, and [`Error::AdapterBusy`] (the whole
-/// budget spent queued for an adapter slot: the same "loaded host" symptom,
-/// nothing was ever generated). Non-timeout failures (missing CLI, non-zero
-/// exit, RPC errors) do not cool down — retrying them next idle is cheap.
+/// out — the only failure that starts the per-workspace cool-down. Matches
+/// the exact shapes the two routes emit: the auggie route's
+/// `run_auggie_print` timeout ("One-shot completion timed out after Nms"),
+/// the ACP route's `OneShotError::SetupTimeout` / `PromptTimeout` wrapped
+/// as `"{provider}: {err}"`, and [`Error::AdapterBusy`] (the whole budget
+/// spent queued for an adapter slot: the same "loaded host" symptom, nothing
+/// was ever generated). The ACP route also wraps transport / JSON-RPC
+/// failures as `Error::Internal`, and their free-text bodies may mention a
+/// timeout, so a bare `contains("timed out")` is deliberately not used:
+/// non-budget failures (missing CLI, non-zero exit, RPC errors) do not cool
+/// down — retrying them next idle is cheap.
 fn is_generation_timeout(err: &Error) -> bool {
     match err {
         Error::AdapterBusy { .. } => true,
-        Error::Internal(msg) => msg.contains("timed out"),
+        Error::Internal(msg) => {
+            msg.starts_with("One-shot completion timed out after ")
+                || msg.ends_with(": one-shot session setup timed out")
+                || msg.ends_with(": one-shot prompt timed out")
+        }
         _ => false,
     }
 }

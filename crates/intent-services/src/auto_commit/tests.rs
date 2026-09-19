@@ -802,13 +802,18 @@ fn generation_budget_is_sixty_seconds() {
 
 /// intent-hq/intent#5454: only budget exhaustion (auggie / ACP timeouts, or
 /// the whole budget spent queued for an adapter slot) starts the cool-down.
+/// The ACP route wraps transport / JSON-RPC failures as `Error::Internal`
+/// too, so a provider error that merely *mentions* a timeout must not count.
 #[test]
 fn is_generation_timeout_classifies_budget_exhaustion_only() {
     assert!(is_generation_timeout(&Error::Internal(
         "One-shot completion timed out after 60000ms".into()
     )));
     assert!(is_generation_timeout(&Error::Internal(
-        "ACP one-shot prompt timed out after 60000ms".into()
+        "claude: one-shot prompt timed out".into()
+    )));
+    assert!(is_generation_timeout(&Error::Internal(
+        "claude: one-shot session setup timed out".into()
     )));
     assert!(is_generation_timeout(&Error::AdapterBusy {
         provider: "auggie".into(),
@@ -820,6 +825,16 @@ fn is_generation_timeout_classifies_budget_exhaustion_only() {
     )));
     assert!(!is_generation_timeout(&Error::Internal(
         "auggie binary not found".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "claude: one-shot transport failed: request timed out".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "claude: adapter returned an error: upstream request timed out (-32000)".into()
+    )));
+    assert!(!is_generation_timeout(&Error::Internal(
+        "claude: adapter exited before completing the turn: exit status: 1; stderr: timed out"
+            .into()
     )));
 }
 
