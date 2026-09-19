@@ -989,6 +989,85 @@ exit 3"#,
     );
 }
 
+/// Like [`fake_auggie_hang_once`] but the script never reads stdin, so a
+/// prompt larger than the pipe capacity (64 KiB on Linux) blocks the daemon's
+/// stdin write until the child exits.
+#[cfg(unix)]
+fn fake_auggie_hang_once_no_stdin_read(tag: &str) -> (tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::tests::test_tempdir(&format!("intentd-acommit-{tag}-"));
+    let bin = dir.path().join("auggie");
+    std::fs::write(
+        &bin,
+        r#"#!/bin/sh
+calls="$(dirname "$0")/calls"
+n=$(cat "$calls" 2>/dev/null || echo 0)
+echo $((n+1)) > "$calls"
+if [ "$n" -eq 0 ]; then sleep 60; fi
+printf '{"subject": "feat: generated after cool-down"}'
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, bin)
+}
+
+/// intent-hq/intent#5454: the generation prompt can exceed the pipe capacity
+/// (the diff section alone is capped at 64 KiB, plus AGENTS.md and the system
+/// prompt). With a hung CLI that never drains stdin, the write itself blocks —
+/// it must sit inside the budgeted region so the timeout still fires, the
+/// fallback subject lands and the cool-down engages.
+#[cfg(unix)]
+#[tokio::test]
+async fn large_prompt_to_non_reading_cli_still_times_out_and_cools_down() {
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    // Enough untracked files with long paths to hit DIFF_CAP_BYTES, plus a
+    // full-cap AGENTS.md: the composed prompt is well past 64 KiB.
+    let bulk = repo.dir.join(format!("bulk-{}", "p".repeat(48)));
+    std::fs::create_dir_all(&bulk).unwrap();
+    for i in 0..1200 {
+        std::fs::write(bulk.join(format!("f{i:04}.txt")), "x\n").unwrap();
+    }
+    std::fs::write(repo.dir.join("AGENTS.md"), "a".repeat(9 * 1024)).unwrap();
+
+    let (bin_dir, bin) = fake_auggie_hang_once_no_stdin_read("cooldown-noread");
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc
+        .with_auggie_bin(bin)
+        .with_settings_registry(registry)
+        .with_auto_commit_timeout_ms(250)
+        .with_auto_commit_cooldown_ms(60_000);
+    let agent = session("agent-c4", &ws_id, None, false, "NoRead Agent", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-c4").await;
+
+    // First idle: the write blocks on the full pipe, the budget elapses
+    // anyway, the fallback subject lands. The outer deadline is what fails
+    // when the write happens before the timed region.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c4", "end_turn")),
+    )
+    .await
+    .expect("stdin write blocked past the outer deadline: budget never started");
+    assert_eq!(fake_auggie_calls(&bin_dir), 1);
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(message.starts_with("NoRead Agent"), "got: {message}");
+
+    // Second idle inside the window: cool-down skips generation up front.
+    redirty_change(&repo, &svc, &ws_id, "agent-c4").await;
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c4", "end_turn"))
+        .await;
+    assert_eq!(
+        fake_auggie_calls(&bin_dir),
+        1,
+        "generation ran again inside the cool-down window"
+    );
+    let (_a, _l, message) = last_commit_trailers(&repo.dir);
+    assert!(message.starts_with("NoRead Agent"), "got: {message}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn malformed_output_falls_back_to_subject() {
