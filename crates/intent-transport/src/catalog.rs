@@ -495,7 +495,9 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 /// `system.status`, the latter served as the guest-safe projection
 /// `control::collaborator_status_json` rather than the administrator's
 /// snapshot),
-/// `workspace.create` / `git.clone` (arbitrary host paths), agent / hook /
+/// `workspace.create` / `git.clone` (arbitrary host paths), agent creation /
+/// delegation (`agent.create` / `agent.delegate` / `agent.wakeOrCreate`;
+/// decided 2026-09-19: guests steer existing agents only), agent / hook /
 /// PR-monitor deletion, and `agent.replaceMessages` — it persists
 /// client-supplied user rows verbatim, so a non-owner could forge
 /// `fromPrincipalId` attribution; collaborators keep
@@ -505,8 +507,6 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows and, for a collaborator member, a user row's content carries the sender preamble (other roles byte-identical). Workspace-scoped, no host reach."),
     ("agent.cancelSubscriptions", "Steer: cancels an agent's own event subscriptions / delegation groups. Agent-scoped bookkeeping, no host reach."),
-    ("agent.create", "Steer: creates an agent in a workspace. The agent acts with the owner's capabilities (decided); the guest only starts it."),
-    ("agent.delegate", "Steer: delegates a task note to a new agent in the workspace; a collaborator's agentInstructions / taskText carry the sender preamble and the caller's fromPrincipalId stamp, so the child's first row is served as the sender's (the task-note fallback carries neither). Same trust as agent.create."),
     ("agent.dismissQuestions", "Steer: dismisses an agent's pending structured questions. Agent-scoped state only."),
     ("agent.editAndRegenerate", "Steer: edits a user message and regenerates from it; the edited content carries the collaborator sender preamble. Conversation write, workspace-scoped."),
     ("agent.editQueuedMessage", "Steer: edits a queued message; a collaborator's edit of a human-authored entry carries the sender preamble. Intentional exception: a collaborator's edit of an agent-authored (A2A / automatic) entry is NOT preambled — its sender stays the originating agent's header and the edit is recorded by the principal stamp. Queue write, agent-scoped."),
@@ -540,7 +540,6 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.summary", "Read: a short summary of an agent's work. Workspace-scoped."),
     ("agent.unsubscribe", "Client boot: drops an agent subscription."),
     ("agent.update", "Steer: updates agent metadata (name, background flag). No host reach."),
-    ("agent.wakeOrCreate", "Steer: ensures a task has a working agent; the context message carries the collaborator sender preamble. Same trust as agent.create."),
     ("chat.subscribe", "Client boot: the chat channel fast path the desktop renders conversations from. Workspace-scoped; delivery narrowed by the event allowlist."),
     ("chat.unsubscribe", "Client boot: drops a chat channel subscription."),
     ("client.hello", "Client boot: binds the connection's logical client id and capabilities. Identity is never taken from it: a collaborator's client id is namespaced by its principal, and a non-administrator connection is never bound into the reverse registry (no reverse-RPC / tab-host eligibility, presence, or client:* transitions) regardless of what it advertises."),
