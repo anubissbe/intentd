@@ -95,6 +95,42 @@ pub struct PullRequestInfo {
     pub is_draft: Option<bool>,
 }
 
+impl PullRequestInfo {
+    /// Strip the detail-only PR fields from a `workspace.list` row entry
+    /// (`activePullRequest` / `pullRequests[]`); see
+    /// [`Workspace::slim_for_list`]. The list-context readers (sidebar PR
+    /// dropdown, card status, delete warning) need `number` / `url` /
+    /// `title` / `status` / `isDraft` plus the timestamps used for ordering,
+    /// and `mergeable` / `mergeableState` — the FE derives the PR lifecycle
+    /// display status from them on list rows, so both stay. `headSha` and
+    /// `author` feed hover tooltips only, so they are `workspace.get`-only.
+    pub fn slim_for_list(&mut self) {
+        self.head_sha = None;
+        self.author = None;
+    }
+
+    /// Whether `other` names the same pull request as `self`. Identity is
+    /// the repository-qualified `url` — the key the emit-path merge dedups
+    /// on — never `id` / `number`: the merged `pullRequests` pool carries
+    /// the workspace's own PRs plus git-root and PR-monitor entries from
+    /// other repositories, and both `pr_ops::build_pr_info` and the monitor
+    /// fold derive `id` from the bare number, so `o/main#1` and `o/sub#1`
+    /// share an `id`. The fallback is repository + `number`, and the only
+    /// repository this struct knows is the one in the URL: two entries that
+    /// both lack a URL share an (unknown) repository, so their `number`
+    /// decides; an entry with a URL is matched by its exact URL only — a
+    /// blank-URL entry never satisfies a lookup for it, whatever its
+    /// `number`.
+    #[must_use]
+    pub fn same_pull_request(&self, other: &Self) -> bool {
+        match (self.url.is_empty(), other.url.is_empty()) {
+            (false, false) => self.url == other.url,
+            (true, true) => self.number == other.number,
+            _ => false,
+        }
+    }
+}
+
 /// Kind of a workspace context link (§5.1). Wire values are lowercase
 /// (`"issue"` / `"pr"`); the set is deliberately extensible for future
 /// link kinds.
@@ -228,7 +264,8 @@ pub struct Workspace {
     pub skip_worktree: bool,
     /// Durable worktree setup script (§5.25): the persisted `SetupScript` record
     /// read/written via `workspace.getSetupScript`/`saveSetupScript`. Omitted (not
-    /// `null`) until a script has been saved.
+    /// `null`) until a script has been saved, and always omitted on list rows
+    /// ([`Workspace::slim_for_list`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_script: Option<SetupScript>,
     pub is_remote: bool,
@@ -246,12 +283,23 @@ pub struct Workspace {
     pub active_pull_request: Option<PullRequestInfo>,
     /// Persisted list of PR snapshots discovered for the workspace's baseRef
     /// (§7.6). Distinct from `activePullRequest` (the currently-linked PR); the
-    /// FE reconciles stale PR links against this collection.
+    /// FE reconciles stale PR links against this collection. List rows carry
+    /// at most [`WORKSPACE_LIST_PR_CAP`] entries ([`Workspace::slim_for_list`]);
+    /// `workspace.get` serves the full pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_requests: Option<Vec<PullRequestInfo>>,
+    /// List-only (`workspace.list` / lite `workspace.subscribe` seq-0): the
+    /// pre-cap length of `pullRequests` when [`Workspace::slim_for_list`]
+    /// truncated the pool to [`WORKSPACE_LIST_PR_CAP`] entries. Derived on the
+    /// list emit path from the row already in hand (no extra read); never
+    /// persisted. Omitted (not `null`) when the pool fit — and always omitted
+    /// on `workspace.get`, which serves the full pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_requests_total: Option<u32>,
     /// Issue/PR context links supplied at `workspace.create` (§5.1), persisted
-    /// on the row and returned on every `Workspace` payload. Omitted (not
-    /// `null`) when the workspace was created without links.
+    /// on the row and returned on every detail `Workspace` payload (omitted on
+    /// list rows, [`Workspace::slim_for_list`]). Omitted (not `null`) when the
+    /// workspace was created without links.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_links: Option<Vec<ContextLink>>,
     pub archived: bool,
@@ -336,7 +384,222 @@ pub struct Workspace {
     pub pending_delete_at: Option<String>,
 }
 
+/// Whole-row byte budget for one serialized `workspace.list` row (and the
+/// identical lite `workspace.subscribe` seq-0 row): a worst-case-realistic
+/// ACTIVE row after [`Workspace::slim_for_list`] — several PRs, a
+/// `diffSummary`, an `agentSummary` of ten agents, every small optional
+/// scalar present — must serialize at or under this many bytes, enforced by
+/// the row-budget golden test in intent-services (`tests.rs`), which prints
+/// a per-field byte table on failure.
+///
+/// Arithmetic. The transport warns on outbound frames over 1 MiB
+/// (1,048,576 B); ~500 workspaces under that line means ≈ 2,097 B/row
+/// averaged over the fleet, and the fleet is mostly archived rows (the
+/// dogfooding set that motivated the slimming, monorepo#3041, was ~85%
+/// archived). The golden's worst-case active row measures ≈ 7.4 KB:
+/// `agentSummary` ≈ 3.5 KB (≈ 300 B per agent — id, name, status,
+/// specialist, lastActivity, parentAgentId, the two liveness flags — plus
+/// ≈ 46 B per `agentIds` entry, ×10), the PR pool at its cap plus the
+/// linked `activePullRequest` ≈ 2.3 KB (six slimmed entries at ≈ 390 B
+/// each, `mergeable` / `mergeableState` kept for the client's lifecycle
+/// display status, plus `pullRequestsTotal`), and ≈ 1.5 KB of fixed
+/// fields (ids, paths, timestamps, a long title / status message,
+/// `taskStats`, `diffSummary` totals). The five-entry PR pool is an
+/// enforced bound, not a fixture assumption: [`Workspace::slim_for_list`]
+/// keeps at most [`WORKSPACE_LIST_PR_CAP`] `pullRequests` entries on a list
+/// row (the golden fixture stores eight so the cap is exercised), so
+/// `agentSummary` is the only field that scales with accumulated state,
+/// which is why archived rows drop it: the same worst case archived is
+/// ≈ 3.9 KB, and a typical row (one to three agents, one PR, short paths)
+/// is ≈ 1.5–2 KB — under the fleet average the 1 MiB goal needs, as the
+/// 130-row realistic-fleet test alongside the golden shows. The budget
+/// below is the measured worst case plus a small margin; the key allowlist
+/// ([`WORKSPACE_LIST_ROW_KEYS`] / [`WORKSPACE_LIST_PR_KEYS`]) keeps the
+/// fixed part from regrowing field-by-field. Shrinking further means
+/// slimming `agentSummary` (e.g. dropping the redundant `agentIds` mirror
+/// once the TS consumer reads `agents[].id`) — a separate protocol
+/// decision.
+pub const WORKSPACE_LIST_ROW_BUDGET_BYTES: usize = 7_680;
+
+/// Maximum number of `pullRequests[]` entries a `workspace.list` row (and
+/// the identical lite `workspace.subscribe` seq-0 row) carries after
+/// [`Workspace::slim_for_list`]. The pool's length is unbounded in
+/// production (every PR ever opened from the workspace's branch, plus the
+/// folded git-root PRs) — unlike the active row's `agentSummary`, which is
+/// deliberately left uncapped, it is cheap to bound here — and
+/// [`WORKSPACE_LIST_ROW_BUDGET_BYTES`] was sized from a five-entry pool
+/// (≈ 390 B per slimmed entry). Survivors are the most recently updated
+/// entries (`updatedAt` descending, `number` descending on ties), with the
+/// entry matching `activePullRequest` — by repository-qualified `url`
+/// ([`PullRequestInfo::same_pull_request`]; PR numbers collide across the
+/// repositories the merged pool spans, and a blank-URL entry never stands
+/// in for an active PR that has a URL) — always retained and moved to the
+/// front; a truncated row reports the pre-cap length as
+/// `pullRequestsTotal`. `workspace.get` serves the full pool.
+pub const WORKSPACE_LIST_PR_CAP: usize = 5;
+
+/// Key allowlist golden for a serialized `workspace.list` row: the
+/// top-level keys a list row may carry after [`Workspace::slim_for_list`].
+/// The row-budget golden test compares every key of a worst-case row
+/// against this list — an unlisted key fails with guidance to either add
+/// it here (list-relevant AND small) or serve it on `workspace.get` only.
+/// Detail-only fields (`setupScript`, `contextLinks`, `tokenUsage`,
+/// `diskUsage`) are deliberately absent; `pullRequestsTotal` is the one
+/// list-only key (set by the [`WORKSPACE_LIST_PR_CAP`] truncation, never on
+/// `workspace.get`). Adding a key here is a
+/// wire-contract change — update `docs/protocol/methods/workspace.md` in
+/// the same commit and state which rung of the derived-field ladder the
+/// field sits on.
+pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
+    "id",
+    "title",
+    "branch",
+    "baseRef",
+    "baseCommitSha",
+    "status",
+    "statusMessage",
+    "statusImageAssetId",
+    "activity",
+    "attention",
+    "createdAt",
+    "updatedAt",
+    "lastActivity",
+    "tags",
+    "path",
+    "repositoryPath",
+    "repositoryOwner",
+    "repositoryName",
+    "worktreePath",
+    "scope",
+    "skipWorktree",
+    "isRemote",
+    "defaultModel",
+    "prNumber",
+    "prUrl",
+    "prStatus",
+    "activePullRequest",
+    "pullRequests",
+    "pullRequestsTotal",
+    "archived",
+    "archivedAt",
+    "taskStats",
+    "agentSummary",
+    "diffSummary",
+    "displayStatus",
+    "waiting",
+    "cowSupported",
+    "checkoutMode",
+    "browserClientId",
+    "pendingDeleteAt",
+];
+
+/// Key allowlist golden for an `activePullRequest` / `pullRequests[]` entry
+/// of a `workspace.list` row; companion of [`WORKSPACE_LIST_ROW_KEYS`] with
+/// the same rules. `headSha` and `author` are detail-only (see
+/// [`PullRequestInfo::slim_for_list`]) and deliberately absent;
+/// `mergeable` / `mergeableState` stay because the FE derives the PR
+/// lifecycle display status from them on list rows.
+pub const WORKSPACE_LIST_PR_KEYS: &[&str] = &[
+    "id",
+    "number",
+    "url",
+    "title",
+    "status",
+    "createdAt",
+    "updatedAt",
+    "baseRef",
+    "headRef",
+    "isDraft",
+    "mergeable",
+    "mergeableState",
+];
+
 impl Workspace {
+    /// List-frame slimming for `workspace.list` and the lite
+    /// `workspace.subscribe` seq-0 snapshot (monorepo#3041, extended): drop
+    /// the detail-only fields so a list row stays within the documented
+    /// worst-case-realistic fixture budget
+    /// ([`WORKSPACE_LIST_ROW_BUDGET_BYTES`] — ten agents, a capped PR pool)
+    /// rather than growing with everything a workspace has accumulated; an
+    /// ACTIVE row's `agentSummary` is deliberately left uncapped, so the
+    /// budget is a fixture bound, not a universal per-row ceiling.
+    /// `workspace.get` never calls
+    /// this and keeps serving every field. Following the v4.2 `diskUsage`
+    /// precedent, every stripped field is optional on the wire and simply
+    /// absent on list rows (never `null`) — no wire-shape change.
+    ///
+    /// - `tokenUsage`: clients read it via `workspace.getTokenUsage` + the
+    ///   tokenUsage-changed event, never off list rows; dominated large
+    ///   frames (~26% of a real 180-workspace payload).
+    /// - `agentSummary` on ARCHIVED rows: archived workspaces render no
+    ///   HUD/coverflow agent cards, yet their accumulated sessions made
+    ///   archived rows the bulk of the aggregate (~65% of `agentSummary`
+    ///   bytes measured). Active rows keep the full summary.
+    /// - `setupScript`: an unbounded script body read only by the open
+    ///   workspace's chat/setup surfaces; `workspace.getSetupScript` is the
+    ///   dedicated read.
+    /// - `contextLinks`: consumed once, when a client opens the workspace
+    ///   and seeds its layout from the linked pages — `workspace.get`
+    ///   serves it there.
+    /// - `diskUsage` and `diffSummary.files`: never populated on the list
+    ///   path today (`workspace.diskUsage` / the diff RPCs serve them);
+    ///   cleared here so the guarantee holds by construction.
+    /// - `activePullRequest` / `pullRequests[]` entries: per-PR detail
+    ///   fields via [`PullRequestInfo::slim_for_list`].
+    /// - `pullRequests[]` length: capped at [`WORKSPACE_LIST_PR_CAP`]
+    ///   entries — the most recently updated (`updatedAt` desc, `number`
+    ///   desc on ties), the `activePullRequest` match (by
+    ///   repository-qualified `url`, [`PullRequestInfo::same_pull_request`])
+    ///   always kept and moved to the front — with the pre-cap length
+    ///   reported as `pullRequestsTotal`. A pool within the cap is left
+    ///   untouched (no reorder, `pullRequestsTotal` absent).
+    ///   `activePullRequest` itself is never removed (only slimmed, above).
+    ///
+    /// Fixed-size scalars stay even when only detail surfaces read them
+    /// (`baseCommitSha`, `path` / `repositoryPath` / `worktreePath`): a
+    /// 40-hex SHA buys nothing per row, and the FE store hydrates open
+    /// workspaces from list rows.
+    ///
+    /// Applied as the FINAL pass over the merged list — after enrichment
+    /// and after the emit-path PR merge — so a row degraded by an
+    /// enrichment failure, and externally merged PR entries, are slimmed
+    /// the same way.
+    pub fn slim_for_list(&mut self) {
+        self.token_usage = None;
+        if self.archived {
+            self.agent_summary = None;
+        }
+        self.setup_script = None;
+        self.context_links = None;
+        self.disk_usage = None;
+        if let Some(diff) = self.diff_summary.as_mut() {
+            diff.files.clear();
+        }
+        if let Some(pr) = self.active_pull_request.as_mut() {
+            pr.slim_for_list();
+        }
+        if let Some(prs) = self.pull_requests.as_mut() {
+            for pr in prs.iter_mut() {
+                pr.slim_for_list();
+            }
+            if prs.len() > WORKSPACE_LIST_PR_CAP {
+                self.pull_requests_total = Some(u32::try_from(prs.len()).unwrap_or(u32::MAX));
+                prs.sort_by(|a, b| {
+                    b.updated_at
+                        .cmp(&a.updated_at)
+                        .then_with(|| b.number.cmp(&a.number))
+                });
+                if let Some(active) = self.active_pull_request.as_ref() {
+                    if let Some(pos) = prs.iter().position(|pr| pr.same_pull_request(active)) {
+                        let active = prs.remove(pos);
+                        prs.insert(0, active);
+                    }
+                }
+                prs.truncate(WORKSPACE_LIST_PR_CAP);
+            }
+        }
+    }
+
     /// The workspace's on-disk root: `path`, else `worktreePath`, else
     /// `repositoryPath` — direct-checkout workspaces (`skipIsolation`) may
     /// persist only `repositoryPath` (monorepo#3778). Empty strings are
@@ -454,6 +717,7 @@ pub fn chief_workspace() -> Workspace {
         pr_status: None,
         active_pull_request: None,
         pull_requests: None,
+        pull_requests_total: None,
         context_links: None,
         archived: false,
         archived_at: None,
@@ -2682,6 +2946,51 @@ pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
     value
 }
 
+/// `agent.list { scope }` row scope (§5.5): which bin of the workspace's
+/// NON-retired sessions a scoped read serves. The three bins partition the
+/// `retired_at IS NULL` rows exactly — `topLevel ∪ delegated ∪ background`
+/// is the default read's row set and the bins are pairwise disjoint — so a
+/// client can render the collapsed bins from [`AgentScopeCounts`] alone and
+/// fetch a bin's rows only on expand (the same pattern as the v8.3 retired
+/// bin). Retired sessions are their own bin (`retiredOnly`), never part of
+/// any scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentListRowScope {
+    /// `parent_agent_id IS NULL AND is_background = 0` — the rows the FE
+    /// lists by default.
+    TopLevel,
+    /// `parent_agent_id IS NOT NULL`, optionally narrowed to one parent's
+    /// direct sub-agents (`parent_agent_id = ?`).
+    Delegated { parent_agent_id: Option<AgentId> },
+    /// `parent_agent_id IS NULL AND is_background <> 0` — unparented
+    /// background agents.
+    Background,
+}
+
+impl AgentListRowScope {
+    /// The wire `scope` value naming this bin.
+    #[must_use]
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            Self::TopLevel => "topLevel",
+            Self::Delegated { .. } => "delegated",
+            Self::Background => "background",
+        }
+    }
+}
+
+/// Per-bin counts of a workspace's non-retired sessions — the always-present
+/// `scopeCounts` field on every `agent.list` response variant (§5.5), one
+/// grouped SQL aggregate. `delegated` is the workspace-wide count even when
+/// the rows read was narrowed by `parentAgentId`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentScopeCounts {
+    pub top_level: u64,
+    pub delegated: u64,
+    pub background: u64,
+}
+
 /// Per-field byte budget for `agent.list` row previews (list-payload cost
 /// contract, extending monorepo#2932): the preview fields exist to render a
 /// one-line summary in list contexts (sidebar rows, HUD cells), so each is
@@ -2697,6 +3006,187 @@ pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
 /// transport's 1 MiB large-frame warn — while keeping each preview long
 /// enough for its one-line render.
 pub const AGENT_LIST_PREVIEW_BUDGET_BYTES: usize = 400;
+
+/// List-row byte cap for the short identifying strings `name` and `model`
+/// (intent-hq/intent#5383): neither is a preview, so the render-sized
+/// 400-byte preview budget would over-provision them. A session name is a
+/// 1–5 word label (the daemon's own naming guidance) and a model id is a
+/// provider slug (`claude-sonnet-4-5-20250929`, ~26 B); 128 B keeps every
+/// realistic value intact and bounds a pathological one. Same
+/// JSON-serialized-bytes, char-boundary-safe truncation as the previews
+/// ([`AgentLite::cap_list_previews`]); `agent.get` serves full values.
+pub const AGENT_LIST_NAME_CAP_BYTES: usize = 128;
+
+/// List-row byte cap for `metadata.sandboxPath` and `metadata.sandboxBranch`
+/// (intent-hq/intent#5383): filesystem paths and branch names run longer
+/// than labels but well under a preview — a sandbox checkout under a
+/// deep home directory is ≈ 70 B, a `sandbox/<workspace>/<sbx-id>` branch
+/// ≈ 50 B — so 256 B keeps every realistic value intact while bounding the
+/// row. Same truncation as [`AGENT_LIST_NAME_CAP_BYTES`]; `agent.get`
+/// serves full values.
+pub const AGENT_LIST_PATH_CAP_BYTES: usize = 256;
+
+/// Whole-row byte budget for one serialized `agent.list` row
+/// (intent-hq/intent#5383): the per-field caps above bound each string,
+/// but the row is the unit the transport frames, so a
+/// worst-case-realistic row — every optional field present, every capped
+/// string at its cap ([`AGENT_LIST_PREVIEW_BUDGET_BYTES`] for the previews
+/// and `metadata.attentionRequestReason`, [`AGENT_LIST_NAME_CAP_BYTES`]
+/// for `name` / `model`, [`AGENT_LIST_PATH_CAP_BYTES`] for
+/// `metadata.sandboxPath` / `metadata.sandboxBranch`), two active hooks
+/// and two PR monitors, the detail-only fields stripped
+/// ([`AgentLite::strip_detail_only_fields`]) — must serialize at or under
+/// this many bytes, enforced by the row-budget golden test in
+/// intent-services (`agent_ops::tests`), which prints a per-field byte
+/// table on failure.
+///
+/// Arithmetic. The transport warns on outbound frames over 1 MiB
+/// (1,048,576 B); the `agent.list` envelope
+/// (`{"jsonrpc":"2.0","id":…,"result":{"agents":[…]}}` plus one comma per
+/// row) costs about 1,060 B for 1,000 rows, so the frame goal is
+/// ≈ 1,047 B/row. The caps alone put the worst-case row above that: six
+/// preview-capped slots (`lastAgentResponse`, `lastUserMessage`, `digest`,
+/// `metadata.completionReport`, `lastToolUse.input`,
+/// `metadata.attentionRequestReason`) × 400 B ≈ 2,600 B on the wire (keys,
+/// quotes and the `lastToolUse` preview flags included), plus the four
+/// smaller caps (2 × 128 B + 2 × 256 B ≈ 800 B with keys) before a single
+/// fixed field. The measured worst-case row is ≈ 5,840 B (it drifts by a
+/// few bytes with RFC-3339 sub-second precision): those ≈ 3,400 B of
+/// capped strings plus ≈ 2,440 B of fixed fields — eight `agent-<uuid>`
+/// ids (≈ 470 B), nine RFC-3339 timestamps (≈ 470 B), four message ids
+/// (≈ 230 B), two hook entries (326 B), two PR-monitor entries (206 B),
+/// the sandbox id (≈ 40 B), and the boolean/enum flags. This budget is
+/// that measurement rounded up to the next half KiB (6 KiB, ≈ 5%
+/// margin); a row that regrows past it fails the golden with the
+/// per-field table. Typical rows are far smaller (the issue's 404-row
+/// measurement averaged 2.6 KB/row BEFORE slimming; few sessions carry an
+/// attention request, sandbox fields, hooks AND monitors at once, and
+/// previews rarely all hit the cap), and the per-key allowlist
+/// ([`AGENT_LIST_ROW_KEYS`]) keeps the fixed part from regrowing
+/// field-by-field. Meeting the ≈ 1 KB/row frame goal for 1,000 worst-case
+/// rows would require lowering the preview cap (each 100 B off
+/// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] takes ≈ 600 B off this budget) or
+/// paging `agent.list` — separate protocol decisions.
+pub const AGENT_LIST_ROW_BUDGET_BYTES: usize = 6 * 1024;
+
+/// Key allowlist golden for a serialized `agent.list` row
+/// (intent-hq/intent#5383): the top-level keys a list row may carry. The
+/// row-budget golden test compares every key of a worst-case row against
+/// this list — an unlisted key fails with guidance to either add it here
+/// (list-relevant AND small) or serve it on `agent.get` / `agent.getSession`
+/// only. Detail-only fields (`harnessFeatures`, `effortLevels`,
+/// `contextReferences`, `fileBlocks`, `stats`) are deliberately absent: the
+/// list projection strips them and the detail reads keep serving them.
+/// Adding a key here is a wire-contract change — update
+/// `docs/protocol/methods/agents.md` in the same commit and state which
+/// rung of the derived-field ladder the field sits on.
+pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
+    "id",
+    "workspaceId",
+    "parentAgentId",
+    "backendSessionId",
+    "acpSessionId",
+    "name",
+    "nameExplicitlySet",
+    "model",
+    "reasoningEffort",
+    "provider",
+    "status",
+    "isActive",
+    "isStreaming",
+    "isProcessing",
+    "isResponding",
+    "isWaitingOnTool",
+    "isWaitingForOtherAgents",
+    "waitingForAgentIds",
+    "waitingOnHooks",
+    "waitingOnPrMonitors",
+    "turnInFlight",
+    "lastStreamActivityAt",
+    "contextUsage",
+    "createdAt",
+    "updatedAt",
+    "lastActivity",
+    "messageCount",
+    "lastAgentResponse",
+    "lastUserMessage",
+    "lastMessageRole",
+    "lastMessageId",
+    "lastToolUse",
+    "digest",
+    "stopReason",
+    "stopReasonTimestamp",
+    "sessionCorrupted",
+    "pendingDeleteAt",
+    "retiredAt",
+    "notificationsMuted",
+    "harnessVersion",
+    "metadata",
+];
+
+/// Key allowlist golden for the nested `metadata` object of an `agent.list`
+/// row; companion of [`AGENT_LIST_ROW_KEYS`] with the same rules.
+/// `pendingProposals` / `proposalResolutions` are detail-only (the open
+/// chat's proposal cards read them via `agent.get`) and deliberately
+/// absent.
+pub const AGENT_LIST_ROW_METADATA_KEYS: &[&str] = &[
+    "isBackground",
+    "specialist",
+    "createdByAgentId",
+    "taskNoteId",
+    "completionReport",
+    "completionReportTimestamp",
+    "attentionRequestKind",
+    "attentionRequestReason",
+    "attentionRequestTimestamp",
+    "delegationDepth",
+    "sandboxId",
+    "sandboxPath",
+    "sandboxBranch",
+    "dismissedQuestionsMessageId",
+    "pendingQuestionsMessageId",
+    "lastSeenMessageId",
+    "isInitialAgent",
+    "sponsorAgentId",
+];
+
+/// Serialized-size attribution of one JSON object for list-row budget
+/// tests: `(total_bytes, per_key)` where `total_bytes` is the compact
+/// serialized length of `value` and `per_key` charges each top-level entry
+/// its serialized key, the `:` separator, its serialized value, and one
+/// byte of `,`/`}` punctuation, sorted largest-first (ties by key). A
+/// non-object value attributes everything to a single `<value>` entry.
+/// Shared by the `agent.list` / `workspace.list` row-budget goldens so
+/// their failure messages name the fields that blew the budget.
+#[must_use]
+pub fn serialized_key_bytes(value: &serde_json::Value) -> (usize, Vec<(String, usize)>) {
+    let total = serde_json::to_vec(value).map_or(0, |v| v.len());
+    let mut per_key: Vec<(String, usize)> = match value {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| {
+                let key_bytes = serde_json::to_vec(k).map_or(0, |b| b.len());
+                let value_bytes = serde_json::to_vec(v).map_or(0, |b| b.len());
+                (k.clone(), key_bytes + 1 + value_bytes + 1)
+            })
+            .collect(),
+        _ => vec![("<value>".to_string(), total)],
+    };
+    per_key.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    (total, per_key)
+}
+
+/// Render a [`serialized_key_bytes`] breakdown as an aligned
+/// `bytes  key` table (largest first) for assertion messages.
+#[must_use]
+pub fn format_key_bytes_table(total: usize, per_key: &[(String, usize)]) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!("total {total} B\n");
+    for (key, bytes) in per_key {
+        let _ = writeln!(out, "{bytes:>7} B  {key}");
+    }
+    out
+}
 
 /// Per-session fields an agent must never learn about. `notificationsMuted`
 /// is a user-facing notification preference served on the wire [`AgentLite`]
@@ -3577,7 +4067,8 @@ pub struct AgentLite {
     /// Captured `agentFeatures` snapshot; mirrors
     /// [`AgentSession::harness_features`]. `None` for pre-snapshot rows here
     /// (no settings context) — the service projection overlays the current
-    /// settings so the wire always carries a value.
+    /// settings so `agent.get` always carries a value. Detail-only: stripped
+    /// from `agent.list` rows by [`Self::strip_detail_only_fields`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_features: Option<serde_json::Value>,
     pub metadata: AgentMetadata,
@@ -3682,13 +4173,44 @@ impl AgentLite {
         }
     }
 
+    /// List-path detail-field strip (intent-hq/intent#5383): drop the fields
+    /// that only the open-agent (detail) UI reads — `harnessFeatures`,
+    /// `effortLevels`, `contextReferences`, `fileBlocks`, `stats`,
+    /// `metadata.pendingProposals`, `metadata.proposalResolutions` — so an
+    /// `agent.list` row carries only what list contexts render. Every one of
+    /// these is presence-detected on the wire (`skip_serializing_if`), so a
+    /// stripped row simply omits the key (absent, never `null`). `agent.list`
+    /// applies this to every row alongside [`Self::cap_list_previews`]; the
+    /// detail reads (`agent.get` / `agent.getSession`) never call it and keep
+    /// serving the full values. Serve-time projection only — nothing changes
+    /// at write time. The key allowlist goldens [`AGENT_LIST_ROW_KEYS`] /
+    /// [`AGENT_LIST_ROW_METADATA_KEYS`] pin the resulting shape.
+    pub fn strip_detail_only_fields(&mut self) {
+        self.harness_features = None;
+        self.effort_levels = None;
+        self.context_references = None;
+        self.file_blocks = None;
+        self.stats = None;
+        self.metadata.pending_proposals.clear();
+        self.metadata.proposal_resolutions.clear();
+    }
+
     /// List-path preview capping (list-payload cost contract, extending
     /// monorepo#2932): bound every render-preview field to
     /// [`AGENT_LIST_PREVIEW_BUDGET_BYTES`] — `lastAgentResponse`,
     /// `lastUserMessage`, `digest`, and `metadata.completionReport` are
     /// truncated char-boundary safe against their JSON-SERIALIZED size
     /// (escaping-heavy content cannot defeat the wire-frame goal by
-    /// expanding 6x on serialization). `lastToolUse` keeps the documented §5.5
+    /// expanding 6x on serialization). The remaining free-text strings a
+    /// list row carries get the same silent truncation at a cap sized for
+    /// the field — `metadata.attentionRequestReason` (a long reason blew
+    /// the row budget in production, intent-hq/intent#5383) at the preview
+    /// budget, `name` / `model` at [`AGENT_LIST_NAME_CAP_BYTES`], and
+    /// `metadata.sandboxPath` / `metadata.sandboxBranch` at
+    /// [`AGENT_LIST_PATH_CAP_BYTES`] — so every free-text string a list row
+    /// carries is bounded (`lastToolUse.name` is the one string left
+    /// untouched: it is a tool identifier, not free text, and the FE keys
+    /// its tool classification on it). `lastToolUse` keeps the documented §5.5
     /// preview contract (`{ name, input?, inputTruncated?, inputBytes? }`):
     /// only an over-budget `input` is replaced by [`cap_json_value`]'s
     /// structure-preserving preview, with `inputTruncated: true` stamped
@@ -3721,31 +4243,48 @@ impl AgentLite {
             let mut sink = CountingSink(0);
             serde_json::to_writer(&mut sink, s).map_or(0, |()| sink.0.saturating_sub(2))
         }
-        fn cap_string(field: &mut Option<String>) {
-            if let Some(s) = field {
-                let mut end = s.len().min(AGENT_LIST_PREVIEW_BUDGET_BYTES);
-                loop {
-                    while end > 0 && !s.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    let escaped = escaped_len(&s[..end]);
-                    if escaped <= AGENT_LIST_PREVIEW_BUDGET_BYTES || end == 0 {
-                        break;
-                    }
-                    // Proportional shrink: `escaped > budget` makes the new
-                    // end strictly smaller, so the loop converges without
-                    // overshooting escaping-heavy content to zero.
-                    end = end * AGENT_LIST_PREVIEW_BUDGET_BYTES / escaped;
+        fn cap_str(s: &mut String, budget: usize) {
+            let mut end = s.len().min(budget);
+            loop {
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
                 }
-                if end < s.len() {
-                    s.truncate(end);
+                let escaped = escaped_len(&s[..end]);
+                if escaped <= budget || end == 0 {
+                    break;
                 }
+                // Proportional shrink: `escaped > budget` makes the new
+                // end strictly smaller, so the loop converges without
+                // overshooting escaping-heavy content to zero.
+                end = end * budget / escaped;
+            }
+            if end < s.len() {
+                s.truncate(end);
             }
         }
-        cap_string(&mut self.last_agent_response);
-        cap_string(&mut self.last_user_message);
-        cap_string(&mut self.digest);
-        cap_string(&mut self.metadata.completion_report);
+        fn cap_string(field: &mut Option<String>, budget: usize) {
+            if let Some(s) = field {
+                cap_str(s, budget);
+            }
+        }
+        cap_string(
+            &mut self.last_agent_response,
+            AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        );
+        cap_string(&mut self.last_user_message, AGENT_LIST_PREVIEW_BUDGET_BYTES);
+        cap_string(&mut self.digest, AGENT_LIST_PREVIEW_BUDGET_BYTES);
+        cap_string(
+            &mut self.metadata.completion_report,
+            AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        );
+        cap_string(
+            &mut self.metadata.attention_request_reason,
+            AGENT_LIST_PREVIEW_BUDGET_BYTES,
+        );
+        cap_str(&mut self.name, AGENT_LIST_NAME_CAP_BYTES);
+        cap_string(&mut self.model, AGENT_LIST_NAME_CAP_BYTES);
+        cap_string(&mut self.metadata.sandbox_path, AGENT_LIST_PATH_CAP_BYTES);
+        cap_string(&mut self.metadata.sandbox_branch, AGENT_LIST_PATH_CAP_BYTES);
         match self.last_tool_use.as_mut() {
             Some(Value::Object(preview)) => {
                 if let Some(input) = preview.get("input") {
@@ -5023,6 +5562,278 @@ mod tests {
         assert_eq!(row["contentLength"], NOTE_LIST_PREVIEW_CHARS * 3);
     }
 
+    /// A `pullRequests[]` entry whose `updatedAt` orders it `n`-th: entry
+    /// `n` was updated `n` minutes into the hour, so a higher `n` is more
+    /// recent.
+    fn list_cap_pr(n: u64) -> PullRequestInfo {
+        PullRequestInfo {
+            id: format!("PR_{n}"),
+            number: 100 + n,
+            url: format!("https://github.com/intent-hq/intentd/pull/{}", 100 + n),
+            title: format!("PR {n}"),
+            status: PullRequestStatus::Open,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: format!("2026-01-01T00:{n:02}:00Z"),
+            base_ref: None,
+            head_ref: None,
+            head_sha: Some("deadbeef".to_string()),
+            author: Some("dev".to_string()),
+            mergeable: None,
+            mergeable_state: None,
+            is_draft: None,
+        }
+    }
+
+    fn list_cap_workspace(pool: u64, active: Option<u64>) -> Workspace {
+        let mut ws = chief_workspace();
+        ws.active_pull_request = active.map(list_cap_pr);
+        ws.pull_requests = Some((0..pool).map(list_cap_pr).collect());
+        ws
+    }
+
+    fn pr_numbers(ws: &Workspace) -> Vec<u64> {
+        ws.pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| pr.number)
+            .collect()
+    }
+
+    /// [`Workspace::slim_for_list`] caps `pullRequests` at
+    /// [`WORKSPACE_LIST_PR_CAP`]: eight entries → the five most recently
+    /// updated survive in `updatedAt`-descending order and the row reports
+    /// `pullRequestsTotal: 8`; the clone taken before slimming (what
+    /// `workspace.get` serves) still carries all eight with no total.
+    #[test]
+    fn workspace_list_caps_pull_requests_to_most_recent() {
+        let full = list_cap_workspace(8, None);
+        let mut row = full.clone();
+        row.slim_for_list();
+
+        assert_eq!(pr_numbers(&row), vec![107, 106, 105, 104, 103]);
+        assert_eq!(row.pull_requests_total, Some(8));
+        assert!(row
+            .pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|pr| pr.head_sha.is_none()));
+        let v = serde_json::to_value(&row).unwrap();
+        assert_eq!(v["pullRequestsTotal"], 8);
+        assert_eq!(
+            v["pullRequests"].as_array().unwrap().len(),
+            WORKSPACE_LIST_PR_CAP
+        );
+
+        // The detail projection is untouched: full pool, no total.
+        assert_eq!(pr_numbers(&full), (100..108).collect::<Vec<_>>());
+        assert_eq!(full.pull_requests_total, None);
+        let detail = serde_json::to_value(&full).unwrap();
+        assert!(detail.get("pullRequestsTotal").is_none());
+        assert_eq!(detail["pullRequests"].as_array().unwrap().len(), 8);
+    }
+
+    /// The `activePullRequest` match is always retained — even when it is
+    /// the 7th most recently updated of eight — counts toward the cap, and
+    /// leads the survivors; `activePullRequest` itself is untouched.
+    #[test]
+    fn workspace_list_cap_keeps_active_pull_request_first() {
+        let mut row = list_cap_workspace(8, Some(1));
+        row.slim_for_list();
+
+        assert_eq!(pr_numbers(&row), vec![101, 107, 106, 105, 104]);
+        assert_eq!(row.pull_requests_total, Some(8));
+        assert_eq!(row.active_pull_request.as_ref().unwrap().number, 101);
+
+        // An active PR outside the pool changes nothing about the survivors.
+        let mut row = list_cap_workspace(8, Some(42));
+        row.slim_for_list();
+        assert_eq!(pr_numbers(&row), vec![107, 106, 105, 104, 103]);
+    }
+
+    /// The active-PR match is by repository-qualified `url`, not `id` /
+    /// `number`: the merged pool spans repositories (workspace, git-root and
+    /// monitor entries), and the merge derives `id` from the bare number, so
+    /// an old active `o/main#1` and a newer `o/sub#1` share `id` and
+    /// `number`. The old active entry must lead the survivors and count
+    /// toward the five; matching on `id` would keep `o/sub#1` and drop it.
+    #[test]
+    fn workspace_list_cap_retains_active_pull_request_by_url_across_repos() {
+        let mut active = list_cap_pr(1);
+        active.id = "1".to_string();
+        active.number = 1;
+        active.url = "https://github.com/o/main/pull/1".to_string();
+        let mut sub_copy = list_cap_pr(2);
+        sub_copy.id = "1".to_string();
+        sub_copy.number = 1;
+        sub_copy.url = "https://github.com/o/sub/pull/1".to_string();
+
+        let mut row = list_cap_workspace(8, None);
+        row.active_pull_request = Some(active.clone());
+        {
+            let pool = row.pull_requests.as_mut().unwrap();
+            pool[1] = active.clone();
+            pool[2] = sub_copy.clone();
+        }
+        let full = row.clone();
+        row.slim_for_list();
+
+        let urls: Vec<&str> = row
+            .pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| pr.url.as_str())
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/main/pull/1",
+                "https://github.com/intent-hq/intentd/pull/107",
+                "https://github.com/intent-hq/intentd/pull/106",
+                "https://github.com/intent-hq/intentd/pull/105",
+                "https://github.com/intent-hq/intentd/pull/104",
+            ],
+            "the same-URL active entry leads and counts toward the cap; the \
+             same-number entry from another repository is an ordinary candidate"
+        );
+        assert_eq!(row.pull_requests_total, Some(8));
+        assert_eq!(
+            row.active_pull_request.as_ref().unwrap().url,
+            "https://github.com/o/main/pull/1"
+        );
+        // Detail projection untouched: both same-number entries still present.
+        assert_eq!(
+            full.pull_requests
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|pr| pr.number == 1)
+                .count(),
+            2
+        );
+
+        // Identity falls back to the number only between entries that both
+        // lack a URL; a blank-URL entry never matches one that has a URL.
+        assert!(active.same_pull_request(&active));
+        assert!(!active.same_pull_request(&sub_copy));
+        let mut blank = active.clone();
+        blank.url.clear();
+        assert!(!blank.same_pull_request(&active));
+        assert!(!active.same_pull_request(&blank));
+        assert!(!blank.same_pull_request(&sub_copy));
+        assert!(blank.same_pull_request(&blank));
+        let mut other_number = blank.clone();
+        other_number.number = 2;
+        assert!(!other_number.same_pull_request(&blank));
+    }
+
+    /// A newer blank-URL entry with the active PR's `number` must not stand
+    /// in for the active entry: the exact URL match is found across the whole
+    /// pool, leads the survivors and counts toward the five, while the
+    /// blank-URL and other-repository same-number entries are ordinary
+    /// candidates. The previous fallback (bare `number` when either URL was
+    /// blank) let the newer blank-URL entry win `position()` and truncated
+    /// the real active PR.
+    #[test]
+    fn workspace_list_cap_exact_url_active_beats_newer_blank_url_same_number() {
+        let mut active = list_cap_pr(1);
+        active.id = "1".to_string();
+        active.number = 1;
+        active.url = "https://github.com/o/main/pull/1".to_string();
+        let mut blank_copy = list_cap_pr(6);
+        blank_copy.id = "1".to_string();
+        blank_copy.number = 1;
+        blank_copy.url.clear();
+        let mut sub_copy = list_cap_pr(4);
+        sub_copy.id = "1".to_string();
+        sub_copy.number = 1;
+        sub_copy.url = "https://github.com/o/sub/pull/1".to_string();
+
+        let mut row = list_cap_workspace(8, None);
+        row.active_pull_request = Some(active.clone());
+        {
+            let pool = row.pull_requests.as_mut().unwrap();
+            pool[1] = active.clone();
+            pool[4] = sub_copy;
+            pool[6] = blank_copy;
+        }
+        row.slim_for_list();
+
+        let urls: Vec<&str> = row
+            .pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| pr.url.as_str())
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://github.com/o/main/pull/1",
+                "https://github.com/intent-hq/intentd/pull/107",
+                "",
+                "https://github.com/intent-hq/intentd/pull/105",
+                "https://github.com/o/sub/pull/1",
+            ],
+            "the exact-URL active entry leads; the newer blank-URL #1 and the \
+             other-repository #1 are ordinary candidates ordered by updatedAt"
+        );
+        assert_eq!(row.pull_requests_total, Some(8));
+        assert_eq!(
+            row.active_pull_request.as_ref().unwrap().url,
+            "https://github.com/o/main/pull/1"
+        );
+
+        // Without a URL on the active PR, only a blank-URL pool entry with
+        // the same number can stand in for it; URL-bearing entries never do.
+        let mut blank_active = active.clone();
+        blank_active.url.clear();
+        let mut row = list_cap_workspace(8, None);
+        row.active_pull_request = Some(blank_active.clone());
+        {
+            let pool = row.pull_requests.as_mut().unwrap();
+            pool[1] = active.clone();
+            pool[2] = blank_active;
+        }
+        row.slim_for_list();
+        let survivors: Vec<(u64, &str)> = row
+            .pull_requests
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|pr| (pr.number, pr.url.as_str()))
+            .collect();
+        assert_eq!(
+            survivors,
+            vec![
+                (1, ""),
+                (107, "https://github.com/intent-hq/intentd/pull/107"),
+                (106, "https://github.com/intent-hq/intentd/pull/106"),
+                (105, "https://github.com/intent-hq/intentd/pull/105"),
+                (104, "https://github.com/intent-hq/intentd/pull/104"),
+            ]
+        );
+    }
+
+    /// A pool within the cap is left as stored: no reorder, no truncation,
+    /// `pullRequestsTotal` absent — on the wire too.
+    #[test]
+    fn workspace_list_cap_leaves_small_pool_untouched() {
+        for pool in [0, 1, 4, 5] {
+            let mut row = list_cap_workspace(pool, Some(0));
+            row.pull_requests.as_mut().unwrap().reverse();
+            let before = pr_numbers(&row);
+            row.slim_for_list();
+            assert_eq!(pr_numbers(&row), before, "pool of {pool} untouched");
+            assert_eq!(row.pull_requests_total, None);
+            let v = serde_json::to_value(&row).unwrap();
+            assert!(v.get("pullRequestsTotal").is_none());
+        }
+        assert!(WORKSPACE_LIST_ROW_KEYS.contains(&"pullRequestsTotal"));
+    }
+
     /// [`last_tool_use_preview`] derivation: the LAST `tool_use` block wins,
     /// an under-budget input passes through whole (no flags), an over-budget
     /// input is capped with the additive `inputTruncated`/`inputBytes`
@@ -5653,6 +6464,7 @@ mod tests {
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
+            pull_requests_total: None,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -6289,7 +7101,10 @@ mod tests {
     /// preview string is truncated to [`AGENT_LIST_PREVIEW_BUDGET_BYTES`]
     /// char-boundary safe, an over-budget `lastToolUse` collapses to the
     /// bounded [`cap_json_value`] preview with the small `name` key
-    /// surviving, and under-budget values pass through untouched.
+    /// surviving, and under-budget values pass through untouched. The
+    /// non-preview strings get their own smaller caps: `name` / `model` at
+    /// [`AGENT_LIST_NAME_CAP_BYTES`], `sandboxPath` / `sandboxBranch` at
+    /// [`AGENT_LIST_PATH_CAP_BYTES`].
     #[test]
     fn agent_lite_cap_list_previews_bounds_preview_fields() {
         let session = AgentSession {
@@ -6300,9 +7115,9 @@ mod tests {
             parent_agent_id: None,
             backend_session_id: None,
             acp_session_id: None,
-            name: "Builder".to_string(),
+            name: "n".repeat(AGENT_LIST_NAME_CAP_BYTES + 1),
             name_explicitly_set: true,
-            model: None,
+            model: Some("claude-sonnet-4-5-20250929".to_string()),
             reasoning_effort: None,
             effort_levels: None,
             provider: None,
@@ -6340,8 +7155,8 @@ mod tests {
             created_at: "t0".to_string(),
             updated_at: "t1".to_string(),
             sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
+            sandbox_path: Some("/p/".repeat(AGENT_LIST_PATH_CAP_BYTES)),
+            sandbox_branch: Some("sandbox/short".to_string()),
         };
         let mut lite = AgentLite::from_session(
             session,
@@ -6372,6 +7187,18 @@ mod tests {
         );
         // Under-budget values pass through untouched.
         assert_eq!(lite.last_user_message.as_deref(), Some("short user ask"));
+        // The non-preview strings land on their own smaller caps; realistic
+        // values (a model slug, a short branch) pass through untouched.
+        assert_eq!(lite.name.len(), AGENT_LIST_NAME_CAP_BYTES);
+        assert_eq!(lite.model.as_deref(), Some("claude-sonnet-4-5-20250929"));
+        assert_eq!(
+            lite.metadata.sandbox_path.as_deref().map(str::len),
+            Some(AGENT_LIST_PATH_CAP_BYTES)
+        );
+        assert_eq!(
+            lite.metadata.sandbox_branch.as_deref(),
+            Some("sandbox/short")
+        );
         // The multi-byte report truncates on a char boundary at or under the
         // budget (never mid-`é`).
         let report = lite.metadata.completion_report.as_deref().unwrap();
