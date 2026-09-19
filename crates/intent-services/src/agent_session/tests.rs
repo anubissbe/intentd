@@ -6794,6 +6794,83 @@ async fn open_tool_call_silence_past_terminal_threshold_fails_turn_and_raises_at
     );
 }
 
+/// The open-tool provider stall embeds the provider-controlled tool id and
+/// title in the flattened `session/prompt failed:` wrapper. A hung call whose
+/// label mentions "cancelled" must NOT be reclassified as a benign cancel by
+/// `agent_manager::prompt_cancellation_error`'s substring heuristic — it
+/// would skip Error persistence here and the worker's teardown/requeue. The
+/// stall prefix is rejected first, so the terminal semantics hold regardless
+/// of the diagnostic label (intent-hq/intent#5395 review).
+#[tokio::test]
+async fn open_tool_call_stall_with_cancelled_in_label_stays_terminal() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "100"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "150"),
+        ("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS", "300"),
+    ]);
+    let (_tmp, services, _bus, agent_id, workspace_id) = setup().await;
+    services.set_test_busy(&agent_id, true);
+    let tool_call = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": ACP_SID,
+            "update": { "sessionUpdate": "tool_call", "toolCallId": "cancelled-sweep",
+                "title": "Inspect cancelled jobs", "kind": "execute", "status": "in_progress",
+                "rawInput": { "command": "jobs" } }
+        }
+    })
+    .to_string();
+    let (conn, mut note_rx, _agent, _release_close, _release_end) =
+        connect_tool_silence(vec![tool_call], Vec::new());
+
+    let err = timeout(
+        Duration::from_secs(5),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            Some("turn-tool-hung-cancelled-label"),
+        ),
+    )
+    .await
+    .expect("the open-tool provider stall ends the turn")
+    .expect_err("the open-tool provider stall fails the turn");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cancelled-sweep") && msg.contains("Inspect cancelled jobs"),
+        "precondition: the label reaches the flattened wrapper: {msg}"
+    );
+    assert!(
+        !crate::agent_manager::prompt_cancellation_error(&err),
+        "a provider stall is never a benign cancel, whatever the tool label: {msg}"
+    );
+
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(
+        stored.status,
+        AgentStatus::Error,
+        "Error status persisted despite \"cancelled\" in the tool label"
+    );
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "terminal context stashed for the worker"
+    );
+    assert_eq!(stored.attention_request_kind.as_deref(), Some("blocker"));
+    assert!(
+        stored
+            .attention_request_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("provider stall") && r.contains("cancelled-sweep")),
+        "attention reason names the stall and the hung tool call: {:?}",
+        stored.attention_request_reason
+    );
+}
+
 /// Mock agent for the streaming-tool guard: `session/prompt` streams
 /// `open_update` (a `tool_call` start), then emits `heartbeat_update` every
 /// `every` until `release_end` fires, then streams `close_update` and
