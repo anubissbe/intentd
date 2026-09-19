@@ -33,6 +33,7 @@ hex = "0.4"
 whoami = "2"
 base64.workspace = true
 socket2 = "0.6"
+semver = "1.0.28"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
