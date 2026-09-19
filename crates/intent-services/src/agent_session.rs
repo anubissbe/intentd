@@ -401,6 +401,31 @@ impl Transcript {
         self.open_tool_calls.len()
     }
 
+    /// Human-readable label of one open tool call — `"{id} ({name}: {title})"`
+    /// (title omitted when absent) — for the open-tool terminal provider-stall
+    /// error and attention reason (intent-hq/intent#5395). Deterministic
+    /// under several open calls (smallest id), `None` when none is open.
+    fn open_tool_call_label(&self) -> Option<String> {
+        let id = self.open_tool_calls.iter().min()?;
+        let block = self
+            .tool_use_index
+            .get(id)
+            .and_then(|&index| self.blocks.get(index));
+        let name = block
+            .and_then(|b| b.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown tool");
+        let title = block
+            .and_then(|b| b.get("input"))
+            .and_then(|input| input.get("_acpTitle"))
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty());
+        Some(match title {
+            Some(title) => format!("{id} ({name}: {title})"),
+            None => format!("{id} ({name})"),
+        })
+    }
+
     /// The stable block id for a 0-based block index (`{messageId}:{index}`).
     fn block_id(&self, index: usize) -> String {
         format!("{}:{index}", self.message_id)
@@ -985,8 +1010,9 @@ pub(crate) fn silent_tail_suspect_ms() -> u64 {
 /// the 8-minute #2669 silent-tail suspicion window
 /// ([`silent_tail_suspect_ms`]) and far below the 30-minute prompt idle
 /// timeout. The stall event itself never cancels or fails the turn; the
-/// terminal mechanisms are [`provider_stall_terminal_ms`] (tool-free silence)
-/// and the 30-minute prompt idle timeout. Tool-call-aware
+/// terminal mechanisms are [`provider_stall_terminal_ms`] (tool-free silence),
+/// [`open_tool_call_terminal_ms`] (silence under an open tool call) and the
+/// 30-minute prompt idle timeout. Tool-call-aware
 /// (intent-hq/monorepo#3466): while ≥1 recorded tool call is still open the
 /// advisory is suppressed — long tool runs are expected silence — but only up
 /// to [`open_tool_call_stall_ms`] (intent-hq/intent#5395), past which it fires
@@ -1012,10 +1038,10 @@ pub(crate) fn stream_stall_ms() -> u64 {
 /// (the daemon's own `host.exec` cap is 10 minutes; agent harness shell
 /// tools cap at or below that) while still surfacing the hang midway through
 /// the idle window, and keeps the ordering stall < silent-tail-suspect <
-/// open-tool ceiling < terminal stall < 30-minute idle timeout. Advisory
-/// only — the open-tool case never fails the turn here; the idle timeout's
-/// warn-and-continue redrive remains the backstop for a hung tool.
-/// Overridable via `INTENTD_OPEN_TOOL_CALL_STALL_MS` (test seam).
+/// open-tool ceiling < terminal stall < open-tool terminal < 30-minute idle
+/// timeout. Advisory only — the open-tool terminal decision is
+/// [`open_tool_call_terminal_ms`]. Overridable via
+/// `INTENTD_OPEN_TOOL_CALL_STALL_MS` (test seam).
 pub(crate) fn open_tool_call_stall_ms() -> u64 {
     if let Ok(val) = std::env::var("INTENTD_OPEN_TOOL_CALL_STALL_MS") {
         if let Ok(ms) = val.parse::<u64>() {
@@ -1031,11 +1057,10 @@ pub(crate) fn open_tool_call_stall_ms() -> u64 {
 /// with [`AcpError::ProviderStall`] — a distinct terminal error naming the
 /// stall — and raises a blocker-style attention request on the agent (the
 /// intent-hq/intent#5419 shape), instead of leaving the silence to the
-/// 30-minute idle timeout's warn-and-continue redrive. Tool-free by design:
-/// a provider that is neither streaming nor running a tool for this long is
-/// hung, whereas silence under an open tool call may be a legitimately long
-/// tool run (covered by the [`open_tool_call_stall_ms`] advisory and the idle
-/// timeout). 20 minutes is 4× the advisory threshold and 2.5× the #2669
+/// 30-minute idle timeout's warn-and-continue redrive. A provider that is
+/// neither streaming nor running a tool for this long is hung; silence under
+/// an open tool call gets the longer [`open_tool_call_terminal_ms`] budget
+/// instead. 20 minutes is 4× the advisory threshold and 2.5× the #2669
 /// silent-tail suspicion window — past any observed healthy tool-free
 /// inference tail — and below the 30-minute idle timeout so it is reachable.
 /// Overridable via `INTENTD_PROVIDER_STALL_TERMINAL_MS` (test seam).
@@ -1046,6 +1071,31 @@ pub(crate) fn provider_stall_terminal_ms() -> u64 {
         }
     }
     20 * 60 * 1000
+}
+
+/// Terminal provider-stall threshold for silence UNDER an open tool call
+/// (intent-hq/intent#5395): once a turn has gone this many ms with zero
+/// `session/update` traffic of any kind while ≥1 recorded tool call is still
+/// open, [`run_prompt_turn`](Services::run_prompt_turn) ends the turn with
+/// [`AcpError::ProviderStall`] naming the hung call and raises the same
+/// blocker-style attention request as the tool-free case. This is the exact
+/// reported signature: the adapter loses the terminal `tool_call_update`
+/// across an event-stream reconnect and the prompt hangs on an open call
+/// forever. Silence means NO update at all — any `tool_call_update` chunk or
+/// content resets the clock, so a legitimately long tool that emits anything
+/// is never killed; a tool call that is completely silent for 25 minutes is
+/// treated as hung (the daemon's own `host.exec` caps at 10 minutes, agent
+/// harness shell tools at or below that). 25 minutes sits above the 15-minute
+/// open-tool advisory and the 20-minute tool-free terminal threshold, and
+/// below the 30-minute idle timeout so it is reachable. Overridable via
+/// `INTENTD_OPEN_TOOL_CALL_TERMINAL_MS` (test seam).
+pub(crate) fn open_tool_call_terminal_ms() -> u64 {
+    if let Ok(val) = std::env::var("INTENTD_OPEN_TOOL_CALL_TERMINAL_MS") {
+        if let Ok(ms) = val.parse::<u64>() {
+            return ms;
+        }
+    }
+    25 * 60 * 1000
 }
 
 /// Per-agent consecutive suspected-truncation auto-redrive counter
@@ -2969,24 +3019,28 @@ impl Services {
         // resolving update, so the window restarts from that point).
         //
         // Terminal provider stall (intent-hq/intent#5395): silence past
-        // [`provider_stall_terminal_ms`] with NO tool call open ends the
-        // attempt with `AcpError::ProviderStall` — the provider is neither
-        // streaming nor running a tool, so this is a hang, not work. Breaking
-        // out drops `prompt_fut` (its pending-map entry is cleaned by the
-        // transport's drop guard, exactly like the idle-timeout early return
-        // in `session::prompt`); the error then takes the ordinary terminal
+        // [`provider_stall_terminal_ms`] with NO tool call open — or past the
+        // longer [`open_tool_call_terminal_ms`] WITH a tool call open (the
+        // reported opencode/grok signature: the tool's completion was lost
+        // and the call hangs open forever) — ends the attempt with
+        // `AcpError::ProviderStall`. Silence is zero `session/update` traffic
+        // of any kind, so a long tool that keeps emitting `tool_call_update`
+        // chunks resets the clock and is never killed. Breaking out drops
+        // `prompt_fut` (its pending-map entry is cleaned by the transport's
+        // drop guard, exactly like the idle-timeout early return in
+        // `session::prompt`); the error then takes the ordinary terminal
         // path below (Error status, `agent:failed`, blocker attention raise)
         // and the worker's `handle_terminal_turn_failure` tears the hung
-        // child down so a retry spawns fresh. Silence under an open tool call
-        // never fails the turn here — the 30-minute prompt idle timeout's
-        // warn-and-continue redrive stays the backstop for a hung tool.
+        // child down so a retry spawns fresh.
         let stall_threshold_ms = stream_stall_ms();
         let open_tool_stall_ms = open_tool_call_stall_ms();
         let stall_terminal_ms = provider_stall_terminal_ms();
+        let open_tool_terminal_ms = open_tool_call_terminal_ms();
         let stall_check = Duration::from_millis(
             (stall_threshold_ms
                 .min(open_tool_stall_ms)
                 .min(stall_terminal_ms)
+                .min(open_tool_terminal_ms)
                 / 6)
             .clamp(10, 15_000),
         );
@@ -3028,14 +3082,24 @@ impl Services {
                             self.publish_stalled_status_event(workspace_id, agent_id, silent_ms)
                                 .await;
                         }
-                        if !tool_call_open && silent_ms >= stall_terminal_ms {
+                        let terminal_ms = if tool_call_open {
+                            open_tool_terminal_ms
+                        } else {
+                            stall_terminal_ms
+                        };
+                        if silent_ms >= terminal_ms {
+                            let open_tool_call = transcript.open_tool_call_label();
                             tracing::warn!(
                                 agent = %agent_id,
                                 silent_ms,
-                                terminal_ms = stall_terminal_ms,
-                                "provider stall — no session/update and no tool call in flight past the terminal threshold; failing the turn (intent#5395)"
+                                terminal_ms,
+                                open_tool_call = open_tool_call.as_deref().unwrap_or("none"),
+                                "provider stall — no session/update past the terminal threshold; failing the turn (intent#5395)"
                             );
-                            break Err(AcpError::ProviderStall(Duration::from_millis(silent_ms)));
+                            break Err(AcpError::ProviderStall {
+                                silent: Duration::from_millis(silent_ms),
+                                open_tool_call,
+                            });
                         }
                     }
                 }
@@ -3615,22 +3679,38 @@ impl Services {
             }
         }
         // Terminal provider stall (intent-hq/intent#5395): the select loop
-        // above ended the attempt because the provider went silent with no
-        // tool call in flight past [`provider_stall_terminal_ms`]. Same
+        // above ended the attempt because the provider went silent past
+        // [`provider_stall_terminal_ms`] with no tool call in flight, or past
+        // [`open_tool_call_terminal_ms`] with a tool call hung open. Same
         // terminal path and same blocker-style attention raise as the #5419
         // block above (ordering, deferred flush, and best-effort semantics
         // identical), so the parent / watchers / user learn about the hang at
         // once instead of after an hour of "Thinking".
-        if let Err(AcpError::ProviderStall(silent)) = &result {
-            let reason = format!(
-                "Turn ended after a provider stall: no session/update from the provider for \
-                 {silent:?} with no tool call in flight (terminal threshold {:?}; error class: \
-                 provider stall). The provider is neither streaming nor running a tool, so the \
-                 turn was failed instead of waiting for the idle timeout; the agent is stopping \
-                 with status error and its provider process is restarted on the next turn. Retry \
-                 the turn to continue.",
-                Duration::from_millis(stall_terminal_ms),
-            );
+        if let Err(AcpError::ProviderStall {
+            silent,
+            open_tool_call,
+        }) = &result
+        {
+            let reason = match open_tool_call {
+                Some(label) => format!(
+                    "Turn ended after a provider stall: no session/update from the provider for \
+                     {silent:?} with tool call {label} still open (open-tool terminal threshold \
+                     {:?}; error class: provider stall). The tool call never reported completion \
+                     and emitted nothing for the whole window, so the turn was failed instead of \
+                     waiting for the idle timeout; the agent is stopping with status error and its \
+                     provider process is restarted on the next turn. Retry the turn to continue.",
+                    Duration::from_millis(open_tool_terminal_ms),
+                ),
+                None => format!(
+                    "Turn ended after a provider stall: no session/update from the provider for \
+                     {silent:?} with no tool call in flight (terminal threshold {:?}; error class: \
+                     provider stall). The provider is neither streaming nor running a tool, so the \
+                     turn was failed instead of waiting for the idle timeout; the agent is stopping \
+                     with status error and its provider process is restarted on the next turn. Retry \
+                     the turn to continue.",
+                    Duration::from_millis(stall_terminal_ms),
+                ),
+            };
             if let Err(raise_err) = self
                 .agent_request_attention_op(
                     workspace_id.clone(),

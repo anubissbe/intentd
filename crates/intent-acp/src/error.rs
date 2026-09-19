@@ -20,6 +20,19 @@ pub const PROMPT_IDLE_TIMEOUT_PREFIX: &str = "session/prompt idle timeout";
 /// only through this prefix.
 pub const PROVIDER_STALL_PREFIX: &str = "provider stall";
 
+/// Display body of [`AcpError::ProviderStall`], anchored on
+/// [`PROVIDER_STALL_PREFIX`] for both shapes (tool-free and open-tool).
+fn provider_stall_display(silent: &Duration, open_tool_call: Option<&str>) -> String {
+    match open_tool_call {
+        Some(label) => format!(
+            "{PROVIDER_STALL_PREFIX}: no session/update for {silent:?} with tool call {label} still open"
+        ),
+        None => format!(
+            "{PROVIDER_STALL_PREFIX}: no session/update for {silent:?} with no tool call in flight"
+        ),
+    }
+}
+
 /// A JSON-RPC 2.0 error object returned by the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonRpcError {
@@ -113,15 +126,22 @@ pub enum AcpError {
     PromptIdleTimeout(Duration),
 
     /// The provider stalled mid-turn (intent-hq/intent#5395): `session/prompt`
-    /// stayed in flight with no `session/update` traffic and no tool call
-    /// open for longer than the service layer's terminal stall threshold —
-    /// the provider is neither streaming nor running a tool, so the silence
-    /// is a hang, not work. Carries the silence that elapsed. Terminal by
-    /// design (unlike the warn-and-continue [`AcpError::PromptIdleTimeout`]):
-    /// the turn fails with this error and attention is raised; the Display
-    /// rendering is pinned to [`PROVIDER_STALL_PREFIX`].
-    #[error("provider stall: no session/update for {0:?} with no tool call in flight")]
-    ProviderStall(Duration),
+    /// stayed in flight with no `session/update` traffic of any kind for
+    /// longer than the service layer's terminal stall threshold — either with
+    /// no tool call open (the provider is neither streaming nor running a
+    /// tool) or with a tool call open that emitted nothing for the whole
+    /// (longer) open-tool ceiling (the tool's completion was lost, the
+    /// opencode/grok reconnect signature). Carries the silence that elapsed
+    /// and, for the open-tool case, a label naming the hung tool call.
+    /// Terminal by design (unlike the warn-and-continue
+    /// [`AcpError::PromptIdleTimeout`]): the turn fails with this error and
+    /// attention is raised; the Display rendering is pinned to
+    /// [`PROVIDER_STALL_PREFIX`].
+    #[error("{}", provider_stall_display(silent, open_tool_call.as_deref()))]
+    ProviderStall {
+        silent: Duration,
+        open_tool_call: Option<String>,
+    },
 
     /// The agent returned a JSON-RPC error response.
     #[error("{0}")]
@@ -340,7 +360,7 @@ pub fn is_transient_upstream_disconnect(err: &AcpError) -> bool {
         | AcpError::Serde(_)
         | AcpError::Protocol(_)
         | AcpError::PromptIdleTimeout(_)
-        | AcpError::ProviderStall(_) => false,
+        | AcpError::ProviderStall { .. } => false,
         other => message_is_transient_upstream_disconnect(&other.to_string()),
     }
 }
