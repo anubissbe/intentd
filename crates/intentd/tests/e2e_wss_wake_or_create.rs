@@ -1389,13 +1389,9 @@ async fn wake_stamp_survives_terminal_failure_requeue_over_wss() {
     let woke = wss_rpc(&mut rpc, 10, "agent.wakeOrCreate", wake_params).await;
     assert_eq!(woke["ok"], true, "owner wakeOrCreate: {woke}");
     let agent_id = woke["agentId"].as_str().expect("agentId").to_string();
-    // The guest's context message is persisted / requeued with the
-    // collaborator sender preamble above it (multiplayer): the requeue keeps
-    // the enqueue-time content, never re-annotates it.
-    let kickoff_content = json!(
-        "Message from @guest (Guest User), a collaborator (guest) of this workspace — not \
-         the workspace owner.\n\nguest kickoff"
-    );
+    // The OWNER enqueued the kickoff, so no collaborator sender preamble is
+    // prepended: the requeue keeps the enqueue-time content verbatim.
+    let kickoff_content = json!("guest kickoff");
 
     // Wait for the terminal failure and for the `agent:queue:updated` that
     // announces the requeued kickoff.
