@@ -9641,6 +9641,25 @@ mod wsapi4_bindings_tests {
         agent_send_result: Mutex<Option<Value>>,
         /// When set, overrides the `agent_send_to_task` result (delivery-shape tests).
         agent_send_to_task_result: Mutex<Option<Value>>,
+        /// When set, `agent_send_message` / `agent_send_to_task` await this
+        /// lock BEFORE recording the call — stands in for the daemon-side
+        /// enqueue outliving the eval budget (intent-hq/intent#5387).
+        agent_send_hold: Mutex<Option<Arc<tokio::sync::Mutex<()>>>>,
+        /// When set, `agent_get_queue` awaits this lock — stands in for the
+        /// single-pending-message guard's store read stalling ahead of the
+        /// enqueue (intent-hq/intent#5387).
+        agent_get_queue_hold: Mutex<Option<Arc<tokio::sync::Mutex<()>>>>,
+        /// When set, `agent_is_retired` awaits this lock — stands in for the
+        /// retired-caller store read stalling ahead of the enqueue
+        /// (intent-hq/intent#5387).
+        agent_is_retired_hold: Mutex<Option<Arc<tokio::sync::Mutex<()>>>>,
+        /// Signalled once per recorded `agent_send_message` call, so a test
+        /// can await a send that lands after the binding already returned.
+        agent_send_landed: tokio::sync::Notify,
+        /// The `message_id` each `agent_send_message` call carried, recorded
+        /// synchronously (before any hold) so a timed-out send's id is
+        /// observable.
+        agent_send_message_ids: Mutex<Vec<Option<String>>>,
     }
 
     fn stub_agent(id: &str, ws: &WorkspaceId) -> AgentLite {
@@ -9779,7 +9798,13 @@ mod wsapi4_bindings_tests {
             _workspace_id: Option<WorkspaceId>,
         ) -> BoxFuture<'_, Result<Value>> {
             let queue = self.queue_entries.lock().unwrap().clone();
-            Box::pin(async move { Ok(json!({ "success": true, "queue": queue })) })
+            let hold = self.agent_get_queue_hold.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    drop(hold.lock_owned().await);
+                }
+                Ok(json!({ "success": true, "queue": queue }))
+            })
         }
 
         fn agent_remove_queued_message_owned(
@@ -9840,7 +9865,7 @@ mod wsapi4_bindings_tests {
             _ws: WorkspaceId,
             agent_id: AgentId,
             content: String,
-            _message_id: Option<String>,
+            message_id: Option<String>,
             _image_blocks: Option<Value>,
             _file_blocks: Option<Value>,
             priority: Option<String>,
@@ -9850,13 +9875,8 @@ mod wsapi4_bindings_tests {
             message_metadata: Option<Value>,
             _origin: intent_core::MessageOrigin,
         ) -> BoxFuture<'_, Result<Value>> {
-            self.agent_send_calls.lock().unwrap().push((
-                agent_id.as_str().to_string(),
-                content,
-                priority,
-                message_metadata,
-            ));
-            self.call_order.lock().unwrap().push("send");
+            self.agent_send_message_ids.lock().unwrap().push(message_id);
+            let hold = self.agent_send_hold.lock().unwrap().clone();
             let error = self.agent_send_error.lock().unwrap().clone();
             let result = self
                 .agent_send_result
@@ -9867,6 +9887,18 @@ mod wsapi4_bindings_tests {
                     || json!({ "success": true, "queued": false, "turnId": "turn-fake-1" }),
                 );
             Box::pin(async move {
+                let _held = match hold {
+                    Some(hold) => Some(hold.lock_owned().await),
+                    None => None,
+                };
+                self.agent_send_calls.lock().unwrap().push((
+                    agent_id.as_str().to_string(),
+                    content,
+                    priority,
+                    message_metadata,
+                ));
+                self.call_order.lock().unwrap().push("send");
+                self.agent_send_landed.notify_one();
                 if let Some(e) = error {
                     return Err(Error::Internal(e));
                 }
@@ -9882,15 +9914,20 @@ mod wsapi4_bindings_tests {
             priority: Option<String>,
             message_metadata: Option<Value>,
         ) -> BoxFuture<'_, Result<Value>> {
-            self.agent_send_to_task_calls.lock().unwrap().push((
-                task_note_id.as_str().to_string(),
-                message,
-                priority,
-                message_metadata,
-            ));
-            self.call_order.lock().unwrap().push("send");
+            let hold = self.agent_send_hold.lock().unwrap().clone();
             let result = self.agent_send_to_task_result.lock().unwrap().clone();
             Box::pin(async move {
+                let _held = match hold {
+                    Some(hold) => Some(hold.lock_owned().await),
+                    None => None,
+                };
+                self.agent_send_to_task_calls.lock().unwrap().push((
+                    task_note_id.as_str().to_string(),
+                    message,
+                    priority,
+                    message_metadata,
+                ));
+                self.call_order.lock().unwrap().push("send");
                 Ok(result.unwrap_or_else(|| {
                     json!({
                         "ok": true,
@@ -10076,7 +10113,13 @@ mod wsapi4_bindings_tests {
                 .lock()
                 .unwrap()
                 .contains(&agent_id.as_str().to_string());
-            Box::pin(async move { retired })
+            let hold = self.agent_is_retired_hold.lock().unwrap().clone();
+            Box::pin(async move {
+                if let Some(hold) = hold {
+                    drop(hold.lock_owned().await);
+                }
+                retired
+            })
         }
 
         fn event_query(
@@ -10852,6 +10895,478 @@ mod wsapi4_bindings_tests {
         assert_eq!(v["refused"], json!(true), "{v}");
         assert_eq!(v["taskNoteId"], json!("tn-1"), "{v}");
         assert!(api.agent_send_to_task_calls.lock().unwrap().is_empty());
+    }
+
+    /// intent-hq/intent#5387: a queued-priority `ws.agent.send` whose
+    /// daemon-side enqueue outlives the eval budget is NOT lost. The mock
+    /// holds the send behind a lock for longer than the (compressed) budget:
+    /// (a) the binding returns within the budget with an explicit error
+    /// naming the pre-minted message id, and (b) once the lock is released
+    /// the enqueue still completes (the dropped eval future did not cancel
+    /// it), with the queue priority intact.
+    #[tokio::test]
+    async fn agent_send_queued_outliving_eval_budget_still_lands() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_send_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 1, "exactly one daemon-side send: {ids:?}");
+        let message_id = ids[0]
+            .clone()
+            .expect("binding mints the message id before the daemon-side send");
+        let t = text(&resp);
+        assert!(
+            t.contains(&message_id) && t.contains("agent-target"),
+            "timeout error must name the in-flight message id and target: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the enqueue is still parked behind the held lock"
+        );
+
+        drop(guard);
+        // The tokio mutex is FIFO: the parked send acquires it first and
+        // records the call while holding it, so re-acquiring here observes
+        // the landed enqueue without polling.
+        let _observed = hold.lock().await;
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the enqueue must land after a timed-out send"
+        );
+        assert_eq!(calls[0].0, "agent-target");
+        assert_eq!(calls[0].1, "hello");
+        assert_eq!(calls[0].2.as_deref(), Some("normal"));
+    }
+
+    /// intent-hq/intent#5387 (sendToTask): same durability — a timed-out
+    /// `ws.agent.sendToTask` returns an explicit error naming the task, and
+    /// the daemon-side send still completes once the lock is released.
+    #[tokio::test]
+    async fn agent_send_to_task_outliving_eval_budget_still_lands() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_send_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.sendToTask('tn-1', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("sendToTask must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("tn-1") && t.contains("in flight"),
+            "timeout error must name the task and say the send is in flight: {t}"
+        );
+        assert!(api.agent_send_to_task_calls.lock().unwrap().is_empty());
+
+        drop(guard);
+        let _observed = hold.lock().await;
+        let calls = api.agent_send_to_task_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "the send must land after a timed-out call");
+        assert_eq!(calls[0].0, "tn-1");
+        assert_eq!(calls[0].2.as_deref(), Some("normal"));
+    }
+
+    /// intent-hq/intent#5387: the stall need not be the enqueue itself — the
+    /// binding's own pre-send reads (the single-pending-message guard's
+    /// `agent_get_queue`, the sender-name `agent_get`) run ahead of it and
+    /// were equally cancelled by the eval-timeout drop. With the guard read
+    /// held past the budget, the send must still land once it is released,
+    /// and the timed-out result must already name the pre-minted id.
+    #[tokio::test]
+    async fn agent_send_stalled_on_pending_guard_read_still_lands() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_get_queue_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("user-msg-") && t.contains("agent-target"),
+            "timeout error must name the pre-minted message id and target: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the send is still parked behind the held guard read"
+        );
+
+        drop(guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must land after the guard read is released");
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one enqueue: {calls:?}");
+        assert_eq!(calls[0].0, "agent-target");
+        assert_eq!(calls[0].1, "hello");
+        assert_eq!(calls[0].2.as_deref(), Some("normal"));
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "error named the id that landed: {t}");
+    }
+
+    /// intent-hq/intent#5387: the retired-caller guard's `agent_is_retired`
+    /// store read is part of the send path too — it used to run in
+    /// `workspace_host_dispatch` ahead of the spawn, where a stall past the
+    /// budget surfaced the generic eval timeout and no send existed to land.
+    /// With the read held past the budget, the binding must still return the
+    /// named in-flight error inside the budget, and the send must land once
+    /// the read is released.
+    #[tokio::test]
+    async fn agent_send_stalled_on_retired_read_still_lands() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_is_retired_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("user-msg-") && t.contains("agent-target"),
+            "timeout error must name the pre-minted message id and target: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the send is still parked behind the held retired read"
+        );
+
+        drop(guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must land after the retired read is released");
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one enqueue: {calls:?}");
+        assert_eq!(calls[0].0, "agent-target");
+        assert_eq!(calls[0].1, "hello");
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "error named the id that landed: {t}");
+    }
+
+    /// Control for the deferred retired read: a retired caller's `send` and
+    /// `sendToTask` are still refused through the spawned path — the same
+    /// retired error every other frame gets, and nothing is enqueued.
+    #[tokio::test]
+    async fn agent_send_from_retired_caller_refuses_without_enqueue() {
+        let (srv, api) = server_with_caller("caller-1");
+        api.retired_agent_ids
+            .lock()
+            .unwrap()
+            .push("caller-1".to_string());
+
+        let resp = call(
+            &srv,
+            "return await ws.agent.send('agent-target', 'hello', 'queue');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        assert!(text(&resp).contains("retired"), "{}", text(&resp));
+        assert!(api.agent_send_calls.lock().unwrap().is_empty());
+
+        let resp = call(
+            &srv,
+            "return await ws.agent.sendToTask('task-1', 'hello', 'queue');",
+        )
+        .await;
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        assert!(text(&resp).contains("retired"), "{}", text(&resp));
+        assert!(api.agent_send_to_task_calls.lock().unwrap().is_empty());
+    }
+
+    /// intent-hq/intent#5387: the send's wait is bounded by the eval budget's
+    /// REMAINING time, not a fresh full budget. An earlier host frame in the
+    /// same eval (`getQueue`, held by the test) spends 1.8 s of a 3 s budget
+    /// before the send starts. A full-budget wait (3 s − 1.5 s margin) would
+    /// end at 3.3 s — past the eval timeout — and the caller would get the
+    /// generic timeout instead of the in-flight id; the remaining-time wait
+    /// (1.2 s − 0.6 s margin) returns the named error inside the budget, and
+    /// the send still lands once released.
+    #[tokio::test]
+    async fn agent_send_after_budget_partly_spent_still_names_in_flight_id() {
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_secs(3));
+        let queue_hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_get_queue_hold.lock().unwrap() = Some(queue_hold.clone());
+        let send_hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_send_hold.lock().unwrap() = Some(send_hold.clone());
+        let queue_guard = queue_hold.lock().await;
+        let send_guard = send_hold.lock().await;
+
+        // Elapsed eval time is the condition under test: nothing observable
+        // stands in for the wall clock, so the earlier frame is held for a
+        // fixed slice of the budget before it is released.
+        let spend_budget_then_release = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+            drop(queue_guard);
+        };
+        let (resp, ()) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                call(
+                    &srv,
+                    "await ws.agent.getQueue('agent-target'); \
+                     return await ws.agent.send('agent-target', 'hello', 'queue');",
+                ),
+            ),
+            spend_budget_then_release,
+        );
+        let resp = resp.expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("user-msg-") && t.contains("agent-target"),
+            "the in-flight error must still name the id when budget was already spent: {t}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "the send is still parked behind the held enqueue"
+        );
+
+        drop(send_guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must land after the enqueue is released");
+        let calls = api.agent_send_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one enqueue: {calls:?}");
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "error named the id that landed: {t}");
+    }
+
+    /// intent-hq/intent#5387: once the binding has returned the in-flight
+    /// error, the detached send's eventual outcome must stay observable. The
+    /// error must describe an UNCONFIRMED attempt (no delivery guarantee),
+    /// and a send that then FAILS is logged as a WARN naming the pre-minted
+    /// id and the failure, not silently dropped with the `JoinHandle`.
+    #[tokio::test]
+    async fn agent_send_late_failure_after_timeout_is_logged_not_swallowed() {
+        let capture = crate::tests::WarnCapture::default();
+        let _subscriber = capture.set_as_default();
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_send_hold.lock().unwrap() = Some(hold.clone());
+        *api.agent_send_error.lock().unwrap() = Some("store pool exhausted".to_string());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        assert!(
+            t.contains("UNCONFIRMED") && t.contains("fail late"),
+            "the in-flight error must not promise delivery: {t}"
+        );
+        assert!(
+            !t.contains("is not lost"),
+            "the in-flight error must not guarantee the message survives: {t}"
+        );
+        let ids = api.agent_send_message_ids.lock().unwrap().clone();
+        let id = ids[0].clone().expect("pre-minted id passed through");
+        assert!(t.contains(&id), "{t}");
+
+        drop(guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            api.agent_send_landed.notified(),
+        )
+        .await
+        .expect("the send must reach the op after release");
+        // The late outcome is logged by a follower task that runs once the
+        // detached send resolves; on this current-thread runtime a bounded
+        // number of yields lets it run.
+        let mut lines = Vec::new();
+        for _ in 0..200 {
+            lines = capture.lines();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            lines.iter().any(|l| l.contains(&id)
+                && l.contains("store pool exhausted")
+                && l.contains("FAILED")),
+            "late failure must be logged under the message id: {lines:?}"
+        );
+    }
+
+    /// intent-hq/intent#5387: outcome observation must not depend on the
+    /// waiter reaching its own timeout branch. The caller task — standing in
+    /// for the host future the eval-timeout drop cancels — is ABORTED while
+    /// the send is still held; the send then fails late, and the failure
+    /// must still be logged under the send label.
+    #[tokio::test]
+    async fn agent_send_caller_dropped_mid_wait_still_logs_late_failure() {
+        use crate::mcp_server::bindings::{agent::spawn_send_within_budget, EvalBudget};
+        let capture = crate::tests::WarnCapture::default();
+        let _subscriber = capture.set_as_default();
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = hold.lock().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let op = {
+            let hold = hold.clone();
+            let entered = entered.clone();
+            async move {
+                entered.notify_one();
+                drop(hold.lock_owned().await);
+                Err::<Value, String>("store pool exhausted".to_string())
+            }
+        };
+        let caller = tokio::spawn(spawn_send_within_budget(
+            EvalBudget::starting_now(std::time::Duration::from_secs(30)),
+            "messageId user-msg-dropped to agent-target".to_string(),
+            op,
+            |_| "in flight".to_string(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the send op must start behind the hold");
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(capture.lines().is_empty(), "nothing to log while held");
+
+        drop(guard);
+        let mut lines = Vec::new();
+        for _ in 0..200 {
+            lines = capture.lines();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            lines.iter().any(|l| l.contains("user-msg-dropped")
+                && l.contains("store pool exhausted")
+                && l.contains("FAILED")),
+            "late failure must be logged although the waiter was dropped: {lines:?}"
+        );
+    }
+
+    /// intent-hq/intent#5387: a late single-pending-message refusal is logged
+    /// as a non-delivery with bounded metadata — the pending id and queue
+    /// count — never the refusal's `queue` payload with its message previews.
+    #[tokio::test]
+    async fn agent_send_late_refusal_logs_outcome_without_queue_content() {
+        let capture = crate::tests::WarnCapture::default();
+        let _subscriber = capture.set_as_default();
+        let (srv, api) = server_with_caller("caller-1");
+        let srv = srv.with_workspace_api_timeout(std::time::Duration::from_millis(400));
+        *api.queue_entries.lock().unwrap() = vec![json!({
+            "id": "q-pending-1",
+            "content": "SENTINEL-QUEUED-BODY",
+            "queuedAt": "2026-01-01T00:00:00Z",
+            "position": 0,
+            "messageMetadata": { "fromAgentId": "caller-1", "fromAgentName": "Caller" },
+        })];
+        let hold = Arc::new(tokio::sync::Mutex::new(()));
+        *api.agent_get_queue_hold.lock().unwrap() = Some(hold.clone());
+        let guard = hold.lock().await;
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            call(
+                &srv,
+                "return await ws.agent.send('agent-target', 'hello', 'queue');",
+            ),
+        )
+        .await
+        .expect("send must return before the test-level fail-safe");
+        assert_eq!(resp["result"]["isError"], json!(true), "{resp}");
+        let t = text(&resp);
+        let id = t
+            .split_whitespace()
+            .find(|w| w.starts_with("user-msg-"))
+            .map(|w| {
+                w.trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+                    .to_string()
+            })
+            .expect("in-flight error names the pre-minted id");
+
+        drop(guard);
+        let mut lines = Vec::new();
+        for _ in 0..200 {
+            lines = capture.lines();
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let line = lines
+            .iter()
+            .find(|l| l.contains(&id))
+            .unwrap_or_else(|| panic!("late refusal must be logged under the id: {lines:?}"));
+        assert!(line.contains("WITHOUT delivering"), "{line}");
+        assert!(
+            line.contains("q-pending-1") && line.contains("queueLength"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("SENTINEL-QUEUED-BODY"),
+            "queued message content must not reach the log: {line}"
+        );
+        assert!(
+            api.agent_send_calls.lock().unwrap().is_empty(),
+            "a refusal enqueues nothing"
+        );
     }
 
     /// Omitted `priority` defaults to INTERRUPT delivery: the binding
