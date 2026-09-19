@@ -1486,7 +1486,7 @@ async fn open_tool_call_provider_stall_fails_turn_over_wss() {
         .as_str()
         .expect("agent:failed carries error");
     assert!(
-        error.contains(intent_acp::PROVIDER_STALL_PREFIX),
+        error.starts_with(intent_acp::PROVIDER_STALL_PREFIX),
         "agent:failed error is ProviderStall-prefixed: {error}"
     );
     assert!(
