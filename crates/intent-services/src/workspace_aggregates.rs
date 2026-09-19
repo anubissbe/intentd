@@ -291,6 +291,10 @@ mod tests {
         assert!(!root.exists(), "the lock must not create the root dir");
     }
 
+    /// A cold caller joins the startup prewarm's flight instead of racing it.
+    /// (macOS-only: elsewhere the temporary platform lock answers before the
+    /// flight table is touched, so the prewarm never enters a flight.)
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn cow_supported_joins_in_flight_prewarm() {
         let dir = tempfile::tempdir().unwrap();
