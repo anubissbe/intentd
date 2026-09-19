@@ -6497,13 +6497,17 @@ async fn tool_call_in_flight_suppresses_stall_until_closed() {
     );
 }
 
-/// Full suppression (intent-hq/monorepo#3466): a tool call that NEVER closes
-/// keeps the stall advisory suppressed for the entire silence — the 30-minute
-/// prompt idle timeout is the backstop for a genuinely hung tool — and the
-/// turn still resolves normally.
+/// Suppression below the ceiling (intent-hq/monorepo#3466): a tool call that
+/// never closes keeps the stall advisory suppressed while the silence stays
+/// below the open-tool ceiling ([`open_tool_call_stall_ms`], pinned far above
+/// this test's silence) — a long tool run is expected silence — and the turn
+/// still resolves normally.
 #[tokio::test]
-async fn unclosed_tool_call_never_emits_stalled() {
-    let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "50")]);
+async fn unclosed_tool_call_below_ceiling_emits_no_stalled() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "60000"),
+    ]);
     let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
     let (conn, mut note_rx, _agent, release_close, release_end) =
         connect_tool_silence(vec![tool_stall_tool_call()], Vec::new());
@@ -6555,13 +6559,349 @@ async fn unclosed_tool_call_never_emits_stalled() {
     assert_eq!(
         phases,
         vec!["prompt"],
-        "an open tool call suppresses the stall advisory entirely"
+        "an open tool call suppresses the stall advisory below the ceiling"
+    );
+}
+
+/// Regression for intent-hq/intent#5395 (the opencode/grok "stalls while
+/// Thinking after the first tool calls" signature): a `tool_call` whose
+/// terminal `tool_call_update` never arrives must NOT suppress the stall
+/// advisory indefinitely. Once the silence crosses the open-tool ceiling
+/// (`INTENTD_OPEN_TOOL_CALL_STALL_MS`, lowered here) the `stalled` advisory
+/// fires with the tool still open, carrying the real `silentMs`; the ceiling
+/// is advisory only, so the turn still resolves normally when released.
+#[tokio::test]
+async fn unclosed_tool_call_past_ceiling_emits_stalled() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "150"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent, release_close, release_end) =
+        connect_tool_silence(vec![tool_stall_tool_call()], Vec::new());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    Some("turn-tool-hung-ceiling"),
+                )
+                .await
+        })
+    };
+
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    wait_for_event_type(&mut sub, &mut events, &mut cursor, "agent:tool:call").await;
+    // The tool call is never closed: the advisory must still fire once the
+    // silence crosses the 150ms ceiling (RED at the parent SHA: the open call
+    // suppressed it for the entire silence and this wait timed out).
+    wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
+    let stalled = events
+        .iter()
+        .find(|e| e.event_type == "agent:stream:status" && e.data["phase"] == json!("stalled"))
+        .expect("stalled status captured");
+    assert!(
+        stalled.data["silentMs"].as_u64().unwrap() >= 150,
+        "silentMs reflects the ceiling, not the tool-free threshold: {:?}",
+        stalled.data
+    );
+    // Advisory only: releasing the held response resolves the turn normally.
+    release_close.send(()).expect("mock alive");
+    release_end.send(()).expect("mock alive");
+    let stop = timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("the ceiling advisory never fails the turn");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let phases: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:status")
+        .map(|e| e.data["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["prompt", "stalled"],
+        "exactly one stalled advisory past the open-tool ceiling"
+    );
+    assert!(
+        !events.iter().any(|e| e.event_type == "agent:failed"),
+        "the open-tool ceiling is advisory: no terminal failure"
+    );
+}
+
+/// Tool-aware terminal guard (intent-hq/intent#5395): the terminal
+/// provider-stall threshold applies only to TOOL-FREE silence. With a tool
+/// call open, silence far past `INTENTD_PROVIDER_STALL_TERMINAL_MS` emits the
+/// ceiling advisory but never fails the turn — a hung tool stays on the
+/// idle-timeout warn-and-continue path, and a legitimately long tool run is
+/// never killed.
+#[tokio::test]
+async fn open_tool_call_silence_past_terminal_threshold_never_fails_turn() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "100"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "150"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    let (conn, mut note_rx, _agent, release_close, release_end) =
+        connect_tool_silence(vec![tool_stall_tool_call()], Vec::new());
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+
+    let turn = {
+        let services = services.clone();
+        let agent_id = agent_id.clone();
+        let workspace_id = workspace_id.clone();
+        tokio::spawn(async move {
+            services
+                .run_prompt_turn(
+                    &conn,
+                    &mut note_rx,
+                    &agent_id,
+                    &workspace_id,
+                    ACP_SID,
+                    vec![text_block("hi")],
+                    Some("turn-tool-hung-terminal"),
+                )
+                .await
+        })
+    };
+
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    wait_for_event_type(&mut sub, &mut events, &mut cursor, "agent:tool:call").await;
+    wait_for_status_phase(&mut sub, &mut events, &mut cursor, "stalled").await;
+    // Silence well past the 150ms terminal threshold with the tool open.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    release_close.send(()).expect("mock alive");
+    release_end.send(()).expect("mock alive");
+    let stop = timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("turn completes")
+        .expect("worker task")
+        .expect("an open tool call is never failed as a provider stall");
+    assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let phases: Vec<&str> = events
+        .iter()
+        .filter(|e| e.event_type == "agent:stream:status")
+        .map(|e| e.data["phase"].as_str().unwrap())
+        .collect();
+    assert_eq!(phases, vec!["prompt", "stalled"]);
+    assert!(!events.iter().any(|e| e.event_type == "agent:failed"));
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert!(
+        stored.attention_request_kind.is_none(),
+        "no attention raise for an open-tool stall: {:?}",
+        stored.attention_request_kind
+    );
+}
+
+/// Regression for intent-hq/intent#5395 (terminal half): tool-free silence
+/// past `INTENTD_PROVIDER_STALL_TERMINAL_MS` ENDS the turn with the distinct
+/// provider-stall error instead of waiting for the 30-minute idle timeout's
+/// warn-and-continue redrive. The turn takes the ordinary terminal path
+/// (`status = error`, terminal context stashed for the worker, `agent:failed`
+/// emitted) and raises the intent-hq/intent#5419-style blocker attention
+/// request naming the stall — `agent:attention-requested` precedes
+/// `agent:failed`, the parent gets the direct wake, and the `stalled`
+/// advisory fired first. RED at the parent SHA: the turn never settled
+/// (the idle timeout is left at its 30-minute default here).
+#[tokio::test]
+async fn tool_free_provider_stall_past_terminal_threshold_fails_turn_and_raises_attention() {
+    let _env = EnvGuard::set_all(&[
+        ("INTENTD_STREAM_STALL_MS", "50"),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "200"),
+    ]);
+    let (_tmp, services, bus, agent_id, workspace_id) = setup().await;
+    // Delegated shape: a parent session whose child is the stalling agent, so
+    // the blocker path's direct parent wake has a target.
+    let parent_id = AgentId::from("parent-stall");
+    services
+        .store
+        .insert_agent_session(&new_session(&parent_id, &workspace_id))
+        .await
+        .expect("insert parent session");
+    let mut child = new_session(&agent_id, &workspace_id);
+    child.parent_agent_id = Some(parent_id.clone());
+    services
+        .store
+        .update_agent_session(&workspace_id, &child)
+        .await
+        .expect("link child to parent");
+    // Production shape: the raise happens INSIDE the live turn, where the
+    // manager's busy set defers the surfacing to the turn-end flush.
+    services.set_test_busy(&agent_id, true);
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    // The provider streams a little text, then hangs with NO tool call open
+    // (the silent mock never resolves the prompt and keeps its pipes open).
+    let chunk = |text: &str| {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": ACP_SID,
+                "update": { "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text } }
+            }
+        })
+        .to_string()
+    };
+    let (conn, mut note_rx, _agent) = connect_silent(vec![chunk("Thinking "), chunk("hard")]);
+
+    let err = timeout(
+        Duration::from_secs(5),
+        services.run_prompt_turn(
+            &conn,
+            &mut note_rx,
+            &agent_id,
+            &workspace_id,
+            ACP_SID,
+            vec![text_block("hi")],
+            Some("turn-provider-stall"),
+        ),
+    )
+    .await
+    .expect("a tool-free provider stall ends the turn well before the idle timeout")
+    .expect_err("the provider stall fails the turn");
+    let intent_core::Error::Internal(msg) = &err else {
+        panic!("Internal error expected: {err}");
+    };
+    assert!(
+        msg.starts_with(&format!(
+            "session/prompt failed: {}",
+            intent_acp::PROVIDER_STALL_PREFIX
+        )),
+        "distinct provider-stall error under the ordinary terminal wrapper: {msg}"
+    );
+    assert!(
+        !msg.contains(intent_acp::PROMPT_IDLE_TIMEOUT_PREFIX),
+        "a provider stall is not an idle timeout (no warn-and-continue): {msg}"
+    );
+
+    // Ordinary terminal classification: Error persisted, context stashed.
+    let stored = services.store.get_agent_session(&agent_id).await.unwrap();
+    assert_eq!(stored.status, AgentStatus::Error);
+    assert!(
+        services.take_pending_terminal_error(&agent_id).is_some(),
+        "terminal context stashed for the worker"
+    );
+    // Blocker-style attention request naming the stall.
+    assert_eq!(
+        stored.attention_request_kind.as_deref(),
+        Some("blocker"),
+        "a terminal provider stall raises a blocker attention request (intent#5395)"
+    );
+    let reason = stored
+        .attention_request_reason
+        .as_deref()
+        .expect("attention reason recorded");
+    assert!(
+        reason.contains("provider stall"),
+        "reason names the stall: {reason}"
+    );
+    assert!(
+        reason.contains("no tool call in flight"),
+        "reason states the tool-free condition: {reason}"
+    );
+    // Transcript: streamed partial persisted, blocker notice after it.
+    let messages = services
+        .store
+        .get_agent_messages(&agent_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        messages.len(),
+        2,
+        "assistant partial + blocker notice: {messages:?}"
+    );
+    assert_eq!(messages[0].role, "assistant");
+    assert_eq!(messages[1].role, "system");
+    assert_eq!(
+        messages[1].content[0]["meta"]["kind"],
+        json!("blocker-report")
+    );
+    // The parent received the direct blocker wake.
+    let parent = services.store.get_agent_session(&parent_id).await.unwrap();
+    assert_eq!(
+        parent.messages.len(),
+        1,
+        "one direct attention wake to the parent"
+    );
+    let wake_text = serde_json::to_string(&parent.messages[0].content).unwrap();
+    assert!(
+        wake_text.contains("provider stall"),
+        "parent wake names the stall: {wake_text}"
+    );
+    // Event order: stalled advisory → agent:attention-requested → agent:failed.
+    let mut events: Vec<Event> = Vec::new();
+    while !events.iter().any(|e| e.event_type == "agent:failed") {
+        let batch = timeout(Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timed out")
+            .expect("subscription open");
+        events.extend(batch);
+    }
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    let stalled_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:stream:status" && e.data["phase"] == json!("stalled"))
+        .unwrap_or_else(|| panic!("stalled advisory precedes the terminal stall: {types:?}"));
+    let attention_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:attention-requested")
+        .unwrap_or_else(|| panic!("agent:attention-requested emitted: {types:?}"));
+    let failed_idx = events
+        .iter()
+        .position(|e| e.event_type == "agent:failed")
+        .expect("agent:failed emitted");
+    assert!(
+        stalled_idx < attention_idx && attention_idx < failed_idx,
+        "stalled → attention → failed: {types:?}"
+    );
+    assert_eq!(events[attention_idx].data["kind"], json!("blocker"));
+    assert!(
+        events[failed_idx].data["error"]
+            .as_str()
+            .unwrap()
+            .contains(intent_acp::PROVIDER_STALL_PREFIX),
+        "agent:failed names the provider stall: {:?}",
+        events[failed_idx].data
+    );
+    assert_eq!(
+        events[failed_idx].data["turnId"],
+        json!("turn-provider-stall")
+    );
+    assert!(
+        events.iter().any(|e| e.event_type == "agent:stream:end"),
+        "terminal stream:end emitted: {types:?}"
     );
 }
 
 /// `INTENTD_STREAM_STALL_MS` overrides the stall threshold; absent (or
 /// unparseable) it falls back to the 5-minute default, which stays below the
-/// silent-tail-suspect default (stall < silent-tail-suspect < 30-min idle).
+/// silent-tail-suspect default. The intent-hq/intent#5395 thresholds
+/// (`INTENTD_OPEN_TOOL_CALL_STALL_MS`, `INTENTD_PROVIDER_STALL_TERMINAL_MS`)
+/// override the same way, and the defaults keep the ordering
+/// stall < silent-tail-suspect < open-tool ceiling < terminal stall <
+/// 30-min idle timeout (the terminal stall must sit below the idle timeout to
+/// be reachable at all).
 #[test]
 fn stream_stall_ms_env_override_and_default() {
     {
@@ -6572,14 +6912,53 @@ fn stream_stall_ms_env_override_and_default() {
         let _env = EnvGuard::set_all(&[("INTENTD_STREAM_STALL_MS", "not-a-number")]);
         assert_eq!(crate::agent_session::stream_stall_ms(), 300_000);
     }
+    {
+        let _env = EnvGuard::set_all(&[
+            ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "4321"),
+            ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "5432"),
+        ]);
+        assert_eq!(crate::agent_session::open_tool_call_stall_ms(), 4321);
+        assert_eq!(crate::agent_session::provider_stall_terminal_ms(), 5432);
+    }
+    {
+        let _env = EnvGuard::set_all(&[
+            ("INTENTD_OPEN_TOOL_CALL_STALL_MS", "nope"),
+            ("INTENTD_PROVIDER_STALL_TERMINAL_MS", "nope"),
+        ]);
+        assert_eq!(crate::agent_session::open_tool_call_stall_ms(), 900_000);
+        assert_eq!(
+            crate::agent_session::provider_stall_terminal_ms(),
+            1_200_000
+        );
+    }
     let _env = EnvGuard::apply(&[
         ("INTENTD_STREAM_STALL_MS", None),
         ("INTENTD_SILENT_TAIL_SUSPECT_MS", None),
+        ("INTENTD_OPEN_TOOL_CALL_STALL_MS", None),
+        ("INTENTD_PROVIDER_STALL_TERMINAL_MS", None),
+        ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", None),
     ]);
     assert_eq!(crate::agent_session::stream_stall_ms(), 300_000);
     assert_eq!(crate::agent_session::silent_tail_suspect_ms(), 480_000);
+    assert_eq!(crate::agent_session::open_tool_call_stall_ms(), 900_000);
+    assert_eq!(
+        crate::agent_session::provider_stall_terminal_ms(),
+        1_200_000
+    );
     assert!(
         crate::agent_session::stream_stall_ms() < crate::agent_session::silent_tail_suspect_ms()
+    );
+    assert!(
+        crate::agent_session::silent_tail_suspect_ms()
+            < crate::agent_session::open_tool_call_stall_ms()
+    );
+    assert!(
+        crate::agent_session::open_tool_call_stall_ms()
+            < crate::agent_session::provider_stall_terminal_ms()
+    );
+    assert!(
+        crate::agent_session::provider_stall_terminal_ms()
+            < u64::try_from(intent_acp::session::prompt_idle_timeout().as_millis()).unwrap()
     );
 }
 
