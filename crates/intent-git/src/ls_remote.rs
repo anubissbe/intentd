@@ -7,8 +7,8 @@
 //!
 //! Follows the [`crate::repo_cache`] shell-git conventions: the child runs on
 //! the blocking pool with `GIT_TERMINAL_PROMPT=0` and a wall-clock deadline
-//! kill; a caller-resolved GitHub token is offered via an extra credential
-//! helper reading [`TOKEN_ENV`] ([`crate::auth::token_helper_config`]) —
+//! kill; a caller-resolved instance-bound credential is offered via an extra credential
+//! helper reading `INTENT_GIT_SCOPED_PASSWORD` ([`crate::auth::token_helper_config`]) —
 //! never argv; and stderr is credential-redacted before it travels into an
 //! error.
 //!
@@ -26,7 +26,6 @@ use std::time::{Duration, Instant};
 use intent_core::{Error, Result};
 use tokio::sync::watch;
 
-use crate::auth::{token_helper_config, TOKEN_ENV};
 use crate::repo_cache::GIT_POLL;
 
 /// Deadline for the ls-remote child. This backs an interactive picker RPC
@@ -66,9 +65,9 @@ fn in_flight() -> &'static Mutex<HashMap<String, Flight>> {
 }
 
 /// List `url`'s branches (and default branch) with one `git ls-remote`.
-/// `token` is an optional caller-resolved GitHub token offered to the child
+/// `token` is an optional caller-resolved instance-bound credential offered to the child
 /// via the environment only ([`crate::auth::token_helper_config`] reading
-/// [`TOKEN_ENV`]); it never appears in argv or error text.
+/// `INTENT_GIT_SCOPED_PASSWORD`); it never appears in argv or error text.
 ///
 /// Concurrent calls for the same `url` share one child and its outcome
 /// (single-flight, monorepo#1926); the joiners' `token`s are ignored in
@@ -80,11 +79,14 @@ fn in_flight() -> &'static Mutex<HashMap<String, Flight>> {
 /// # Errors
 ///
 /// Returns `Error::Internal` if `git` cannot be spawned, the ls-remote fails or times out, or the shared flight is abandoned.
-pub async fn ls_remote_branches(url: &str, token: Option<&str>) -> Result<RemoteBranches> {
+pub async fn ls_remote_branches(
+    url: &str,
+    token: Option<&crate::auth::GitCredential>,
+) -> Result<RemoteBranches> {
     let owned_url = url.to_string();
-    let token = token.map(str::to_owned);
+    let token = token.cloned();
     single_flight(url, move || {
-        ls_remote_blocking(&owned_url, token.as_deref())
+        ls_remote_blocking(&owned_url, token.as_ref(), None)
     })
     .await
 }
@@ -171,14 +173,20 @@ fn flatten_internal(e: Error) -> String {
 
 /// Blocking body of [`ls_remote_branches`]: spawn, drain both pipes off-thread
 /// (an undrained pipe blocks the child forever), poll with a deadline kill.
-fn ls_remote_blocking(url: &str, token: Option<&str>) -> Result<RemoteBranches> {
+pub(crate) fn ls_remote_blocking(
+    url: &str,
+    token: Option<&crate::auth::GitCredential>,
+    cwd: Option<&std::path::Path>,
+) -> Result<RemoteBranches> {
     let mut cmd = Command::new("git");
-    // Offer the resolved token as an extra github.com-scoped credential
-    // helper, appended after any configured helpers (see `crate::auth`). The
-    // helper reads the secret from the environment — argv carries no token.
-    if let Some(token) = crate::auth::usable_token(token) {
-        cmd.arg("-c").arg(token_helper_config());
-        cmd.env(TOKEN_ENV, token);
+    if let Some(cwd) = cwd {
+        cmd.arg("-C").arg(cwd);
+    }
+    // The instance-scoped helper takes precedence over existing helpers,
+    // which remain fallbacks. The secret travels in the child environment.
+    if let Some(token) = token {
+        let inherited = std::env::var(crate::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
+        cmd.envs(token.environment(cwd, inherited.as_deref()));
     }
     let mut child = cmd
         .args(["ls-remote", "--symref", "--", url, "HEAD", "refs/heads/*"])

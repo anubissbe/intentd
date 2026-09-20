@@ -47,12 +47,12 @@ fn should_answer_requires_get_https_github() {
 }
 
 #[test]
-fn should_answer_rejects_other_hosts_and_protocols() {
+fn should_answer_rejects_malformed_hosts_and_non_https_protocols() {
     for (protocol, host) in [
-        ("https", "gitlab.com"),
-        ("https", "api.github.com"),
-        ("https", "github.com.evil.com"),
-        ("https", "github.com:8443"),
+        ("https", "gitlab.com/evil"),
+        ("https", "user@github.com"),
+        ("https", "gitlab.com\npassword=bad"),
+        ("https", ""),
         ("http", "github.com"),
         ("ssh", "github.com"),
     ] {
@@ -78,7 +78,7 @@ fn should_answer_defers_to_explicit_url_identity() {
         ("host", "github.com"),
         ("username", "alice"),
     ]);
-    assert!(!should_answer("get", &pinned));
+    assert!(should_answer("get", &pinned));
     // The daemon's own fixed identity is fine.
     let matching = attrs(&[
         ("protocol", "https"),

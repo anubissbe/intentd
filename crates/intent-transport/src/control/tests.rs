@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 
 use super::*;
 
+type CredentialScope = (String, Option<String>, Option<String>);
+
 // `credential_pid` recorder is `Option<Option<_>>`: never-called vs called-with-None.
 #[expect(clippy::option_option)]
 struct FakeControl {
@@ -14,6 +16,7 @@ struct FakeControl {
     import_force: std::sync::Mutex<Option<bool>>,
     credential: Option<(String, String)>,
     credential_pid: std::sync::Mutex<Option<Option<u64>>>,
+    credential_scope: std::sync::Mutex<Option<CredentialScope>>,
     update_error: Option<String>,
     update_called: AtomicBool,
     exact_target: std::sync::Mutex<Option<String>>,
@@ -75,6 +78,7 @@ impl FakeControl {
             import_force: std::sync::Mutex::new(None),
             credential: None,
             credential_pid: std::sync::Mutex::new(None),
+            credential_scope: std::sync::Mutex::new(None),
             update_error: None,
             update_called: AtomicBool::new(false),
         }
@@ -141,9 +145,13 @@ impl SystemControl for FakeControl {
     fn git_credential(
         &self,
         client_pid: Option<u64>,
+        host: String,
+        path: Option<String>,
+        username: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Option<(String, String)>> + Send + '_>> {
         Box::pin(async move {
             *self.credential_pid.lock().unwrap() = Some(client_pid);
+            *self.credential_scope.lock().unwrap() = Some((host, path, username));
             self.credential.clone()
         })
     }
@@ -624,8 +632,8 @@ async fn git_credential_out_of_scope_yields_null_without_resolver() {
         json!(null),
         json!({}),
         json!({ "pid": 1 }),
-        json!({ "protocol": "https", "host": "gitlab.com" }),
-        json!({ "protocol": "https", "host": "api.github.com" }),
+        json!({ "protocol": "https", "host": "gitlab.com/evil" }),
+        json!({ "protocol": "https", "host": "user@github.com" }),
         json!({ "protocol": "http", "host": "github.com" }),
         json!({ "protocol": "https" }),
         json!({ "host": "github.com" }),
@@ -702,4 +710,23 @@ async fn exact_update_validates_and_never_falls_back_to_channel() {
         serde_json::from_str(&handle(req, &unsupported, false, false).await.unwrap()).unwrap();
     assert_eq!(response["error"]["code"], -32603);
     assert!(!unsupported.update_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn gitlab_credential_forwards_exact_host_port_path_and_identity() {
+    let control = FakeControl::with_credential("oauth2", "fixture");
+    let request = classify(&json!({"jsonrpc":"2.0","id":26,"method":"system.gitCredential","params":{
+        "protocol":"https","host":"git.example:8443","path":"gitlab/team/nested/project.git","username":"oauth2"
+    }})).unwrap();
+    let response: Value =
+        serde_json::from_str(&handle(request, &control, true, true).await.unwrap()).unwrap();
+    assert_eq!(response["result"]["credential"]["username"], "oauth2");
+    assert_eq!(
+        *control.credential_scope.lock().unwrap(),
+        Some((
+            "git.example:8443".into(),
+            Some("gitlab/team/nested/project.git".into()),
+            Some("oauth2".into())
+        ))
+    );
 }

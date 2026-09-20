@@ -10,13 +10,10 @@
 //! instead of a hidden prompt; a wall-clock deadline kills the child via
 //! `Child::kill` if the remote hangs.
 //!
-//! A caller-resolved GitHub token (if any) is offered to the child as a
-//! `credential.https://github.com.helper` scoped to github.com only, ordered
-//! ahead of the configured helpers with those re-added behind it as fallbacks
-//! (monorepo#3059 — see `auth::github_helper_entries` for why deferring to
-//! them outright backfires on macOS). The token value travels via an
-//! environment variable — never argv, so it cannot leak through process
-//! listings or error messages.
+//! A caller-resolved instance-bound credential is offered to the child through
+//! a helper scoped to its HTTPS host, port and installation prefix, ahead of
+//! existing helpers. The secret travels in the short-lived child's environment,
+//! never argv; credential-bearing operations do not follow redirects.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -35,19 +32,25 @@ const SHELL_FETCH_TIMEOUT: Duration = Duration::from_secs(100);
 /// stays negligible for a long-running remote.
 const SHELL_FETCH_POLL: Duration = Duration::from_millis(50);
 
+#[cfg(test)]
 use crate::auth::TOKEN_ENV;
 
 /// Fetch a single `branch` from `remote` (typically `origin`), updating the local
 /// remote-tracking ref `refs/remotes/<remote>/<branch>`. `token` is an optional
-/// caller-resolved GitHub token used as the final credential-chain step for
-/// HTTPS github.com remotes (see [`crate::auth`]). Errors when the branch
+/// caller-resolved instance-bound credential used as the final credential-chain step for
+/// matching HTTPS forge remotes (see [`crate::auth`]). Errors when the branch
 /// name is empty, `git` is not on PATH, the remote is unreachable, or the fetch
 /// exceeds [`SHELL_FETCH_TIMEOUT`].
 ///
 /// # Errors
 ///
 /// Returns `Error::Internal` if the branch name is empty, `git` cannot be spawned, the fetch fails or times out.
-pub fn fetch(worktree_path: &Path, remote: &str, branch: &str, token: Option<&str>) -> Result<()> {
+pub fn fetch(
+    worktree_path: &Path,
+    remote: &str,
+    branch: &str,
+    token: Option<&crate::auth::GitCredential>,
+) -> Result<()> {
     fetch_with_timeout(worktree_path, remote, branch, token, SHELL_FETCH_TIMEOUT)
 }
 
@@ -57,7 +60,7 @@ pub(crate) fn fetch_with_timeout(
     worktree_path: &Path,
     remote: &str,
     branch: &str,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
     timeout: Duration,
 ) -> Result<()> {
     if branch.is_empty() {
@@ -76,20 +79,11 @@ pub(crate) fn fetch_with_timeout(
     // into a fast error rather than a hidden hang.
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(worktree_path);
-    // Offer the resolved token as an extra credential helper scoped to
-    // github.com HTTPS only, consulted *ahead* of the configured helpers
-    // (which stay reachable behind it) so an OS-default helper holding a stale
-    // github.com credential cannot shadow the resolved token — monorepo#3059,
-    // see `auth::github_helper_entries`. `-c` entries are applied after the
-    // inherited `GIT_CONFIG_PARAMETERS`, so the reset they carry covers both.
-    // The helper reads the secret from the environment — the argv below
-    // carries no token bytes.
-    if let Some(token) = crate::auth::usable_token(token) {
+    // Scoped helper takes precedence; existing helpers remain fallbacks.
+    // The secret is carried in the child environment, never argv.
+    if let Some(token) = token {
         let inherited = std::env::var(crate::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
-        for entry in crate::auth::token_helper_entries(Some(worktree_path), inherited.as_deref()) {
-            cmd.arg("-c").arg(entry);
-        }
-        cmd.env(TOKEN_ENV, token);
+        cmd.envs(token.environment(Some(worktree_path), inherited.as_deref()));
     }
     let mut child = cmd
         .arg("fetch")

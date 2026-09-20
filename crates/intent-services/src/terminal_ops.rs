@@ -203,10 +203,11 @@ pub(crate) fn git_credential_env(
     settings: Option<&SettingsRegistry>,
     cwd: Option<&Path>,
 ) -> Vec<(String, String)> {
-    if !expose_git_credential(settings) {
+    let Some(settings) = settings else {
         return Vec::new();
-    }
-    credential_pairs(cwd)
+    };
+    let instances = child_git_credential_instances(&settings.snapshot().effective.source_control);
+    credential_pairs(cwd, &instances)
 }
 
 /// All git env pairs injected under the caller's overlay for a spawn in
@@ -230,6 +231,7 @@ pub(crate) fn injected_git_env(
 /// token resolution; the production composition root always wires the
 /// registry, where the schema default (`true`) applies. Shared with the
 /// `system.gitCredential` UDS RPC (see [`crate::github_git_credential`]).
+#[cfg(test)]
 pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool {
     settings.is_some_and(|r| {
         r.snapshot()
@@ -240,17 +242,28 @@ pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool
     })
 }
 
+/// Public scopes only; secrets remain in the daemon and are resolved on demand.
+pub(crate) fn child_git_credential_instances(
+    settings: &intent_core::settings_file::SourceControlSettings,
+) -> Vec<String> {
+    crate::source_control_ops::configured_connections(settings)
+        .into_iter()
+        .filter(|(_, config)| config.enabled && config.expose_git_credential_to_children)
+        .map(|(instance, _)| instance)
+        .collect()
+}
+
 /// Build the daemon-backed helper env pair on top of the daemon's own
 /// inherited `GIT_CONFIG_PARAMETERS` (the PTY child inherits the daemon env,
 /// so overwriting the variable without re-appending would drop inherited
 /// entries). The helper path is the running daemon's own binary
 /// (`current_exe`); an unresolvable path yields no pairs (logged at debug).
-fn credential_pairs(cwd: Option<&Path>) -> Vec<(String, String)> {
+fn credential_pairs(cwd: Option<&Path>, instances: &[String]) -> Vec<(String, String)> {
     let Some(intentd) = crate::daemon_exe_path() else {
         return Vec::new();
     };
     let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
-    intent_git::auth::daemon_helper_env(&intentd, cwd, inherited.as_deref())
+    intent_git::auth::daemon_helpers_for_instances(&intentd, instances, cwd, inherited.as_deref())
 }
 
 /// Layer caller-supplied env over the injected credential pairs: a key the
@@ -1326,7 +1339,7 @@ mod tests {
     /// child environment (monorepo#884 Phase 2.2).
     #[test]
     fn credential_pairs_are_helper_only_without_token_env() {
-        let pairs = credential_pairs(None);
+        let pairs = credential_pairs(None, &["https://github.com".to_string()]);
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec![intent_git::auth::GIT_CONFIG_PARAMETERS_ENV]);
         assert!(

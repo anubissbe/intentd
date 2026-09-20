@@ -1024,6 +1024,54 @@ impl Store {
         Ok(res.rows_affected())
     }
 
+    /// Apply a pause only to the monitors resolved to one forge instance.
+    /// # Errors
+    /// Returns an error if the pause annotation cannot be persisted.
+    pub async fn annotate_pr_monitor_pause_for_ids(
+        &self,
+        pause: &str,
+        ids: &[PrMonitorId],
+    ) -> Result<u64> {
+        let query = format!(
+            "{} AND monitor_id IN (SELECT value FROM json_each(?3))",
+            *ANNOTATE_ACTIVE_PR_MONITORS_PAUSE_SQL
+        );
+        let ids = serde_json::to_string(ids)
+            .map_err(|error| intent_core::Error::Internal(error.to_string()))?;
+        let result = sqlx::query(&query)
+            .bind(pause)
+            .bind(PR_MONITOR_PAUSE_MARKER)
+            .bind(ids)
+            .execute(self.write_pool())
+            .await
+            .map_err(|error| intent_core::Error::Internal(error.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Clear a recovered pause only for one forge instance's monitor rows.
+    /// # Errors
+    /// Returns an error if the pause annotation cannot be cleared.
+    pub async fn clear_pr_monitor_pause_for_ids(
+        &self,
+        lifted: Option<&str>,
+        ids: &[PrMonitorId],
+    ) -> Result<u64> {
+        let query = format!(
+            "{} AND monitor_id IN (SELECT value FROM json_each(?3))",
+            *CLEAR_ACTIVE_PR_MONITORS_PAUSE_SQL
+        );
+        let ids = serde_json::to_string(ids)
+            .map_err(|error| intent_core::Error::Internal(error.to_string()))?;
+        let result = sqlx::query(&query)
+            .bind(PR_MONITOR_PAUSE_MARKER)
+            .bind(lifted)
+            .bind(ids)
+            .execute(self.write_pool())
+            .await
+            .map_err(|error| intent_core::Error::Internal(error.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
     /// Re-parent an ACTIVE monitor from `from_agent_id` to `to_agent_id` and
     /// re-arm it in the same statement (the [`Store::update_pr_monitor_poll`]
     /// write-back), so a reader never observes the new owner with the old

@@ -197,7 +197,7 @@ pub(crate) struct CloneJob {
     /// github.com-scoped credential helper (monorepo#825). `None` for SSH /
     /// non-GitHub URLs or when no token resolves; the value travels via the
     /// environment only — never argv, never logged.
-    pub token: Option<String>,
+    pub token: Option<intent_git::auth::GitCredential>,
     pub bus: EventBus,
     /// Unified `workspace.create` progress reporter (PROTOCOL §5.1). When
     /// set, every frame routes through the reporter — stderr percentages are
@@ -268,12 +268,14 @@ fn classified(detail: &str) -> Option<CloneErrorCategory> {
 fn build_clone_command(
     url: &str,
     target_path: &Path,
-    token: Option<&str>,
+    token: Option<&intent_git::auth::GitCredential>,
     inherited_config_parameters: Option<&str>,
     recurse_submodules: bool,
 ) -> Command {
     let mut cmd = Command::new("git");
-    for (key, value) in intent_git::auth::scoped_credential_env(token, inherited_config_parameters)
+    for (key, value) in token
+        .map(|credential| credential.environment(None, inherited_config_parameters))
+        .unwrap_or_default()
     {
         cmd.env(key, value);
     }
@@ -379,7 +381,7 @@ async fn run_clone(job: CloneJob) -> std::result::Result<(), CloneFailure> {
     let mut cmd = build_clone_command(
         &url,
         &target_path,
-        token.as_deref(),
+        token.as_ref(),
         inherited_config_parameters.as_deref(),
         recurse_submodules,
     );
@@ -1327,10 +1329,13 @@ mod tests {
     #[test]
     fn build_clone_command_injects_token_via_env_not_argv() {
         let token = "ghp_secret1234567890";
+        let credential =
+            intent_git::auth::GitCredential::new("https://github.com", "x-access-token", token)
+                .unwrap();
         let cmd = build_clone_command(
             "https://github.com/acme/private.git",
             Path::new("/tmp/x"),
-            Some(token),
+            Some(&credential),
             None,
             false,
         );
@@ -1371,7 +1376,7 @@ mod tests {
         );
         assert!(
             env.iter()
-                .any(|(k, v)| k == intent_git::auth::TOKEN_ENV && v.as_deref() == Some(token)),
+                .any(|(k, v)| k == "INTENT_GIT_SCOPED_PASSWORD" && v.as_deref() == Some(token)),
             "token travels via {} only",
             intent_git::auth::TOKEN_ENV
         );
@@ -1389,7 +1394,8 @@ mod tests {
         let cmd = build_clone_command(
             "https://github.com/acme/private.git",
             Path::new("/tmp/x"),
-            Some("tok"),
+            intent_git::auth::GitCredential::new("https://github.com", "x-access-token", "tok")
+                .as_ref(),
             Some("'foo.bar=baz'"),
             false,
         );
@@ -1415,7 +1421,15 @@ mod tests {
             let cmd = build_clone_command(
                 "https://github.com/acme/repo.git",
                 Path::new("/tmp/x"),
-                token,
+                token
+                    .and_then(|token| {
+                        intent_git::auth::GitCredential::new(
+                            "https://github.com",
+                            "x-access-token",
+                            token,
+                        )
+                    })
+                    .as_ref(),
                 None,
                 false,
             );

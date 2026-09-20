@@ -271,3 +271,64 @@ async fn revoke_applies_to_next_helper_get() {
         "no credential after revocation: {stdout:?}"
     );
 }
+
+/// The same daemon serves GitHub and two independent GitLab installations.
+/// A credential request is resolved from its host/port/path, never a UI switch.
+#[tokio::test]
+async fn multiple_forge_credentials_are_isolated_by_host_port_and_installation() {
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let data_dir = temp_data_dir();
+    let mut secrets = serde_json::Map::new();
+    let mut config = String::from("[sourceControl.github]\ntokenSource = \"env\"\n");
+    for (instance, token, expose) in [
+        ("https://git.example:8443/gitlab", "fixture-first", true),
+        ("https://second.example", "fixture-second", true),
+        ("https://hidden.example", "fixture-hidden", false),
+    ] {
+        let mut hash = String::with_capacity(64);
+        for byte in Sha256::digest(instance.as_bytes()) {
+            write!(hash, "{byte:02x}").unwrap();
+        }
+        secrets.insert(
+            format!("sourceControl.connections.{hash}.token"),
+            json!(json!({"provider":"gitlab","instanceUrl":instance,"token":token}).to_string()),
+        );
+        write!(config, "\n[sourceControl.connections.\"{instance}\"]\nprovider = \"gitlab\"\ntokenSource = \"explicit\"\nenabled = true\nexposeGitCredentialToChildren = {expose}\n").unwrap();
+    }
+    std::fs::write(data_dir.path().join("config.toml"), config).unwrap();
+    std::fs::write(
+        data_dir.path().join("secrets.json"),
+        serde_json::to_vec(&secrets).unwrap(),
+    )
+    .unwrap();
+    let _daemon = Daemon {
+        child: spawn_serve(data_dir.path()),
+    };
+    assert!(await_uds(&data_dir.path().join("intentd.sock")).await);
+    for (input, expected) in [
+        (GITHUB_GET, format!("username=x-access-token\npassword={TEST_TOKEN}\n")),
+        ("protocol=https\nhost=git.example:8443\npath=gitlab/team/nested/project.git\n\n", "username=oauth2\npassword=fixture-first\n".into()),
+        ("protocol=https\nhost=second.example\npath=team/project.git\n\n", "username=oauth2\npassword=fixture-second\n".into()),
+        ("protocol=https\nhost=git.example\npath=gitlab/team/project.git\n\n", String::new()),
+        ("protocol=https\nhost=git.example:8443\npath=else/team/project.git\n\n", String::new()),
+        ("protocol=https\nhost=git.example:8443\n\n", String::new()),
+        ("protocol=https\nhost=git.example:8443\npath=gitlab/team/project.git\nusername=alice\n\n", String::new()),
+        ("protocol=https\nhost=unregistered.example\npath=team/project.git\n\n", String::new()),
+        ("protocol=https\nhost=hidden.example\npath=team/project.git\n\n", String::new()),
+    ] {
+        let (ok, output) = run_helper(data_dir.path(), "get", input);
+        assert!(ok);
+        assert_eq!(output, expected, "{input}");
+    }
+    let log = std::fs::read_to_string(data_dir.path().join("daemon.log")).unwrap();
+    for token in [
+        TEST_TOKEN,
+        "fixture-first",
+        "fixture-second",
+        "fixture-hidden",
+    ] {
+        assert!(!log.contains(token));
+    }
+}

@@ -130,6 +130,7 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
+mod source_control_ops;
 pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
@@ -146,6 +147,7 @@ mod transfer_submodules;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
+mod workspace_source_url;
 mod workspace_status;
 pub mod workspace_vocabulary;
 
@@ -653,6 +655,11 @@ pub struct Services {
     /// composition root or a test; when unset, the `pr.*` handlers build the
     /// provider from default settings (token from env / `gh` / keychain).
     source_control: Option<Arc<dyn intent_sourcecontrol::SourceControl>>,
+    /// Request-local explicit-addressing context; never changes daemon defaults.
+    source_control_connection: Option<String>,
+    source_control_generation: Option<u64>,
+    source_control_config_gate: Arc<tokio::sync::Mutex<()>>,
+    source_control_runtimes: Arc<Mutex<HashMap<String, source_control_ops::SourceControlRuntime>>>,
     /// Active Linear engine for the `linear.*` methods (§5.28). `None` until
     /// wired by the composition root or a test; when unset, the `linear.*`
     /// handlers build the engine from default settings (key from
@@ -1302,6 +1309,10 @@ impl Services {
             dismissal_notices_sent: Arc::new(Mutex::new(HashMap::new())),
             agent_manager: Arc::new(OnceLock::new()),
             source_control: None,
+            source_control_connection: None,
+            source_control_generation: None,
+            source_control_config_gate: Arc::new(tokio::sync::Mutex::new(())),
+            source_control_runtimes: Arc::new(Mutex::new(HashMap::new())),
             linear_engine: None,
             sentry_engine: None,
             voice_engine: None,
@@ -3134,6 +3145,10 @@ impl Services {
         use std::collections::HashSet;
         use std::sync::Mutex;
         static BACKFILLED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+        let forge = self.effective_settings().source_control;
+        let forge_scope =
+            serde_json::to_string(&source_control_ops::configured_connections(&forge))
+                .unwrap_or_default();
 
         let candidates = {
             let mut guard = BACKFILLED.lock().unwrap();
@@ -3145,7 +3160,7 @@ impl Services {
                 else {
                     continue;
                 };
-                let dedupe_key = format!("{}\0{repository_path}", ws.id.as_str());
+                let dedupe_key = format!("{}\0{repository_path}\0{forge_scope}", ws.id.as_str());
                 if ws.archived || backfilled.contains(&dedupe_key) {
                     continue;
                 }
@@ -3187,6 +3202,7 @@ impl Services {
     /// are skipped silently.
     async fn backfill_one_workspace(&self, candidate: BackfillCandidate) -> Result<()> {
         let repository_path = candidate.repository_path.clone();
+        let source_control_config = self.effective_settings().source_control;
         let metadata = tokio::task::spawn_blocking(move || {
             let repo_path = std::path::PathBuf::from(&repository_path);
             #[cfg(test)]
@@ -3197,7 +3213,9 @@ impl Services {
             intent_git::remote::origin_url(&repo_path)
                 .ok()
                 .flatten()
-                .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                .and_then(|url| {
+                    source_control_ops::configured_repo_from_url(&source_control_config, &url)
+                })
         })
         .await
         .map_err(|error| Error::Internal(format!("repository metadata probe failed: {error}")))?;
@@ -4462,7 +4480,7 @@ impl Services {
                 .ok()
                 .and_then(std::result::Result::ok)
                 .flatten()
-                .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                .and_then(|url| self.configured_repo_from_url(&url))
                 .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
                 // Stamp the root's HEAD at registration time (fail-soft:
                 // unreadable HEAD ⇒ NULL, backfilled by a later sweep pass).
@@ -4576,13 +4594,35 @@ impl Services {
             // local steps above have already done their work. A forge whose
             // quota is exhausted is treated the same for the remaining roots
             // — the local steps 1–3 above still ran (monorepo#2961).
-            let Some(sc) = sc.filter(|_| !self.sweeps_rate_limited()) else {
+            let origin = self
+                .source_control_provenance(root.pr_url.as_deref(), Some(&root.path))
+                .await;
+            let scope_id = origin
+                .as_deref()
+                .and_then(|url| {
+                    source_control_ops::connection_for_url(
+                        &self.effective_settings().source_control,
+                        url,
+                    )
+                })
+                .map(|(id, _)| id);
+            let scoped = scope_id
+                .as_deref()
+                .map_or_else(|| self.clone(), |id| self.with_source_control_scope(id));
+            let root_sc = if self.source_control.is_some() {
+                sc.cloned()
+            } else if let Some(id) = scope_id {
+                scoped.resolve_source_control_connection(&id).await.ok()
+            } else {
+                None
+            };
+            let Some(sc) = root_sc.as_ref().filter(|_| !scoped.sweeps_rate_limited()) else {
                 continue;
             };
             let root_id = root.id.clone();
             let refreshed = match tokio::time::timeout(
                 self.pr_refresh_fetch_timeout,
-                self.refresh_git_root_pr(root, sc),
+                scoped.refresh_git_root_pr(root, sc),
             )
             .await
             {
@@ -4594,7 +4634,7 @@ impl Services {
             };
             match refreshed {
                 Err(Error::RateLimited(detail)) => {
-                    self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                    scoped.pause_sweeps_for_rate_limit(sc, &detail).await;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -4696,11 +4736,17 @@ impl Services {
         if !opened && until == before {
             return;
         }
-        match self
-            .store
-            .annotate_active_pr_monitors_pause(&rate_limit::pause_error(until.as_deref()))
-            .await
-        {
+        let pause = rate_limit::pause_error(until.as_deref());
+        let result = match self.connection_monitor_ids().await {
+            Ok(Some(ids)) => {
+                self.store
+                    .annotate_pr_monitor_pause_for_ids(&pause, &ids)
+                    .await
+            }
+            Ok(None) => self.store.annotate_active_pr_monitors_pause(&pause).await,
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(stamped) => tracing::debug!(
                 stamped,
                 opened,
@@ -4804,7 +4850,16 @@ impl Services {
     /// error is logged, the sweep goes on and the first successful poll
     /// after the stale deadline clears each row on its own.
     pub(crate) async fn clear_pr_monitor_pause_annotations(&self, lifted: Option<&str>) {
-        match self.store.clear_active_pr_monitors_pause(lifted).await {
+        let result = match self.connection_monitor_ids().await {
+            Ok(Some(ids)) => {
+                self.store
+                    .clear_pr_monitor_pause_for_ids(lifted, &ids)
+                    .await
+            }
+            Ok(None) => self.store.clear_active_pr_monitors_pause(lifted).await,
+            Err(error) => Err(error),
+        };
+        match result {
             Ok(cleared) => tracing::debug!(
                 cleared,
                 "forge rate limit pause lifted: cleared the pause from active pr monitors"
@@ -4847,9 +4902,31 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
+        let source_control_config = self.effective_settings().source_control;
+        let provenance = self
+            .source_control_provenance(root.pr_url.as_deref(), Some(&root.path))
+            .await
+            // A temporarily unavailable checkout can still refresh an
+            // existing pool: its stored full URLs retain forge provenance.
+            .or_else(|| {
+                root.pull_requests.as_deref().and_then(|items| {
+                    items
+                        .iter()
+                        .find(|pr| self.source_control_url_matches(&pr.url))
+                        .map(|pr| pr.url.clone())
+                })
+            });
         let Some(repo_ref) = root.repo() else {
             return Ok(PrRefreshOutcome::Skipped);
         };
+        if self.source_control.is_none()
+            && provenance
+                .as_deref()
+                .is_none_or(|url| !self.source_control_url_matches(url))
+        {
+            return Ok(PrRefreshOutcome::Skipped);
+        }
+
         // The live HEAD read is git I/O (roots may live on network/FUSE
         // mounts), so it runs on the blocking pool — never inline on the
         // runtime.
@@ -4874,6 +4951,13 @@ impl Services {
                 .get_pr(&repo_ref, number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
+            if !self.source_control_result_matches(
+                &source_control_config,
+                provenance.as_deref(),
+                &pr.url,
+            ) {
+                return Ok(PrRefreshOutcome::Skipped);
+            }
             fetched_fresh.push(number);
             // Clear a stale link only on a positive mismatch against the
             // root's current branch; an unreadable HEAD (empty branch)
@@ -4938,6 +5022,13 @@ impl Services {
                         }
                     };
                     if let Some(open_pr) = discovered {
+                        if !self.source_control_result_matches(
+                            &source_control_config,
+                            provenance.as_deref(),
+                            &open_pr.url,
+                        ) {
+                            return Ok(PrRefreshOutcome::Skipped);
+                        }
                         fetched_fresh.push(open_pr.number);
                         let open_info = pr_ops::build_pr_info(&open_pr);
                         pr_ops::upsert_pr_info(&mut root.pull_requests, &open_info);
@@ -4970,6 +5061,13 @@ impl Services {
                     .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
+                    if !self.source_control_result_matches(
+                        &source_control_config,
+                        provenance.as_deref(),
+                        &pr.url,
+                    ) {
+                        return Ok(PrRefreshOutcome::Skipped);
+                    }
                     fetched_fresh.push(pr.number);
                     let info = pr_ops::build_pr_info(&pr);
                     pr_ops::upsert_pr_info(&mut root.pull_requests, &info);
@@ -5009,6 +5107,16 @@ impl Services {
                 outcome = PrRefreshOutcome::Updated;
             }
             root.updated_at = now_iso();
+            if !self
+                .source_control_origin_unchanged(
+                    &source_control_config,
+                    provenance.as_deref(),
+                    Some(&root.path),
+                )
+                .await
+            {
+                return Ok(PrRefreshOutcome::Skipped);
+            }
             self.store.update_workspace_git_root_pr(&root).await?;
             publish_event(
                 self.event_bus.as_ref(),
@@ -5069,8 +5177,13 @@ impl Services {
             return Ok(PrRefreshOutcome::Skipped);
         }
 
-        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
-        self.refresh_workspace_pr_with_sc(ws, &sc).await
+        let scoped = if self.source_control.is_some() {
+            self.clone()
+        } else {
+            self.with_source_control_scope(&self.workspace_source_control_connection(&ws).await?)
+        };
+        let sc = scoped.resolve_workspace_source_control(&ws).await?;
+        scoped.refresh_workspace_pr_with_sc(ws, &sc).await
     }
 
     /// Refresh one workspace's PR linkage with a pre-resolved [`SourceControl`]
@@ -5091,6 +5204,15 @@ impl Services {
         sc: &Arc<dyn intent_sourcecontrol::SourceControl>,
     ) -> Result<pr_ops::PrRefreshOutcome> {
         use pr_ops::PrRefreshOutcome;
+        let source_control_config = self.effective_settings().source_control;
+        let provenance = self
+            .source_control_provenance(
+                ws.pr_url.as_deref(),
+                ws.worktree_path
+                    .as_deref()
+                    .or(ws.repository_path.as_deref()),
+            )
+            .await;
 
         if ws.is_remote || ws.archived {
             return Ok(PrRefreshOutcome::Skipped);
@@ -5098,12 +5220,22 @@ impl Services {
         let Ok(repo_ref) = pr_ops::repo_of(&ws) else {
             return Ok(PrRefreshOutcome::Skipped);
         };
+        if self.ensure_workspace_source_control(&ws).await.is_err() {
+            return Ok(PrRefreshOutcome::Skipped);
+        }
 
         if let Some(number) = ws.pr_number {
             let pr = sc
                 .get_pr(&repo_ref, number)
                 .await
                 .map_err(pr_ops::map_sc_err)?;
+            if !self.source_control_result_matches(
+                &source_control_config,
+                provenance.as_deref(),
+                &pr.url,
+            ) {
+                return Ok(PrRefreshOutcome::Skipped);
+            }
             // Clear a stale link only on a positive mismatch against BOTH
             // the workspace's branch and its baseRef (review workspaces
             // link PRs whose head equals the workspace's `baseRef`, §7.6);
@@ -5114,6 +5246,18 @@ impl Services {
                 ws.pr_status = None;
                 ws.active_pull_request = None;
                 ws.updated_at = now_iso();
+                if !self
+                    .source_control_origin_unchanged(
+                        &source_control_config,
+                        provenance.as_deref(),
+                        ws.worktree_path
+                            .as_deref()
+                            .or(ws.repository_path.as_deref()),
+                    )
+                    .await
+                {
+                    return Ok(PrRefreshOutcome::Skipped);
+                }
                 self.store.update_workspace_pr_linkage(&ws).await?;
                 publish_event(self.event_bus.as_ref(), pr_unlinked_event(&ws.id)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
@@ -5169,6 +5313,13 @@ impl Services {
                     }
                 };
                 if let Some(open_pr) = discovered {
+                    if !self.source_control_result_matches(
+                        &source_control_config,
+                        provenance.as_deref(),
+                        &open_pr.url,
+                    ) {
+                        return Ok(PrRefreshOutcome::Skipped);
+                    }
                     let open_info = pr_ops::build_pr_info(&open_pr);
                     pr_ops::upsert_pr_info(&mut ws.pull_requests, &open_info);
                     ws.pr_number = Some(open_pr.number);
@@ -5176,6 +5327,18 @@ impl Services {
                     ws.pr_status = Some(open_info.status);
                     ws.active_pull_request = Some(open_info);
                     ws.updated_at = now_iso();
+                    if !self
+                        .source_control_origin_unchanged(
+                            &source_control_config,
+                            provenance.as_deref(),
+                            ws.worktree_path
+                                .as_deref()
+                                .or(ws.repository_path.as_deref()),
+                        )
+                        .await
+                    {
+                        return Ok(PrRefreshOutcome::Skipped);
+                    }
                     self.store.update_workspace_pr_linkage(&ws).await?;
                     publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
@@ -5191,6 +5354,18 @@ impl Services {
                 ws.pr_url = Some(pr.url.clone());
                 ws.active_pull_request = Some(info);
                 ws.updated_at = now_iso();
+                if !self
+                    .source_control_origin_unchanged(
+                        &source_control_config,
+                        provenance.as_deref(),
+                        ws.worktree_path
+                            .as_deref()
+                            .or(ws.repository_path.as_deref()),
+                    )
+                    .await
+                {
+                    return Ok(PrRefreshOutcome::Skipped);
+                }
                 self.store.update_workspace_pr_linkage(&ws).await?;
                 publish_event(self.event_bus.as_ref(), pr_updated_event(&ws)).await;
                 self.maybe_emit_display_status_changed(&ws.id).await;
@@ -5223,6 +5398,13 @@ impl Services {
             .map_err(pr_ops::map_sc_err)?;
             match found {
                 Some(pr) => {
+                    if !self.source_control_result_matches(
+                        &source_control_config,
+                        provenance.as_deref(),
+                        &pr.url,
+                    ) {
+                        return Ok(PrRefreshOutcome::Skipped);
+                    }
                     let info = pr_ops::build_pr_info(&pr);
                     pr_ops::upsert_pr_info(&mut ws.pull_requests, &info);
                     ws.pr_number = Some(pr.number);
@@ -5230,6 +5412,18 @@ impl Services {
                     ws.pr_status = Some(info.status);
                     ws.active_pull_request = Some(info);
                     ws.updated_at = now_iso();
+                    if !self
+                        .source_control_origin_unchanged(
+                            &source_control_config,
+                            provenance.as_deref(),
+                            ws.worktree_path
+                                .as_deref()
+                                .or(ws.repository_path.as_deref()),
+                        )
+                        .await
+                    {
+                        return Ok(PrRefreshOutcome::Skipped);
+                    }
                     self.store.update_workspace_pr_linkage(&ws).await?;
                     publish_event(self.event_bus.as_ref(), pr_linked_event(&ws)).await;
                     self.maybe_emit_display_status_changed(&ws.id).await;
@@ -5275,7 +5469,12 @@ impl Services {
             .await?;
         for mut ws in workspaces {
             let mut changed = pr_ops::upsert_pr_info_by_url(&mut ws.pull_requests, &info);
-            let linked = ws.pr_number == Some(pr.number) && ws.repo().as_ref() == Some(repo_ref);
+            let linked = ws.pr_number == Some(pr.number)
+                && ws.repo().as_ref() == Some(repo_ref)
+                && ws
+                    .pr_url
+                    .as_deref()
+                    .is_none_or(|url| pr_ops::same_pr_url(url, &pr.url));
             if linked
                 && (ws.pr_status != Some(info.status)
                     || ws.active_pull_request.as_ref() != Some(&info)
@@ -5314,8 +5513,12 @@ impl Services {
             {
                 changed |= pr_ops::upsert_pr_info_by_url(&mut root.pull_requests, &info);
             }
-            let linked =
-                root.pr_number == Some(pr.number) && root.repo().as_ref() == Some(repo_ref);
+            let linked = root.pr_number == Some(pr.number)
+                && root.repo().as_ref() == Some(repo_ref)
+                && root
+                    .pr_url
+                    .as_deref()
+                    .is_none_or(|url| pr_ops::same_pr_url(url, &pr.url));
             if linked
                 && (root.pr_status != Some(info.status)
                     || root.pr_url.as_deref() != Some(pr.url.as_str()))
@@ -5394,19 +5597,28 @@ impl Services {
         // An unavailable provider (no credentials / gh setup) skips only the
         // forge-touching work; the git-root sweep's local steps (submodule
         // auto-detect, prune, commit-sha backfill) still run below.
-        let sc = match pr_ops::resolve_source_control(self.source_control.clone()).await {
-            Ok(sc) => Some(sc),
-            Err(e) => {
-                tracing::warn!(error = %e, "pr refresh: source control unavailable, skipping PR refresh");
-                None
-            }
-        };
-        // A paused tick spends its one free quota probe here: the pause
-        // lifts early once the quota has recovered (monorepo#2961).
-        if let Some(sc) = sc.as_ref() {
-            self.maybe_lift_rate_limit_pause(sc).await;
-        }
+        let mut clients: HashMap<
+            String,
+            (Self, Option<Arc<dyn intent_sourcecontrol::SourceControl>>),
+        > = HashMap::new();
         for ws in workspaces {
+            let connection = self.workspace_source_control_connection(&ws).await.ok();
+            let (scoped, sc) = if let Some(id) = connection {
+                if !clients.contains_key(&id) {
+                    let scoped = self.with_source_control_scope(&id);
+                    let client = scoped.resolve_source_control_connection(&id).await.ok();
+                    if let Some(client) = client.as_ref() {
+                        scoped.maybe_lift_rate_limit_pause(client).await;
+                    }
+                    clients.insert(id.clone(), (scoped, client));
+                }
+                clients
+                    .get(&id)
+                    .cloned()
+                    .expect("connection inserted above")
+            } else {
+                (self.clone(), None)
+            };
             // STAB-3 fix: refresh all workspaces (discovery + update), not just
             // those already linked. `refresh_workspace_pr_with_sc` skips
             // ineligible workspaces internally.
@@ -5420,10 +5632,10 @@ impl Services {
             // sweep) so a limit hit mid-sweep stops the remaining forge
             // calls immediately instead of burning them into the exhausted
             // quota (monorepo#2961).
-            if let Some(sc) = sc.as_ref().filter(|_| !self.sweeps_rate_limited()) {
+            if let Some(sc) = sc.as_ref().filter(|_| !scoped.sweeps_rate_limited()) {
                 let refreshed = match tokio::time::timeout(
                     self.pr_refresh_fetch_timeout,
-                    self.refresh_workspace_pr_with_sc(ws.clone(), sc),
+                    scoped.refresh_workspace_pr_with_sc(ws.clone(), sc),
                 )
                 .await
                 {
@@ -5435,7 +5647,7 @@ impl Services {
                 };
                 match refreshed {
                     Err(Error::RateLimited(detail)) => {
-                        self.pause_sweeps_for_rate_limit(sc, &detail).await;
+                        scoped.pause_sweeps_for_rate_limit(sc, &detail).await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -5450,7 +5662,7 @@ impl Services {
             // After the workspace's own refresh, sweep its tracked git roots
             // (submodule auto-detect, auto-prune, per-root PR refresh;
             // monorepo#2053). Fail-soft internally, per-root timeouts inside.
-            self.sweep_workspace_git_roots(&ws, sc.as_ref()).await;
+            scoped.sweep_workspace_git_roots(&ws, sc.as_ref()).await;
             // Release the SQLite pool slot between workspaces so queued
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
@@ -10363,7 +10575,14 @@ async fn sibling_workspace_or_throw(
         }
         Err(e) => return Err(e),
     };
-    if !workspaces_share_repository(&current, &target) {
+    let origin_current = current.clone();
+    let origin_target = target.clone();
+    let share_repository = tokio::task::spawn_blocking(move || {
+        workspaces_share_repository_on_host(&origin_current, &origin_target)
+    })
+    .await
+    .map_err(|error| Error::Internal(format!("repository origin probe failed: {error}")))?;
+    if !share_repository {
         return Err(Error::Internal(
             "Access denied: Can only access workspaces in the same repository".to_string(),
         ));
@@ -10416,6 +10635,37 @@ fn workspaces_share_repository(a: &Workspace, b: &Workspace) -> bool {
         (nonempty_repository_path(a), nonempty_repository_path(b)),
         (Some(pa), Some(pb)) if pa == pb
     )
+}
+
+/// Cross-workspace note access is on-demand. Probe origins on the blocking
+/// pool (at its callers) only after the cheap slug/path candidate check, so
+/// GitLab and GitHub projects sharing a slug cannot read each other's notes.
+fn workspaces_share_repository_on_host(a: &Workspace, b: &Workspace) -> bool {
+    if !workspaces_share_repository(a, b) {
+        return false;
+    }
+    if matches!((nonempty_repository_path(a), nonempty_repository_path(b)), (Some(left), Some(right)) if left == right)
+    {
+        return true;
+    }
+    let origin = |ws: &Workspace| {
+        ws.worktree_path
+            .as_deref()
+            .or(ws.repository_path.as_deref())
+            .and_then(|path| {
+                intent_git::remote::origin_url(std::path::Path::new(path))
+                    .ok()
+                    .flatten()
+            })
+            .or_else(|| ws.pr_url.clone())
+            .and_then(|url| GitRemoteUrl::parse(&url))
+    };
+    match (origin(a), origin(b)) {
+        (Some(left), Some(right)) => source_control_ops::same_repository_remote(&left, &right),
+        // Pre-existing identity-only GitHub rows have no origin to probe.
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Prefix each line with a right-aligned 1-based line number (`"   1 | text"`),
@@ -13554,81 +13804,30 @@ async fn git_fetch_bounded(
     worktree: &std::path::Path,
     remote: &str,
     branch: &str,
-    token: Option<&str>,
+    token: Option<&intent_git::auth::GitCredential>,
 ) -> Result<()> {
     let worktree = worktree.to_path_buf();
     let remote = remote.to_string();
     let branch = branch.to_string();
-    let token = token.map(str::to_owned);
+    let token = token.cloned();
     tokio::task::spawn_blocking(move || {
-        intent_git::fetch::fetch(&worktree, &remote, &branch, token.as_deref())
+        intent_git::fetch::fetch(&worktree, &remote, &branch, token.as_ref())
     })
     .await
     .map_err(|e| Error::Internal(format!("git.fetch task failed: {e}")))?
 }
 
-/// The [`intent_sourcecontrol::TokenSource`] to use for git-credential token
-/// resolution: the effective `sourceControl.github.tokenSource`, deserialized
-/// via the `TokenSource` serde derive (kebab-case, same wire spelling as the
-/// settings enum) so the mapping can never drift. Defaults to the full `Auto`
-/// chain (secrets store → env → `gh`) so a device-flow token in the secrets
-/// store is picked up without configuration.
-fn github_token_source(registry: Option<&SettingsRegistry>) -> intent_sourcecontrol::TokenSource {
-    use intent_sourcecontrol::TokenSource;
-    registry
-        .and_then(|r| r.snapshot().get("sourceControl.github.tokenSource"))
-        .and_then(|v| serde_json::from_value::<TokenSource>(v).ok())
-        .unwrap_or(TokenSource::Auto)
-}
-
-/// Resolve the GitHub token to offer the git credential chain for network
-/// operations against `worktree`'s `origin`: `Some` only when `origin` is an
-/// HTTPS `github.com` remote (the only shape the token step applies to — see
-/// `intent_git::auth`) and a token resolves per [`github_token_source`]. The
-/// gate avoids the bounded secrets-store / `gh` lookups entirely for SSH and
-/// non-GitHub remotes. The token value is never logged.
-async fn github_git_token(
-    registry: Option<&SettingsRegistry>,
+/// Resolve a credential using this checkout's origin, without a global forge selection.
+async fn repository_git_credential(
+    services: &Services,
     worktree: &std::path::Path,
-) -> Option<String> {
-    let origin = intent_git::remote::origin_url(worktree).ok().flatten()?;
-    github_git_token_for_url(registry, &origin).await
-}
-
-/// URL-parameterised sibling of [`github_git_token`] for callers that have no
-/// local checkout yet (the `git.clone` / `workspace.create` clone
-/// orchestration, monorepo#825): `Some` only when `url` is an HTTPS
-/// `github.com` remote and a token resolves per [`github_token_source`]. The
-/// token value is never logged.
-async fn github_git_token_for_url(
-    registry: Option<&SettingsRegistry>,
-    url: &str,
-) -> Option<String> {
-    if !intent_git::auth::is_https_github_url(url) {
-        return None;
-    }
-    intent_sourcecontrol::token::resolve(&github_token_source(registry)).await
-}
-
-/// Resolve the daemon-managed GitHub credential for the `system.gitCredential`
-/// UDS RPC backing the `intentd git-credential` helper (monorepo#884):
-/// `Some((username, password))` only when the
-/// `sourceControl.github.exposeGitCredentialToChildren` gate is on and a
-/// usable token resolves per [`github_token_source`] (see
-/// [`intent_git::auth::usable_token`] — control characters would corrupt the
-/// line-oriented git-credential protocol). The token value is never logged.
-pub async fn github_git_credential(
-    registry: Option<&SettingsRegistry>,
-) -> Option<(String, String)> {
-    if !terminal_ops::expose_git_credential(registry) {
-        return None;
-    }
-    let token = intent_sourcecontrol::token::resolve(&github_token_source(registry)).await;
-    let token = intent_git::auth::usable_token(token.as_deref())?;
-    Some((
-        intent_git::auth::TOKEN_USERNAME.to_string(),
-        token.to_string(),
-    ))
+) -> Option<intent_git::auth::GitCredential> {
+    let path = worktree.to_path_buf();
+    let origin = tokio::task::spawn_blocking(move || intent_git::remote::origin_url(&path))
+        .await
+        .ok()?
+        .ok()??;
+    services.git_credential_for_url(&origin).await
 }
 
 /// The running daemon's own binary path, for spawn sites that configure the
@@ -13652,62 +13851,6 @@ pub(crate) fn daemon_exe_path() -> Option<String> {
         Err(e) => {
             tracing::debug!("current_exe unresolved; spawning without git credential helper: {e}");
             None
-        }
-    }
-}
-
-#[cfg(test)]
-mod github_token_source_tests {
-    use super::*;
-    use intent_sourcecontrol::TokenSource;
-
-    /// A registry backed by a fresh temp config dir; the returned guard keeps
-    /// the dir alive for the test and removes it on drop. Set
-    /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
-    fn registry_with(value: Option<&str>) -> (Arc<SettingsRegistry>, tempfile::TempDir) {
-        let mut dir = tempfile::tempdir().expect("temp config dir");
-        if std::env::var_os("INTENTD_TEST_KEEP_TMP").is_some_and(|v| !v.is_empty()) {
-            dir.disable_cleanup(true);
-        }
-        let registry =
-            SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry");
-        if let Some(v) = value {
-            registry
-                .apply(&[(
-                    "sourceControl.github.tokenSource".to_string(),
-                    serde_json::json!(v),
-                )])
-                .expect("apply tokenSource");
-        }
-        (Arc::new(registry), dir)
-    }
-
-    /// No registry and the schema default both resolve to the full `Auto`
-    /// chain, so a device-flow token in the secrets store is found without
-    /// configuration.
-    #[test]
-    fn defaults_to_auto() {
-        assert_eq!(github_token_source(None), TokenSource::Auto);
-        let (registry, _dir) = registry_with(None);
-        assert_eq!(github_token_source(Some(&registry)), TokenSource::Auto);
-    }
-
-    /// Each configured wire value maps to its `TokenSource` variant via the
-    /// serde derive — the settings enum and the resolver can't drift.
-    #[test]
-    fn configured_values_map_via_serde() {
-        for (wire, expected) in [
-            ("auto", TokenSource::Auto),
-            ("env", TokenSource::Env),
-            ("gh-cli", TokenSource::GhCli),
-            ("explicit", TokenSource::Explicit),
-        ] {
-            let (registry, _dir) = registry_with(Some(wire));
-            assert_eq!(
-                github_token_source(Some(&registry)),
-                expected,
-                "wire value {wire:?}"
-            );
         }
     }
 }
@@ -15909,6 +16052,43 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn source_control_scoped(
+        &self,
+        target: serde_json::Value,
+    ) -> BoxFuture<'_, Result<Arc<dyn WorkspaceApi>>> {
+        Box::pin(async move { self.scoped_source_control(target).await })
+    }
+    fn source_control_connections_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.list_source_control_connections().await })
+    }
+    fn source_control_connections_configure(
+        &self,
+        input: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.configure_source_control_connection(input).await })
+    }
+    fn source_control_connections_disconnect(
+        &self,
+        connection_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.disconnect_source_control_connection(&connection_id)
+                .await
+        })
+    }
+    fn source_control_auth_status(
+        &self,
+        connection_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.source_control_connection_status(&connection_id).await })
+    }
+    fn source_control_resolve(
+        &self,
+        target: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move { self.resolve_source_control_target(target).await })
+    }
+
     fn settings_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             // Daemon settings are host state: administrator-only in the matrix.
@@ -15943,6 +16123,7 @@ impl WorkspaceApi for Services {
                 Registry,
             }
             Self::require_administrator("settings.update")?;
+            let source_control_before = self.effective_settings().source_control;
             let _revision_guard = self.settings_revision_gate.write().await;
             // A default-provider switch re-resolves `model.default` for the
             // new provider (monorepo#3177). Appended BEFORE the old-value
@@ -16205,6 +16386,7 @@ impl WorkspaceApi for Services {
                         return Err(e);
                     }
                 }
+                self.invalidate_source_control_settings_change(&source_control_before, &applied);
                 let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
                 publish_event(
                     self.event_bus.as_ref(),
@@ -16223,9 +16405,14 @@ impl WorkspaceApi for Services {
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             Self::require_administrator("settings.reset")?;
+            let source_control_before = self.effective_settings().source_control;
             let _revision_guard = self.settings_revision_gate.write().await;
             let (result, changed) = self.settings_service().reset_with_change(&path).await?;
             let revision = if changed {
+                self.invalidate_source_control_settings_change(
+                    &source_control_before,
+                    std::slice::from_ref(&result),
+                );
                 let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
                 publish_event(
                     self.event_bus.as_ref(),
@@ -17800,9 +17987,22 @@ impl WorkspaceApi for Services {
             }
             let mut all = store.list_workspaces(true).await?;
             self.retain_member_workspaces(&mut all).await?;
-            let siblings: Vec<serde_json::Value> = all
+            let candidates = all
                 .into_iter()
-                .filter(|w| w.id != workspace_id && workspaces_share_repository(&current, w))
+                .filter(|workspace| {
+                    workspace.id != workspace_id && workspaces_share_repository(&current, workspace)
+                })
+                .collect::<Vec<_>>();
+            let candidates = tokio::task::spawn_blocking(move || {
+                candidates
+                    .into_iter()
+                    .filter(|workspace| workspaces_share_repository_on_host(&current, workspace))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|error| Error::Internal(format!("repository origin probe failed: {error}")))?;
+            let siblings: Vec<serde_json::Value> = candidates
+                .into_iter()
                 .map(|w| {
                     serde_json::json!({
                         "id": w.id,
@@ -18315,6 +18515,7 @@ impl WorkspaceApi for Services {
                     // `contextLinks` (see `preflight_workspace_create`). The
                     // remaining `initialAgent` checks are the agent-create
                     // plan right below, still ahead of the first side effect.
+                    services.normalize_workspace_source_url(&mut input);
                     Services::preflight_workspace_create(&input)?;
                     // Caller-supplied paths may carry a leading `~` (the FE
                     // onboarding default is `~/Developer`); expand to `$HOME`
@@ -18622,10 +18823,7 @@ impl WorkspaceApi for Services {
                                         .await;
                                     }
                                 }
-                                let token = github_git_token_for_url(
-                                    services.settings_registry.as_deref(),
-                                    url,
-                                )
+                                let token = services.git_credential_for_url(url)
                                 .await;
                                 let cache_root =
                                     intent_git::repo_cache::cache_root_for(&workspaces_root);
@@ -18649,7 +18847,7 @@ impl WorkspaceApi for Services {
                                         url,
                                         &owner,
                                         &name,
-                                        token.as_deref(),
+                                        token.as_ref(),
                                         ensure_progress,
                                     )
                                     .await;
@@ -18753,7 +18951,7 @@ impl WorkspaceApi for Services {
                                 if let Some(RepoRef {
                                     owner: gh_owner,
                                     name: gh_name,
-                                }) = GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
+                                }) = services.configured_repo_from_url(url)
                                 {
                                     if input.repository_owner.is_none() {
                                         input.repository_owner = Some(gh_owner);
@@ -18812,10 +19010,7 @@ impl WorkspaceApi for Services {
                             // non-GitHub URLs skip resolution entirely; the
                             // value travels to the child via the environment
                             // only and is never logged.
-                            let token = github_git_token_for_url(
-                                services.settings_registry.as_deref(),
-                                url,
-                            )
+                            let token = services.git_credential_for_url(url)
                             .await;
                             // Clone failures surface as a typed error carrying
                             // the sanitized stderr tail so clients can show the
@@ -18850,7 +19045,7 @@ impl WorkspaceApi for Services {
                             // are trusted as GitHub identity by the
                             // `crossWorkspace.*` sibling predicate.
                             if let Some(RepoRef { owner, name }) =
-                                GitRemoteUrl::parse(url).and_then(|u| u.github_repo())
+                                services.configured_repo_from_url(url)
                             {
                                 if input.repository_owner.is_none() {
                                     input.repository_owner = Some(owner);
@@ -18927,7 +19122,7 @@ impl WorkspaceApi for Services {
                         intent_git::remote::origin_url(&repo_path)
                             .ok()
                             .flatten()
-                            .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                            .and_then(|url| services.configured_repo_from_url(&url))
                     } else {
                         None
                     };
@@ -18988,7 +19183,18 @@ impl WorkspaceApi for Services {
                     // other part held to the link's own) so a missing part
                     // never counts as a mismatch.
                     let pr_link = pr_link.filter(|link| {
+                        if services.source_control.is_none() && !services.source_control_url_matches(&link.url) { return false; }
                         let link_ref = intent_sourcecontrol::RepoRef::new(&link.owner, &link.repo);
+                        if services.source_control.is_none() {
+                            let settings = services.effective_settings().source_control;
+                            let Some((link_connection, actual_repo)) = source_control_ops::connection_for_url(&settings, &link.url) else { return false; };
+                            if actual_repo != link_ref { return false; }
+                            let origin = input.repository_path.as_deref().and_then(|path| intent_git::remote::origin_url(std::path::Path::new(path)).ok().flatten());
+                            if let Some(repository_url) = origin.as_deref().or(input.github_url.as_deref()) {
+                                let Some((repository_connection, repository)) = source_control_ops::connection_for_url(&settings, repository_url) else { return false; };
+                                if repository_connection != link_connection || repository != actual_repo { return false; }
+                            }
+                        }
                         let owner_mismatch = input.repository_owner.as_deref().is_some_and(|o| {
                             !o.is_empty() && intent_sourcecontrol::RepoRef::new(o, &link.repo) != link_ref
                         });
@@ -19024,7 +19230,7 @@ impl WorkspaceApi for Services {
                     let mut linked_pr: Option<intent_sourcecontrol::PullRequest> = None;
                     let mut pr_derived_branch = false;
                     if let Some(link) = pr_link.as_ref() {
-                        match pr_ops::resolve_source_control(services.source_control.clone())
+                        match services.resolve_source_control_for_url(&link.url)
                             .await
                         {
                             Ok(sc) => {
@@ -25892,7 +26098,7 @@ impl WorkspaceApi for Services {
                     .ok()
                     .and_then(std::result::Result::ok)
                     .flatten()
-                    .and_then(|url| GitRemoteUrl::parse(&url)?.github_repo())
+                    .and_then(|url| svc.configured_repo_from_url(&url))
                     .map_or((None, None), |r| (Some(r.owner), Some(r.name)));
             // Stamp the root's HEAD at registration time (fail-soft:
             // unreadable HEAD ⇒ NULL; the store merge never overwrites an
@@ -26253,7 +26459,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
-        let registry = self.settings_registry.clone();
+        let credential_services = self.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
@@ -26267,7 +26473,7 @@ impl WorkspaceApi for Services {
             // Resolve the GitHub token outside the lock (bounded async lookups)
             // so the credential chain can fall back to it for HTTPS github.com
             // remotes (see `intent_git::auth`).
-            let token = github_git_token(registry.as_deref(), &worktree).await;
+            let token = repository_git_credential(&credential_services, &worktree).await;
             // Resolve the currently-checked-out branch (FE parity — `git push`
             // with no args pushes HEAD's upstream, which for our worktrees is
             // the current branch on `origin`). Resolve inside the lock so a
@@ -26291,7 +26497,7 @@ impl WorkspaceApi for Services {
                         "origin",
                         &branch,
                         force,
-                        token.as_deref(),
+                        token.as_ref(),
                     )?;
                     // The remote-tracking ref advanced → the cached scan's
                     // ahead/behind is stale (monorepo#1648).
@@ -26320,7 +26526,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let locks = self.worktree_locks.clone();
-        let registry = self.settings_registry.clone();
+        let credential_services = self.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
@@ -26333,7 +26539,7 @@ impl WorkspaceApi for Services {
             })?;
             // Token resolved outside the lock — see the matching note on
             // `git_push` above.
-            let token = github_git_token(registry.as_deref(), &worktree).await;
+            let token = repository_git_credential(&credential_services, &worktree).await;
             // Resolve HEAD's branch inside the lock so a concurrent
             // checkout/rename cannot change it between the read and the fetch.
             // The status snapshot is taken inside the lock too, so the
@@ -26350,7 +26556,7 @@ impl WorkspaceApi for Services {
                                     .to_string(),
                             )
                         })?;
-                    intent_git::fetch::fetch(&worktree, "origin", &branch, token.as_deref())?;
+                    intent_git::fetch::fetch(&worktree, "origin", &branch, token.as_ref())?;
                     // Remote-tracking refs moved → cached ahead/behind is
                     // stale (monorepo#1648).
                     status_cache.invalidate(&worktree);
@@ -26596,7 +26802,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<intent_core::GitPullResult>> {
         let store = self.store.clone();
         let event_bus = self.event_bus.clone();
-        let registry = self.settings_registry.clone();
+        let credential_services = self.clone();
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             // Path-based like `git_get_branches`: the workspace-create auto-pull
@@ -26619,9 +26825,10 @@ impl WorkspaceApi for Services {
             let pull_path = std::path::PathBuf::from(&repo_path);
             let pull_branch = branch_name.clone();
             let token =
-                github_git_token(registry.as_deref(), std::path::Path::new(&repo_path)).await;
+                repository_git_credential(&credential_services, std::path::Path::new(&repo_path))
+                    .await;
             let outcome = git_pull_bounded(
-                move || intent_git::pull::pull_branch(&pull_path, &pull_branch, token.as_deref()),
+                move || intent_git::pull::pull_branch(&pull_path, &pull_branch, token.as_ref()),
                 GIT_PULL_TIMEOUT,
             )
             .await?;
@@ -26667,7 +26874,7 @@ impl WorkspaceApi for Services {
         request_id: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let bus = self.event_bus.clone();
-        let registry = self.settings_registry.clone();
+        let credential_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("git.clone")?;
             if url.trim().is_empty() {
@@ -26697,7 +26904,7 @@ impl WorkspaceApi for Services {
             let spawn_request_id = request_id.clone();
             let spawn_target = target.clone();
             intent_core::spawn_daemon(async move {
-                let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                let token = credential_services.git_credential_for_url(&url).await;
                 clone_ops::spawn_clone(clone_ops::CloneJob {
                     request_id: spawn_request_id,
                     workspace_id: None,
@@ -26768,7 +26975,7 @@ impl WorkspaceApi for Services {
     }
 
     fn repo_warm_cache(&self, github_url: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let registry = self.settings_registry.clone();
+        let credential_services = self.clone();
         let warm_in_flight = self.warm_in_flight.clone();
         let workspaces_root = self.workspaces_root.clone();
         let worktrees_location = settings::worktrees_location(&self.effective_settings());
@@ -26851,13 +27058,13 @@ impl WorkspaceApi for Services {
             let task_repo = repo.clone();
             intent_core::spawn_daemon(async move {
                 let _clear_on_drop = clear_on_drop;
-                let token = github_git_token_for_url(registry.as_deref(), &url).await;
+                let token = credential_services.git_credential_for_url(&url).await;
                 let result = intent_git::repo_cache::ensure_cached_repo(
                     &cache_root,
                     &url,
                     &task_owner,
                     &task_repo,
-                    token.as_deref(),
+                    token.as_ref(),
                 )
                 .await;
                 match result {
@@ -29232,13 +29439,18 @@ impl WorkspaceApi for Services {
 
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            source_control_services
+                .ensure_workspace_source_control(&ws)
+                .await?;
             let repo_ref = pr_ops::repo_of(&ws)?;
             let number = pr_ops::active_pr_number(&ws)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services
+                .resolve_workspace_source_control(&ws)
+                .await?;
             let pr = sc
                 .get_pr(&repo_ref, number)
                 .await
@@ -29293,11 +29505,14 @@ impl WorkspaceApi for Services {
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         let this = self.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             let ws = load_ws_for_pr(&store, &workspace_id).await?;
+            source_control_services
+                .ensure_workspace_source_control(&ws)
+                .await?;
             // Cross-repo override (`{ repo: "owner/name" }`) wins over the
             // workspace repo; either way the resolved repo is echoed in the
             // result so a wrong-repo read is detectable.
@@ -29309,7 +29524,9 @@ impl WorkspaceApi for Services {
                 None => pr_ops::repo_of(&ws)?,
             };
             let repo_slug = format!("{}/{}", repo_ref.owner, repo_ref.name);
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services
+                .resolve_workspace_source_control(&ws)
+                .await?;
             let pr = sc.get_pr(&repo_ref, pr_number).await.map_err(|e| match e {
                 intent_sourcecontrol::Error::NotFound(_) => {
                     Error::Internal(format!("PR #{pr_number} not found in {repo_slug}"))
@@ -29407,7 +29624,14 @@ impl WorkspaceApi for Services {
             // AFTER the awaited forge reads so the snapshot describes the
             // gate as of its completion: a pause opened or lifted while the
             // reads were in flight is neither omitted nor retained stale.
-            if let Some(until) = this.sweep_rate_limit_paused_until() {
+            let pause_scope = if this.source_control.is_some() {
+                this.clone()
+            } else {
+                this.with_source_control_scope(
+                    &this.workspace_source_control_connection(&ws).await?,
+                )
+            };
+            if let Some(until) = pause_scope.sweep_rate_limit_paused_until() {
                 snapshot["pausedUntil"] = serde_json::json!(until);
             }
             Ok(snapshot)
@@ -29432,10 +29656,10 @@ impl WorkspaceApi for Services {
         base: String,
         draft: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.pullsCreate")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             // `head` is forwarded VERBATIM (no `owner:branch` login prefix) —
             // the engine sends `input.source_branch` as the raw `head`,
@@ -29463,10 +29687,10 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.pullsGet")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let pr = sc
                 .get_pr(&repo_ref, number)
@@ -29497,13 +29721,13 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.pullsList")?;
             let state = github_ops::parse_pr_state(state.as_deref())?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_prs(
@@ -29541,7 +29765,7 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.pullsSearch")?;
             let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
@@ -29560,7 +29784,7 @@ impl WorkspaceApi for Services {
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let page = sc
                 .list_prs(
                     &repo_ref,
@@ -29602,11 +29826,11 @@ impl WorkspaceApi for Services {
         commit_title: Option<String>,
         commit_message: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.pullsMerge")?;
             let method = pr_ops::validate_merge_method(merge_method.as_deref())?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let outcome = sc
                 .merge_pr(
@@ -29642,12 +29866,12 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.reposList")?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let page = sc
                 .list_repos(intent_sourcecontrol::PageParams { limit, cursor })
                 .await
@@ -29666,13 +29890,13 @@ impl WorkspaceApi for Services {
         number: u64,
         expected_head_sha: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.pullsUpdateBranch")?;
             // `expectedHeadSha` is accepted for FE shape parity; the engine
             // `update_branch` does not take a race guard, so it is unused.
             let _ = expected_head_sha;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             sc.update_branch(&repo_ref, number)
                 .await
@@ -29690,12 +29914,12 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.reposSearch")?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let page = sc
                 .search_repos(&query, intent_sourcecontrol::PageParams { limit, cursor })
                 .await
@@ -29713,10 +29937,10 @@ impl WorkspaceApi for Services {
         repo: String,
         number: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.issuesGet")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let issue = sc
                 .get_issue(&repo_ref, number)
@@ -29737,13 +29961,13 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.issuesList")?;
             let state = github_ops::parse_issue_state(state.as_deref())?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_issues(
@@ -29782,7 +30006,7 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.issuesSearch")?;
             // Validate `filter` against the issues value set from PROTOCOL §5
@@ -29802,7 +30026,7 @@ impl WorkspaceApi for Services {
             let cursor = github_ops::decode_next_token(next_token.as_deref());
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let extra_repos = github_ops::normalize_extra_repos(&repo_ref, repos)?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let page = sc
                 .list_issues(
                     &repo_ref,
@@ -29841,12 +30065,12 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.listReviewComments")?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .list_review_comments(
@@ -29876,10 +30100,10 @@ impl WorkspaceApi for Services {
         comment_id: u64,
         body: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.replyReviewComment")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let rc = sc
                 .reply_to_review_comment(&repo_ref, number, comment_id, &body)
@@ -29897,12 +30121,12 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.getReviewThreads")?;
             let limit = github_ops::clamp_limit(limit);
             let cursor = github_ops::decode_next_token(next_token.as_deref());
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner, repo);
             let page = sc
                 .get_review_threads(
@@ -29925,10 +30149,10 @@ impl WorkspaceApi for Services {
     }
 
     fn github_resolve_thread(&self, thread_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.resolveThread")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let is_resolved = sc
                 .resolve_thread(&thread_id)
                 .await
@@ -29941,10 +30165,10 @@ impl WorkspaceApi for Services {
         &self,
         thread_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.unresolveThread")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let is_resolved = sc
                 .unresolve_thread(&thread_id)
                 .await
@@ -29958,10 +30182,10 @@ impl WorkspaceApi for Services {
         owner: String,
         repo: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.reposGet")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             match sc.get_repo(&owner, &repo).await {
                 Ok(r) => Ok(serde_json::json!({ "repo": github_browse_ops::repo_to_wire(&r) })),
                 // FE `getGitHubRepo` returns `GithubRepo | null`; a missing repo
@@ -29982,7 +30206,7 @@ impl WorkspaceApi for Services {
         limit: Option<i64>,
         next_token: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.branchesList")?;
             let limit = github_ops::clamp_limit(limit);
@@ -29992,7 +30216,7 @@ impl WorkspaceApi for Services {
             let prefix = prefix
                 .map(|p| p.trim().to_string())
                 .filter(|p| !p.is_empty());
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let page = sc
                 .list_remote_branches(
                     &owner,
@@ -30022,14 +30246,32 @@ impl WorkspaceApi for Services {
             .configured_worktrees_location()
             .or_else(|| self.workspaces_root.clone())
             .unwrap_or_else(default_workspaces_root);
-        let registry = self.settings_registry.clone();
-        let ls_remote_base = self.branches_ls_remote_base.clone();
+        let credential_services = self.clone();
+        let ls_remote_base = self.branches_ls_remote_base.clone().unwrap_or_else(|| {
+            self.source_control_connection
+                .clone()
+                .unwrap_or_else(|| "https://github.com".into())
+        });
         Box::pin(async move {
             Self::require_administrator("github.branchesListCached")?;
             let cache_root = intent_git::repo_cache::cache_root_for(&cache_parent);
-            if let Some(cached) =
-                intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await?
+            let url = format!("{ls_remote_base}/{owner}/{repo}.git");
+            let cached = if credential_services
+                .source_control_connection
+                .as_deref()
+                .is_none_or(|id| id == "https://github.com")
             {
+                intent_git::repo_cache::list_cached_branches(&cache_root, &owner, &repo).await?
+            } else {
+                intent_git::repo_cache::list_cached_branches_for_url(
+                    &cache_root,
+                    &owner,
+                    &repo,
+                    &url,
+                )
+                .await?
+            };
+            if let Some(cached) = cached {
                 let mut result = serde_json::json!({
                     "cached": true,
                     "source": "cache",
@@ -30048,10 +30290,9 @@ impl WorkspaceApi for Services {
                 // pipeline. Any failure (offline, missing repo, no access)
                 // folds to the pre-fallback `{ cached: false, branches: [] }`
                 // — this method never errors for the FE seam.
-                let base = ls_remote_base.as_deref().unwrap_or("https://github.com");
-                let url = format!("{base}/{owner}/{repo}.git");
-                let token = github_git_token_for_url(registry.as_deref(), &url).await;
-                match intent_git::ls_remote::ls_remote_branches(&url, token.as_deref()).await {
+
+                let token = credential_services.git_credential_for_url(&url).await;
+                match intent_git::ls_remote::ls_remote_branches(&url, token.as_ref()).await {
                     Ok(remote) => {
                         let mut result = serde_json::json!({
                             "cached": false,
@@ -30085,10 +30326,10 @@ impl WorkspaceApi for Services {
         repo: String,
         git_ref: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.repoConfigGet")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
             let source = format!(
                 "{}/{}@{}",
@@ -30139,10 +30380,10 @@ impl WorkspaceApi for Services {
         repo: String,
         git_ref: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.relatedReposList")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let repo_ref = intent_sourcecontrol::RepoRef::new(owner.clone(), repo.clone());
             // Missing `.gitmodules` → { repos: [] }. A mis-shaped contents
             // payload (directory, non-base64/non-UTF-8 content) folds the
@@ -30167,7 +30408,26 @@ impl WorkspaceApi for Services {
                 Err(e) => return Err(pr_ops::map_sc_err(e)),
             };
             let repos = content
-                .map(|text| github_browse_ops::related_repos_from_gitmodules(&text, &repo_ref))
+                .map(|text| {
+                    github_browse_ops::related_repos_from_gitmodules_with(&text, &repo_ref, |url| {
+                        if source_control_services
+                            .source_control_connection
+                            .as_deref()
+                            .is_none_or(|id| id == "https://github.com")
+                        {
+                            return github_browse_ops::github_repo_from_gitmodules_url(url);
+                        }
+                        let (id, repo) = source_control_ops::connection_for_url(
+                            &source_control_services.effective_settings().source_control,
+                            url,
+                        )?;
+                        (id == source_control_services
+                            .source_control_connection
+                            .as_deref()
+                            .unwrap_or("https://github.com"))
+                        .then_some(repo)
+                    })
+                })
                 .unwrap_or_default();
             Ok(serde_json::json!({
                 "repos": github_browse_ops::related_repos_to_wire(&repos),
@@ -30176,21 +30436,19 @@ impl WorkspaceApi for Services {
     }
 
     fn github_auth_status(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         let state = self.github_auth_flow.clone();
         Box::pin(async move {
             Self::require_administrator("github.authStatus")?;
             // A missing/invalid token is the graceful "not configured" state,
             // NOT an error: report `isConfigured: false` instead of throwing.
-            let is_configured = match pr_ops::resolve_source_control(injected).await {
+            let is_configured = match source_control_services.resolve_source_control().await {
                 Ok(sc) => sc.check_auth().await.is_ok_and(|s| s.authenticated),
                 Err(_) => false,
             };
             let slot = state.lock().await;
-            Ok(github_auth_ops::auth_status_to_wire(
-                is_configured,
-                slot.as_ref(),
-            ))
+            let flow = slot.as_ref();
+            Ok(github_auth_ops::auth_status_to_wire(is_configured, flow))
         })
     }
 
@@ -30198,6 +30456,7 @@ impl WorkspaceApi for Services {
         // Start (or return the still-pending) GitHub OAuth device flow
         // (§5.27). The daemon polls GitHub in the background; the token is
         // persisted server-side by the engine and never crosses the wire.
+        let connection_services = self.clone();
         let state = self.github_auth_flow.clone();
         let bus = self.event_bus.clone();
         let secrets = self.secrets.clone();
@@ -30215,6 +30474,7 @@ impl WorkspaceApi for Services {
         let identity_guard = self.connect_identity_guard();
         Box::pin(async move {
             Self::require_administrator("github.connect")?;
+            connection_services.enable_github_oauth_connection().await?;
             // Short critical section: reuse a live flow / clear a terminal
             // one. The lock is NOT held across the network start below, so
             // cancelAuth / revoke / authStatus stay responsive meanwhile.
@@ -30309,6 +30569,7 @@ impl WorkspaceApi for Services {
         // the token being revoked (the login the authorize-side sync
         // created), gh is best-effort logged out too — same production-host
         // gate as the login sync, so mock-host tests never touch a real `gh`.
+        let connection_services = self.clone();
         let state = self.github_auth_flow.clone();
         let secrets = self.secrets.clone();
         let bus = self.event_bus.clone();
@@ -30317,6 +30578,7 @@ impl WorkspaceApi for Services {
         );
         Box::pin(async move {
             Self::require_administrator("github.revoke")?;
+            connection_services.invalidate_source_control_connection("https://github.com");
             // Capture the stored token BEFORE it is deleted so the detached
             // logout can match it against gh's active login. Fail-soft: a
             // load failure only skips the logout, never the revoke. 🔒 The
@@ -30354,10 +30616,10 @@ impl WorkspaceApi for Services {
     }
 
     fn github_get_user(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.getUser")?;
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = source_control_services.resolve_source_control().await?;
             let user = sc.get_user().await.map_err(pr_ops::map_sc_err)?;
             Ok(serde_json::json!({ "user": github_browse_ops::user_to_wire(&user) }))
         })
@@ -32575,9 +32837,9 @@ impl Services {
     }
 
     /// The GitHub token (if any) to offer the git credential chain for network
-    /// operations against `worktree`'s `origin` — see [`github_git_token`].
-    async fn ac_git_token(&self, worktree: &Path) -> Option<String> {
-        github_git_token(self.settings_registry.as_deref(), worktree).await
+    /// operations against `worktree`'s `origin` — see [`repository_git_credential`].
+    async fn ac_git_token(&self, worktree: &Path) -> Option<intent_git::auth::GitCredential> {
+        repository_git_credential(self, worktree).await
     }
 
     /// Push the branch to `origin`, restoring attribution (committed → pushed).
@@ -32593,7 +32855,7 @@ impl Services {
             ));
         }
         let token = self.ac_git_token(worktree).await;
-        let outcome = intent_git::push::push(worktree, "origin", branch, false, token.as_deref())?;
+        let outcome = intent_git::push::push(worktree, "origin", branch, false, token.as_ref())?;
         self.ac_move_stage(workspace_id, "committed", "pushed")
             .await;
         Ok(outcome.pushed_sha)
@@ -32616,7 +32878,8 @@ impl Services {
         }
         let repo_ref = pr_ops::repo_of(&ws)
             .map_err(|_| Error::Internal("No remote configured for this repository".to_string()))?;
-        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
+        self.ensure_workspace_source_control(&ws).await?;
+        let sc = self.resolve_workspace_source_control(&ws).await?;
 
         let branch = ws.branch.clone();
         let target_branch = target
@@ -32668,12 +32931,28 @@ impl Services {
             Error::Internal(format!("Workspace not found: {}", workspace_id.as_str()))
         })?;
         let repo_ref = pr_ops::repo_of(&ws)?;
-        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
+        self.ensure_workspace_source_control(&ws).await?;
+        let sc = self.resolve_workspace_source_control(&ws).await?;
         let options = intent_sourcecontrol::MergeOptions {
             commit_title,
             commit_message,
         };
         match sc.merge_pr(&repo_ref, pr_number, method, options).await {
+            Ok(outcome) if !outcome.merged => {
+                let step = accept_changes::step(
+                    "merge",
+                    "Merge PR",
+                    "failed",
+                    None,
+                    Some(&outcome.message),
+                );
+                Ok(accept_changes::accept_result(
+                    false,
+                    vec![step],
+                    None,
+                    Some(outcome.message),
+                ))
+            }
             Ok(outcome) => {
                 ws.pr_status = Some(intent_core::PullRequestStatus::Merged);
                 if let Some(info) = ws.active_pull_request.as_mut() {
@@ -32910,7 +33189,7 @@ impl Services {
 
         let token = self.ac_git_token(worktree).await;
         if let Err(e) =
-            intent_git::push::push_refspec(worktree, "origin", hash, branch, true, token.as_deref())
+            intent_git::push::push_refspec(worktree, "origin", hash, branch, true, token.as_ref())
         {
             return Err(ac_step_failure(
                 steps.clone(),
@@ -32924,7 +33203,7 @@ impl Services {
         // fetch (TS parity) is best-effort and never fails the undo. Driven
         // through `git_fetch_bounded` so a hung remote can't pin a runtime
         // worker for the shell-fetch inner deadline (100s).
-        let _ = git_fetch_bounded(worktree, "origin", branch, token.as_deref()).await;
+        let _ = git_fetch_bounded(worktree, "origin", branch, token.as_ref()).await;
 
         steps.push(accept_changes::step(
             "undo-push",
@@ -32980,7 +33259,7 @@ impl Services {
         let has_remote = intent_git::remote::origin_url(worktree).is_ok_and(|u| u.is_some());
         if has_remote {
             let token = self.ac_git_token(worktree).await;
-            let _ = git_fetch_bounded(worktree, "origin", trunk, token.as_deref()).await;
+            let _ = git_fetch_bounded(worktree, "origin", trunk, token.as_ref()).await;
         }
         let reset_target = if has_remote {
             format!("origin/{trunk}")
@@ -33060,7 +33339,7 @@ impl Services {
         };
         if has_remote {
             let token = self.ac_git_token(worktree).await;
-            let _ = git_fetch_bounded(worktree, "origin", trunk, token.as_deref()).await;
+            let _ = git_fetch_bounded(worktree, "origin", trunk, token.as_ref()).await;
         }
 
         let has_conflicts =
@@ -33195,7 +33474,7 @@ impl Services {
                 worktree,
                 "origin",
                 trunk,
-                token.as_deref(),
+                token.as_ref(),
             ) {
                 Ok(intent_git::remote::RemoteBranch::Present) => true,
                 Ok(intent_git::remote::RemoteBranch::Missing) => false,
@@ -33214,7 +33493,7 @@ impl Services {
         };
 
         if has_remote_trunk {
-            if let Err(e) = git_fetch_bounded(worktree, "origin", trunk, token.as_deref()).await {
+            if let Err(e) = git_fetch_bounded(worktree, "origin", trunk, token.as_ref()).await {
                 return Err(ac_step_failure(
                     steps.clone(),
                     "merge",
@@ -33273,7 +33552,7 @@ impl Services {
                 "HEAD",
                 branch,
                 needs_force,
-                token.as_deref(),
+                token.as_ref(),
             ) {
                 return Err(ac_step_failure(
                     steps.clone(),
@@ -33340,7 +33619,7 @@ impl Services {
                     "HEAD",
                     branch,
                     true,
-                    token.as_deref(),
+                    token.as_ref(),
                 )
                 .is_err()
             {
@@ -33391,7 +33670,7 @@ impl Services {
                 trunk,
                 &commit_hash,
                 has_remote_trunk,
-                token.as_deref(),
+                token.as_ref(),
             ) {
                 return Err(ac_step_failure(
                     steps.clone(),
@@ -33415,13 +33694,9 @@ impl Services {
                     ));
                 }
             };
-            if let Err(e) = self.ac_advance_trunk(
-                worktree,
-                trunk,
-                &current,
-                has_remote_trunk,
-                token.as_deref(),
-            ) {
+            if let Err(e) =
+                self.ac_advance_trunk(worktree, trunk, &current, has_remote_trunk, token.as_ref())
+            {
                 return Err(ac_step_failure(
                     steps.clone(),
                     "merge",
@@ -33464,7 +33739,7 @@ impl Services {
         trunk: &str,
         sha: &str,
         has_remote_trunk: bool,
-        token: Option<&str>,
+        token: Option<&intent_git::auth::GitCredential>,
     ) -> Result<()> {
         if has_remote_trunk {
             intent_git::push::push_refspec(worktree, "origin", sha, trunk, false, token)?;

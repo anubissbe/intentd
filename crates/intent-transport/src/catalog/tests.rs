@@ -149,12 +149,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// `note.presence.update`) and +1 router method (`presence.snapshot`); the
 /// `note.presence.subscribe` / `note.presence.unsubscribe` channel pair is
 /// counted with the other subscription channels, not here.
-const EXPECTED_TOTAL_METHODS: usize = 378;
+const EXPECTED_TOTAL_METHODS: usize = 405;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 323;
+const EXPECTED_ROUTER_METHODS: usize = 350;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 53;

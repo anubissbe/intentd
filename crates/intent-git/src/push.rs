@@ -1,12 +1,10 @@
 //! Branch push (`accept-changes.execute` push step).
 //!
 //! Ports the `git push origin <branch>` half of the TS accept-changes pipeline.
-//! libgit2 performs the push; for local/`file://` remotes (the test path) no
-//! credentials are needed. For real remotes a best-effort credential callback is
-//! installed (ssh-agent → credential helper → caller-resolved GitHub token for
-//! HTTPS github.com remotes); the interactive keychain consent flow the TS
-//! service drives is deferred (see the accept-changes parity notes in
-//! `intent-services`).
+//! Authenticated HTTPS uses system Git with a scoped helper and redirects
+//! disabled. libgit2 can reuse a credential on same-host redirects outside an
+//! installation prefix, so it is retained only for operations without an
+//! Intent-supplied credential (including local and SSH remotes).
 //!
 //! libgit2's `push` does not update local remote-tracking refs, so after a
 //! successful push the local `refs/remotes/<remote>/<branch>` is fast-forwarded
@@ -31,8 +29,8 @@ pub struct PushOutcome {
 /// Push `branch` to `remote` (typically `origin`). When `force` is set the
 /// refspec is prefixed with `+` to allow a non-fast-forward update (mirroring the
 /// TS `git push --force` path used after a rebase). `token` is an optional
-/// caller-resolved GitHub token used as the final credential-chain step for
-/// HTTPS github.com remotes (see [`crate::auth`]). Errors when the branch has no
+/// caller-resolved instance-bound credential used as the final credential-chain step for
+/// matching HTTPS forge remotes (see [`crate::auth`]). Errors when the branch has no
 /// local commit or the remote rejects the push.
 ///
 /// # Errors
@@ -43,7 +41,7 @@ pub fn push(
     remote: &str,
     branch: &str,
     force: bool,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
 ) -> Result<PushOutcome> {
     if branch.is_empty() {
         return Err(Error::Internal(
@@ -63,13 +61,22 @@ pub fn push(
     let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
 
     let mut opts = PushOptions::new();
-    opts.remote_callbacks(remote_callbacks(token));
+    opts.remote_callbacks(remote_callbacks(None));
 
     let prefix = if force { "+" } else { "" };
     let refspec = format!("{prefix}{local_ref}:{local_ref}");
-    remote_handle
-        .push(&[refspec.as_str()], Some(&mut opts))
-        .map_err(map_git_err)?;
+    if let Some(credential) = token {
+        crate::repo_cache::run_git(
+            worktree_path,
+            &["push", "--", remote, &refspec],
+            Some(credential),
+            std::time::Duration::from_secs(100),
+        )?;
+    } else {
+        remote_handle
+            .push(&[refspec.as_str()], Some(&mut opts))
+            .map_err(map_git_err)?;
+    }
 
     // libgit2 leaves the local remote-tracking ref untouched; advance it so the
     // ahead/behind + isPushed reads see the branch as pushed.
@@ -100,8 +107,8 @@ pub fn push(
 /// `git push <sha>:<dst>` shortcut, nor `--force-with-lease`), so `src` is first
 /// resolved to its commit OID, written to a short-lived temporary ref that is
 /// deleted once the push returns, and pushed with a plain force when requested.
-/// `token` is an optional caller-resolved GitHub token used as the final
-/// credential-chain step for HTTPS github.com remotes (see [`crate::auth`]).
+/// `token` is an optional caller-resolved instance-bound credential used as the final
+/// credential-chain step for matching HTTPS forge remotes (see [`crate::auth`]).
 ///
 /// # Errors
 ///
@@ -112,7 +119,7 @@ pub fn push_refspec(
     src: &str,
     dst_branch: &str,
     force: bool,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
 ) -> Result<String> {
     if dst_branch.is_empty() {
         return Err(Error::Internal(
@@ -138,16 +145,27 @@ pub fn push_refspec(
 
     let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
     let mut opts = PushOptions::new();
-    opts.remote_callbacks(remote_callbacks(token));
+    opts.remote_callbacks(remote_callbacks(None));
     let prefix = if force { "+" } else { "" };
     let refspec = format!("{prefix}{tmp_ref}:refs/heads/{dst_branch}");
-    let push_result = remote_handle.push(&[refspec.as_str()], Some(&mut opts));
+    let push_result = if let Some(credential) = token {
+        crate::repo_cache::run_git(
+            worktree_path,
+            &["push", "--", remote, &refspec],
+            Some(credential),
+            std::time::Duration::from_secs(100),
+        )
+    } else {
+        remote_handle
+            .push(&[refspec.as_str()], Some(&mut opts))
+            .map_err(map_git_err)
+    };
 
     // Always remove the temporary ref, regardless of the push outcome.
     if let Ok(mut r) = repo.find_reference(&tmp_ref) {
         let _ = r.delete();
     }
-    push_result.map_err(map_git_err)?;
+    push_result?;
 
     // Advance the local remote-tracking ref so ahead/behind + isPushed reads see
     // the new remote position without a follow-up fetch.

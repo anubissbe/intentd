@@ -23,7 +23,7 @@
 //! Network git work shells out to system `git` (same rationale as
 //! [`crate::fetch`]): the child inherits OpenSSH config + credential-helper
 //! resolution, `GIT_TERMINAL_PROMPT=0` fails fast instead of prompting, and a
-//! wall-clock deadline kills a hung child. A caller-resolved GitHub token is
+//! wall-clock deadline kills a hung child. A caller-resolved instance-bound credential is
 //! offered via the env-backed github.com-scoped credential helper
 //! ([`crate::auth::token_helper_config`]) — never argv.
 
@@ -37,7 +37,6 @@ use git2::{ConfigLevel, Direction, ErrorCode, Repository};
 use intent_core::{Error, GitRemoteUrl, RepoRef, Result};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::auth::{token_helper_config, TOKEN_ENV};
 use crate::map_git_err;
 
 /// Default wall-clock bound for the cache clone, matching the service-layer
@@ -226,6 +225,34 @@ pub fn cache_path_for(cache_root: &Path, owner: &str, repo: &str) -> PathBuf {
     cache_root.join(owner).join(repo)
 }
 
+// Preserve historical GitHub/local slots while isolating every HTTP forge
+// repository by full canonical URL. A host/port/prefix collision must not let
+// another ensure replace the source between ensure and checkout hydration.
+fn cache_path_for_url(cache_root: &Path, owner: &str, repo: &str, raw: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return cache_path_for(cache_root, owner, repo);
+    };
+    if !matches!(url.scheme(), "http" | "https") || github_repo(raw).is_some() {
+        return cache_path_for(cache_root, owner, repo);
+    }
+    let path = url
+        .path()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string();
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut key = String::with_capacity(64);
+    for byte in Sha256::digest(url.as_str().as_bytes()) {
+        write!(key, "{byte:02x}").expect("writing a string cannot fail");
+    }
+    cache_path_for(&cache_root.join(".forges").join(key), owner, repo)
+}
+
 /// Whether `entry` is a real directory — a symlink (to a directory or
 /// anywhere else) is not. `DirEntry::file_type` never follows symlinks.
 fn is_real_dir_entry(entry: &std::fs::DirEntry) -> bool {
@@ -329,7 +356,7 @@ fn adopt_case_variant_cache(cache_root: &Path, owner: &str, repo: &str, cache_pa
 ///   branch. Any anomaly self-heals by deleting the cache dir and re-cloning —
 ///   refresh never fails the flow.
 ///
-/// `token` is an optional caller-resolved GitHub token offered to the child
+/// `token` is an optional caller-resolved instance-bound credential offered to the child
 /// git via the environment (see [`crate::auth`]); it never appears in argv.
 /// Callers for the same repo serialize on a per-repo async lock; the git work
 /// itself runs on the blocking pool.
@@ -342,7 +369,7 @@ pub async fn ensure_cached_repo(
     github_url: &str,
     owner: &str,
     repo: &str,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
 ) -> Result<PathBuf> {
     ensure_cached_repo_with_progress(cache_root, github_url, owner, repo, token, None).await
 }
@@ -361,25 +388,29 @@ pub async fn ensure_cached_repo_with_progress(
     github_url: &str,
     owner: &str,
     repo: &str,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
     progress: Option<CacheEnsureProgress>,
 ) -> Result<PathBuf> {
     validate_segment("owner", owner)?;
     validate_segment("repo", repo)?;
-    let cache_path = cache_path_for(cache_root, owner, repo);
+    let cache_path = cache_path_for_url(cache_root, owner, repo, github_url);
 
     let lock = lock_for(&cache_path);
     let _guard = lock.lock().await;
 
     let path = cache_path.clone();
-    let root = cache_root.to_path_buf();
+    let root = cache_path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(cache_root)
+        .to_path_buf();
     let owner = owner.to_string();
     let repo = repo.to_string();
     let url = github_url.to_string();
-    let token = token.map(str::to_owned);
+    let token = token.cloned();
     tokio::task::spawn_blocking(move || {
         adopt_case_variant_cache(&root, &owner, &repo, &path);
-        ensure_blocking(&path, &url, token.as_deref(), progress.as_ref())
+        ensure_blocking(&path, &url, token.as_ref(), progress.as_ref())
     })
     .await
     .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))??;
@@ -391,7 +422,7 @@ pub async fn ensure_cached_repo_with_progress(
 fn ensure_blocking(
     cache_path: &Path,
     github_url: &str,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
     progress: Option<&CacheEnsureProgress>,
 ) -> Result<()> {
     ensure_blocking_with_ttl(cache_path, github_url, token, progress, fresh_ttl())
@@ -402,7 +433,7 @@ fn ensure_blocking(
 fn ensure_blocking_with_ttl(
     cache_path: &Path,
     github_url: &str,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
     progress: Option<&CacheEnsureProgress>,
     fresh_ttl: Duration,
 ) -> Result<()> {
@@ -516,7 +547,7 @@ fn github_repo(url: &str) -> Option<RepoRef> {
 /// re-cloning.
 fn refresh(
     cache_path: &Path,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
     progress: Option<&CacheEnsureProgress>,
 ) -> Result<()> {
     emit(progress, CacheEnsureEvent::Step("fetch"));
@@ -655,7 +686,7 @@ fn default_branch(repo: &Repository) -> Result<String> {
 fn clone(
     github_url: &str,
     cache_path: &Path,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
     progress: Option<&CacheEnsureProgress>,
 ) -> Result<()> {
     if let Some(parent) = cache_path.parent() {
@@ -790,6 +821,43 @@ pub async fn list_cached_branches(
         .map_err(|e| Error::Internal(format!("repo cache task failed: {e}")))?
 }
 
+/// Read a cached slot only when its origin equals the requested forge URL.
+/// Nested namespaces currently use the direct clone path rather than this
+/// two-segment disk cache, so they return a cache miss without traversing paths.
+///
+/// # Errors
+/// Returns an invalid-parameter error for unsafe cache segments, or an internal
+/// error if the blocking reader fails.
+pub async fn list_cached_branches_for_url(
+    cache_root: &Path,
+    owner: &str,
+    repo: &str,
+    expected_url: &str,
+) -> Result<Option<CachedBranches>> {
+    if owner.contains('/') {
+        return Ok(None);
+    }
+    validate_segment("owner", owner)?;
+    validate_segment("repo", repo)?;
+    let path = cache_path_for_url(cache_root, owner, repo, expected_url);
+    let lock = lock_for(&path);
+    let Ok(_guard) = lock.try_lock() else {
+        return Ok(None);
+    };
+    let expected_url = expected_url.to_string();
+    tokio::task::spawn_blocking(move || {
+        if !origin_matches(&path, &expected_url) {
+            return Ok(None);
+        }
+        let Ok(repo) = Repository::open(&path) else {
+            return Ok(None);
+        };
+        read_cached_branches(&repo)
+    })
+    .await
+    .map_err(|error| Error::Internal(format!("repo cache task failed: {error}")))?
+}
+
 /// Blocking body of [`list_cached_branches`]: read-only ref enumeration of
 /// the cached clone. An unopenable repo counts as a cache miss (the write
 /// path self-heals it on the next ensure), as does an `origin` that is not
@@ -809,6 +877,10 @@ fn list_cached_branches_blocking(
     if !origin_url.is_some_and(|url| origin_is_github_slot(&url, owner, repo_name)) {
         return Ok(None);
     }
+    read_cached_branches(&repo)
+}
+
+fn read_cached_branches(repo: &Repository) -> Result<Option<CachedBranches>> {
     let mut branches = Vec::new();
     let iter = repo
         .branches(Some(git2::BranchType::Remote))
@@ -827,7 +899,7 @@ fn list_cached_branches_blocking(
     branches.sort_unstable();
     // A vanished / non-symbolic `origin/HEAD` is an anomaly the write path
     // self-heals; the read path just omits the default branch.
-    let default_branch = default_branch(&repo).ok();
+    let default_branch = default_branch(repo).ok();
     Ok(Some(CachedBranches {
         branches,
         default_branch,
@@ -1488,8 +1560,13 @@ fn validate_segment(what: &str, value: &str) -> Result<()> {
 /// Shell out to `git -C <dir> <args…>` with the fail-fast/deadline-kill
 /// semantics of [`crate::fetch`]: `GIT_TERMINAL_PROMPT=0`, discarded stdout,
 /// piped stderr for the error message, and a poll loop that kills the child
-/// at `timeout`. The optional token travels only via [`TOKEN_ENV`].
-fn run_git(dir: &Path, args: &[&str], token: Option<&str>, timeout: Duration) -> Result<()> {
+/// at `timeout`. The optional token travels only via `INTENT_GIT_SCOPED_PASSWORD`.
+pub(crate) fn run_git(
+    dir: &Path,
+    args: &[&str],
+    token: Option<&crate::auth::GitCredential>,
+    timeout: Duration,
+) -> Result<()> {
     run_git_streamed(dir, args, token, timeout, None)
 }
 
@@ -1498,7 +1575,7 @@ fn run_git(dir: &Path, args: &[&str], token: Option<&str>, timeout: Duration) ->
 fn run_git_streamed(
     dir: &Path,
     args: &[&str],
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
     timeout: Duration,
     on_chunk: Option<ProgressChunkFn>,
 ) -> Result<()> {
@@ -1509,7 +1586,7 @@ fn run_git_streamed(
 fn run_git_os(
     dir: &Path,
     args: &[&std::ffi::OsStr],
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
     timeout: Duration,
 ) -> Result<()> {
     run_git_os_streamed(dir, args, token, timeout, None)
@@ -1524,18 +1601,17 @@ fn run_git_os(
 fn run_git_os_streamed(
     dir: &Path,
     args: &[&std::ffi::OsStr],
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
     timeout: Duration,
     on_chunk: Option<ProgressChunkFn>,
 ) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir);
-    // Offer the resolved token as an extra github.com-scoped credential
-    // helper, appended after any configured helpers (see `crate::auth`). The
-    // helper reads the secret from the environment — argv carries no token.
-    if let Some(token) = crate::auth::usable_token(token) {
-        cmd.arg("-c").arg(token_helper_config());
-        cmd.env(TOKEN_ENV, token);
+    // The instance-scoped helper takes precedence over existing helpers,
+    // which remain fallbacks. The secret travels in the child environment.
+    if let Some(token) = token {
+        let inherited = std::env::var(crate::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
+        cmd.envs(token.environment(Some(dir), inherited.as_deref()));
     }
     let mut child = cmd
         .args(args)
@@ -1844,6 +1920,34 @@ mod tests {
         assert_eq!(slot, cache_root.join("intent-hq").join("intentd"));
         assert_eq!(slot, cache_path_for(&cache_root, "intent-hq", "intentd"));
         assert!(slot.starts_with(&cache_root));
+    }
+
+    #[test]
+    fn forge_cache_slots_preserve_host_port_prefix_and_github_compatibility() {
+        let root = Path::new("/cache");
+        let urls = [
+            "https://git.example/team/project.git",
+            "https://git.example:8443/team/project.git",
+            "https://git.example/forge/team/project.git",
+            "https://other.example/team/project.git",
+            "https://github.com/team/project.git",
+        ];
+        let slots = urls.map(|url| cache_path_for_url(root, "team", "project", url));
+        for (index, slot) in slots.iter().enumerate() {
+            for other in &slots[index + 1..] {
+                assert_ne!(slot, other);
+            }
+        }
+        assert_eq!(slots[4], cache_path_for(root, "team", "project"));
+        assert_eq!(
+            slots[0],
+            cache_path_for_url(
+                root,
+                "team",
+                "project",
+                "https://GIT.EXAMPLE:443/team/project/"
+            )
+        );
     }
 
     /// Cache miss → a fresh clone lands at `<root>/<owner>/<repo>` with the
@@ -2668,6 +2772,54 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(cached.branches, expected);
         assert_eq!(cached.default_branch, Some(default));
+    }
+
+    #[tokio::test]
+    async fn explicit_forge_cache_reader_never_reuses_another_host_or_port() {
+        let origin = init_repo("repocache-forge");
+        commit_file(origin.path(), "a.txt", "one\n");
+        let root = CacheRoot::new("forge");
+        let cache = ensure_cached_repo(
+            root.path(),
+            &file_url(origin.path()),
+            "team",
+            "project",
+            None,
+        )
+        .await
+        .unwrap();
+        let url = "https://git.example:8443/forge/team/project.git";
+        let isolated = cache_path_for_url(root.path(), "team", "project", url);
+        std::fs::create_dir_all(isolated.parent().unwrap()).unwrap();
+        std::fs::rename(&cache, &isolated).unwrap();
+        Repository::open(&isolated)
+            .unwrap()
+            .remote_set_url("origin", url)
+            .unwrap();
+        assert!(
+            list_cached_branches_for_url(root.path(), "team", "project", url)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        for other in [
+            "https://github.com/team/project.git",
+            "https://git.example/forge/team/project.git",
+            "https://other.example:8443/forge/team/project.git",
+        ] {
+            assert!(
+                list_cached_branches_for_url(root.path(), "team", "project", other)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            list_cached_branches_for_url(root.path(), "team/nested", "project", url)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A slot whose `origin` is not `github.com/<owner>/<repo>` — another

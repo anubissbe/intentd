@@ -21,6 +21,9 @@ use std::process::{Command, Stdio};
 
 use git2::{Cred, RemoteCallbacks};
 
+mod scoped;
+pub use scoped::{daemon_helpers_for_instances, GitCredential};
+
 /// Maximum number of times the credential callback is entered per fetch/push
 /// before it returns `Err` — attempt 0 walks the full ssh-agent →
 /// credential-helper → resolved-token chain, and the re-entries (which skip
@@ -67,20 +70,6 @@ const GITHUB_HELPER_RESET: &str = "credential.https://github.com.helper=";
 pub(crate) fn token_helper_config() -> String {
     format!(
         "{GITHUB_HELPER_KEY}=!f() {{ test \"$1\" = get || exit 0; printf 'username={TOKEN_USERNAME}\\npassword=%s\\n' \"${TOKEN_ENV}\"; }}; f"
-    )
-}
-
-/// The ordered `-c` entries the shell-git token paths pass so the resolved
-/// token is offered *ahead* of the configured helpers (see
-/// [`github_helper_entries`]). `cwd` is the repository the child git will run
-/// in, so a repository-local helper is preserved as a fallback.
-pub(crate) fn token_helper_entries(
-    cwd: Option<&Path>,
-    inherited_config_parameters: Option<&str>,
-) -> Vec<String> {
-    github_helper_entries(
-        token_helper_config(),
-        discover_github_helpers(cwd, inherited_config_parameters).as_deref(),
     )
 }
 
@@ -549,6 +538,7 @@ pub(crate) fn resolve_credential(
 /// stops re-entering it. `token` is the caller-resolved GitHub token (if any)
 /// used as the final chain step. Exposed at the module level so unit tests can
 /// drive the counter without a real remote.
+#[cfg(test)]
 pub(crate) fn make_credentials_callback(
     max_attempts: u32,
     token: Option<String>,
@@ -568,13 +558,42 @@ pub(crate) fn make_credentials_callback(
 /// remote operations that still install these callbacks: [`crate::push`] and
 /// [`crate::remote::ls_remote_has_branch`]. (`crate::fetch` shells out to
 /// system `git`, so it does not use this callback — see the module docs.)
-pub(crate) fn remote_callbacks<'cb>(token: Option<&str>) -> RemoteCallbacks<'cb> {
+pub(crate) fn remote_callbacks<'cb>(token: Option<&GitCredential>) -> RemoteCallbacks<'cb> {
     let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(make_credentials_callback(
-        MAX_CREDENTIAL_ATTEMPTS,
-        token.map(str::to_owned),
-    ));
+    callbacks.credentials(scoped_credentials_callback(token.cloned()));
     callbacks
+}
+
+fn scoped_credentials_callback(
+    credential: Option<GitCredential>,
+) -> impl FnMut(&str, Option<&str>, git2::CredentialType) -> std::result::Result<Cred, git2::Error>
+{
+    let mut attempts = 0;
+    move |url, username, allowed| {
+        let attempt = attempts;
+        attempts += 1;
+        if attempt >= MAX_CREDENTIAL_ATTEMPTS {
+            return Err(git2::Error::from_str(
+                "git authentication failed: exhausted credential attempts",
+            ));
+        }
+        if allowed.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+            if let Some(credential) = credential.as_ref().filter(|credential| {
+                credential.matches_url(url)
+                    && username.is_none_or(|username| username == credential.username())
+            }) {
+                return Cred::userpass_plaintext(credential.username(), credential.password());
+            }
+        }
+        resolve_credential(
+            url,
+            username,
+            allowed,
+            attempt,
+            MAX_CREDENTIAL_ATTEMPTS,
+            None,
+        )
+    }
 }
 
 #[cfg(test)]

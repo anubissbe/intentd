@@ -16096,6 +16096,8 @@ pub(crate) mod pr {
     #[derive(Default)]
     pub(crate) struct StubForge {
         fail_threads: bool,
+        /// A successful HTTP response whose merge is still pending/refused.
+        merge_not_completed: bool,
         /// When set, `get_review_threads` fails with `RateLimited` (the
         /// GraphQL quota is exhausted), exercising the checklist's
         /// quota-exhaustion propagation instead of the REST fallback.
@@ -16481,9 +16483,13 @@ pub(crate) mod pr {
             _: MergeOptions,
         ) -> ScResult<MergeOutcome> {
             Ok(MergeOutcome {
-                merged: true,
-                message: format!("Merged via {method:?}"),
-                sha: Some("mergedsha".into()),
+                merged: !self.merge_not_completed,
+                message: if self.merge_not_completed {
+                    "Merge has not completed".into()
+                } else {
+                    format!("Merged via {method:?}")
+                },
+                sha: (!self.merge_not_completed).then(|| "mergedsha".into()),
             })
         }
         async fn mergeability(&self, _: &RepoRef, _: u64) -> ScResult<Mergeability> {
@@ -17617,12 +17623,14 @@ pub(crate) mod pr {
         // scopes the lookup (no "No active PR" guard), and the resolved repo
         // is echoed back.
         let (_t, svc, ws) = setup(false, false).await;
-        let v = svc
-            .pr_state(ws, 42, Some("acme/widgets".into()))
-            .await
-            .expect("snapshot");
-        assert_eq!(v["repo"], "acme/widgets");
-        assert_eq!(v["prNumber"], 42);
+        for repo in ["acme/widgets", "acme/subgroup/widgets"] {
+            let v = svc
+                .pr_state(ws.clone(), 42, Some(repo.into()))
+                .await
+                .expect("snapshot");
+            assert_eq!(v["repo"], repo);
+            assert_eq!(v["prNumber"], 42);
+        }
     }
 
     /// `pausedUntil` on the snapshot describes the global rate-limit gate as
@@ -17674,7 +17682,7 @@ pub(crate) mod pr {
     #[intent_test_macros::daemon_test]
     async fn state_snapshot_rejects_malformed_repo_arg() {
         let (_t, svc, ws) = setup(false, true).await;
-        for bad in ["acme", "acme/", "/widgets", "a/b/c", " "] {
+        for bad in ["acme", "acme/", "/widgets", "a//c", "a/../c", "a/./c", " "] {
             let err = svc
                 .pr_state(ws.clone(), 42, Some(bad.into()))
                 .await
@@ -18469,6 +18477,30 @@ pub(crate) mod pr {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].number, 7);
         assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn merge_not_completed_never_marks_the_workspace_merged() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                merge_not_completed: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let before = svc.store().get_workspace(&ws).await.unwrap();
+        let result = svc
+            .accept_changes_merge_pr(ws.clone(), 42, Some("squash".into()), None, None)
+            .await
+            .expect("negative merge response");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["steps"][0]["status"], "failed");
+        let after = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(after.pr_status, before.pr_status);
+        assert_eq!(after.active_pull_request, before.active_pull_request);
+        assert_eq!(after.pull_requests, before.pull_requests);
+        assert_eq!(after.updated_at, before.updated_at);
     }
 
     /// Undoing a commit that renamed a file re-attributes BOTH sides of the

@@ -527,6 +527,7 @@ impl SharedPrSnapshot {
 /// sub-reads ([`fetch_shared_snapshot_cached`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrFingerprint {
+    url: String,
     updated_at: String,
     head_sha: Option<String>,
     state: PrState,
@@ -538,6 +539,9 @@ struct PrFingerprint {
 impl PrFingerprint {
     fn of(pr: &PullRequest) -> Self {
         Self {
+            // A provider/instance switch can reuse the same slug, number and
+            // commit. Its checklist must never reuse the former host's data.
+            url: pr.url.clone(),
             updated_at: pr.updated_at.clone(),
             head_sha: pr.head_sha.clone(),
             state: pr.state,
@@ -1602,6 +1606,19 @@ impl Services {
         repo_name: &str,
         pr_number: u64,
     ) -> Result<PrMonitorRegistration> {
+        if self.source_control_connection.is_none() && self.source_control.is_none() {
+            let ws = self.store.get_workspace(workspace_id).await?;
+            let id = self.workspace_source_control_connection(&ws).await?;
+            return Box::pin(self.with_source_control_scope(&id).pr_monitor_try_register(
+                workspace_id,
+                agent_id,
+                repo_owner,
+                repo_name,
+                pr_number,
+            ))
+            .await;
+        }
+        let source_control_config = self.effective_settings().source_control;
         let existing = self
             .store
             .find_active_pr_monitor(agent_id, repo_owner, repo_name, pr_number.cast_signed())
@@ -1641,9 +1658,35 @@ impl Services {
             }
         }
 
-        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
+        let sc = self.resolve_source_control().await?;
         let repo_ref = RepoRef::new(repo_owner, repo_name);
         let mut snapshot = fetch_snapshot(sc.as_ref(), &repo_ref, pr_number, None).await?;
+        let expected = existing.as_ref().and_then(|monitor| {
+            monitor
+                .last_snapshot
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<PrMonitorSnapshot>(raw).ok())
+        });
+        let ws = self.store.get_workspace(workspace_id).await?;
+        let provenance = self
+            .source_control_provenance(
+                ws.pr_url.as_deref(),
+                ws.worktree_path
+                    .as_deref()
+                    .or(ws.repository_path.as_deref()),
+            )
+            .await;
+        if !self.source_control_result_matches(
+            &source_control_config,
+            provenance
+                .as_deref()
+                .or_else(|| expected.as_ref().map(|snapshot| snapshot.url.as_str())),
+            &snapshot.url,
+        ) {
+            return Err(Error::InvalidParams(
+                "Source-control instance changed during monitor registration".into(),
+            ));
+        }
         invalidate_fetch_cache(
             &self.pr_monitor_fetch_cache,
             &pr_key_for(&repo_ref, pr_number.cast_signed()),
@@ -2330,6 +2373,15 @@ impl Services {
         workspace_id: &WorkspaceId,
         monitor_id: &PrMonitorId,
     ) -> Result<bool> {
+        if self.source_control_connection.is_none() && self.source_control.is_none() {
+            let monitor = self.store.get_pr_monitor(monitor_id).await?;
+            let id = self.monitor_source_control_connection(&monitor).await?;
+            return Box::pin(
+                self.with_source_control_scope(&id)
+                    .pr_monitor_check_and_flush(workspace_id, monitor_id),
+            )
+            .await;
+        }
         let monitor = self.store.get_pr_monitor(monitor_id).await?;
         if &monitor.workspace_id != workspace_id {
             return Err(Error::NotFound(format!(
@@ -2340,7 +2392,18 @@ impl Services {
         if monitor.state != PrMonitorState::Active {
             return Ok(false);
         }
-        let sc = pr_ops::resolve_source_control(self.source_control.clone()).await?;
+        if self.source_control.is_none()
+            && monitor
+                .last_snapshot
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<PrMonitorSnapshot>(raw).ok())
+                .is_some_and(|snapshot| !self.source_control_url_matches(&snapshot.url))
+        {
+            return Err(Error::InvalidParams(
+                "Monitor belongs to a different source-control instance".into(),
+            ));
+        }
+        let sc = self.resolve_source_control().await?;
         let repo_ref = monitor.repo();
         let shared =
             match fetch_shared_snapshot(sc.as_ref(), &repo_ref, monitor.pr_number.cast_unsigned())
@@ -2477,9 +2540,39 @@ impl Services {
     /// either way; a full sweep (`skip_fresh == false`) plans no cadence and
     /// spends none.
     async fn sweep_pr_monitors(&self, skip_fresh: bool) {
+        let monitors = match self.store.load_active_pr_monitors().await {
+            Ok(monitors) => monitors,
+            Err(error) => {
+                tracing::warn!(%error,"pr monitor sweep: load failed");
+                return;
+            }
+        };
+        if self.source_control.is_some() {
+            self.sweep_pr_monitors_on_connection(skip_fresh, monitors)
+                .await;
+            return;
+        }
+        let mut groups: HashMap<String, Vec<PrMonitor>> = HashMap::new();
+        for monitor in monitors {
+            match self.monitor_source_control_connection(&monitor).await {
+                Ok(id) => groups.entry(id).or_default().push(monitor),
+                Err(error) => {
+                    self.record_pr_monitor_error(&monitor, &error.to_string())
+                        .await;
+                }
+            }
+        }
+        for (id, monitors) in groups {
+            self.with_source_control_scope(&id)
+                .sweep_pr_monitors_on_connection(skip_fresh, monitors)
+                .await;
+        }
+    }
+
+    async fn sweep_pr_monitors_on_connection(&self, skip_fresh: bool, monitors: Vec<PrMonitor>) {
         let mut probed = None;
         if self.sweeps_rate_limited() {
-            let lifted = match pr_ops::resolve_source_control(self.source_control.clone()).await {
+            let lifted = match self.resolve_source_control().await {
                 Ok(sc) => self.maybe_lift_rate_limit_pause(&sc).await,
                 Err(_) => None,
             };
@@ -2489,13 +2582,6 @@ impl Services {
             }
             probed = lifted;
         }
-        let monitors = match self.store.load_active_pr_monitors().await {
-            Ok(monitors) => monitors,
-            Err(e) => {
-                tracing::warn!(error = %e, "pr monitor sweep: load failed; skipping tick");
-                return;
-            }
-        };
         if monitors.is_empty() {
             self.pr_monitor_fetch_cache.lock().unwrap().clear();
             return;
@@ -2507,7 +2593,7 @@ impl Services {
                 .unwrap()
                 .retain(|key, _| active.contains(key));
         }
-        let sc = match pr_ops::resolve_source_control(self.source_control.clone()).await {
+        let sc = match self.resolve_source_control().await {
             Ok(sc) => sc,
             Err(e) => {
                 tracing::debug!(error = %e, "pr monitor sweep: no source control; skipping tick");
@@ -2524,6 +2610,15 @@ impl Services {
             HashMap::new();
         let mut rate_limited = false;
         for monitor in monitors {
+            if self.source_control.is_none()
+                && monitor
+                    .last_snapshot
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<PrMonitorSnapshot>(raw).ok())
+                    .is_some_and(|snapshot| !self.source_control_url_matches(&snapshot.url))
+            {
+                continue;
+            }
             let key = pr_key(&monitor);
             let fetched = match shared.entry(key.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
@@ -2681,6 +2776,30 @@ impl Services {
             .last_snapshot
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
+        let ws = self.store.get_workspace(&monitor.workspace_id).await?;
+        let provenance = self
+            .source_control_provenance(
+                ws.pr_url.as_deref(),
+                ws.worktree_path
+                    .as_deref()
+                    .or(ws.repository_path.as_deref()),
+            )
+            .await;
+        if !self.source_control_result_matches(
+            &self.effective_settings().source_control,
+            provenance
+                .as_deref()
+                .or_else(|| previous.as_ref().map(|snapshot| snapshot.url.as_str())),
+            &shared.url,
+        ) || !self.source_control_result_matches(
+            &self.effective_settings().source_control,
+            previous.as_ref().map(|snapshot| snapshot.url.as_str()),
+            &shared.url,
+        ) {
+            return Err(Error::InvalidParams(
+                "Fetched pull request belongs to a different source-control instance".into(),
+            ));
+        }
         let now = now_iso();
         let mut fresh = shared.materialize(previous.as_ref());
         fresh.observed_at = Some(now.clone());
@@ -3198,7 +3317,7 @@ impl Services {
     /// watches (a successful wake makes the backstop a no-op — the
     /// queued/running wake turn owns the settlement).
     async fn wake_pr_monitor_owner(&self, monitor: &PrMonitor, message: &str, reason: &str) {
-        let paused_until = self.sweep_rate_limit_paused_until();
+        let paused_until = self.monitor_rate_limit_paused_until(monitor).await;
         let metadata = pr_monitor_wake_metadata(monitor, reason, paused_until.as_deref());
         if let Err(e) = self
             .deliver_wake_message(
@@ -3232,7 +3351,7 @@ impl Services {
         let label = monitor_label(former);
         let message =
             crate::harness::latest().pr_monitor_transferred_to_parent_notice(&label, &adopter.0);
-        let paused_until = self.sweep_rate_limit_paused_until();
+        let paused_until = self.monitor_rate_limit_paused_until(former).await;
         let mut metadata = pr_monitor_wake_metadata(former, "transferred", paused_until.as_deref());
         metadata["adoptedBy"] = json!(adopter);
         if let Err(e) = self
@@ -3265,6 +3384,7 @@ impl Services {
             pr_ops::parse_repo_slug(&slug)
         } else {
             let ws = self.store.get_workspace(workspace_id).await?;
+            self.ensure_workspace_source_control(&ws).await?;
             let RepoRef { owner, name } = pr_ops::repo_of(&ws)?;
             Ok((owner, name))
         }
@@ -3294,7 +3414,7 @@ impl Services {
                 requirements,
                 adopted_from,
             } => {
-                let paused_until = self.sweep_rate_limit_paused_until();
+                let paused_until = self.monitor_rate_limit_paused_until(&monitor).await;
                 let mut payload = json!({
                     "ok": true,
                     "monitor": pr_monitor_wire(&monitor, paused_until.as_deref()),
@@ -3332,7 +3452,7 @@ impl Services {
         let monitor = self
             .pr_monitor_cancel(workspace_id, &existing.monitor_id, Some(agent_id))
             .await?;
-        let paused_until = self.sweep_rate_limit_paused_until();
+        let paused_until = self.monitor_rate_limit_paused_until(&monitor).await;
         Ok(json!({ "ok": true, "monitor": pr_monitor_wire(&monitor, paused_until.as_deref()) }))
     }
 
@@ -3348,13 +3468,15 @@ impl Services {
             Some(a) => self.pr_monitors_for_agent(a).await?,
             None => self.pr_monitors_for_workspace(workspace_id).await?,
         };
-        let paused_until = self.sweep_rate_limit_paused_until();
-        let monitors: Vec<Value> = monitors
+        let mut rows = Vec::new();
+        for monitor in monitors
             .into_iter()
             .filter(|m| &m.workspace_id == workspace_id)
-            .map(|m| pr_monitor_wire(&m, paused_until.as_deref()))
-            .collect();
-        Ok(json!({ "monitors": monitors }))
+        {
+            let paused_until = self.monitor_rate_limit_paused_until(&monitor).await;
+            rows.push(pr_monitor_wire(&monitor, paused_until.as_deref()));
+        }
+        Ok(json!({ "monitors": rows }))
     }
 
     /// Wire `prMonitor.cancel`: the FE cancel path — any monitor in the
@@ -3367,7 +3489,7 @@ impl Services {
         let monitor = self
             .pr_monitor_cancel(workspace_id, monitor_id, None)
             .await?;
-        let paused_until = self.sweep_rate_limit_paused_until();
+        let paused_until = self.monitor_rate_limit_paused_until(&monitor).await;
         Ok(json!({ "ok": true, "monitor": pr_monitor_wire(&monitor, paused_until.as_deref()) }))
     }
 
@@ -3587,6 +3709,7 @@ mod tests {
     #[derive(Clone)]
     #[expect(clippy::struct_excessive_bools)]
     struct ForgeState {
+        pr_url_override: Option<String>,
         pr_state: PrState,
         draft: bool,
         head_sha: String,
@@ -3674,6 +3797,7 @@ mod tests {
     impl Default for ForgeState {
         fn default() -> Self {
             Self {
+                pr_url_override: None,
                 revision: 0,
                 pr_state: PrState::Open,
                 draft: false,
@@ -3716,7 +3840,10 @@ mod tests {
         fn pr_record(&self, number: u64) -> PullRequest {
             PullRequest {
                 number,
-                url: format!("https://github.com/o/r/pull/{number}"),
+                url: self
+                    .pr_url_override
+                    .clone()
+                    .unwrap_or_else(|| format!("https://github.com/o/r/pull/{number}")),
                 title: "Add thing".into(),
                 body: None,
                 state: self.pr_state,
@@ -7087,6 +7214,128 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn a_changed_forge_url_refetches_instead_of_reusing_foreign_subreads() {
+        let forge = StubForge::new();
+        let cache: PrMonitorFetchCache = Arc::default();
+        let repo = RepoRef::new("o", "r");
+        let key = pr_key_for(&repo, 42);
+        let first = fetch_shared_snapshot_cached(&forge, &repo, 42, &cache, &key)
+            .await
+            .expect("initial fetch");
+        for foreign_url in [
+            "https://git.euraika.net/o/r/-/merge_requests/42",
+            "https://github.com:8443/o/r/pull/42",
+            "https://github.com/gitlab-two/o/r/-/merge_requests/42",
+        ] {
+            // Simulate a cache left by another configured forge with all
+            // other fingerprint fields identical to the currently fetched PR.
+            {
+                let mut guard = cache.lock().unwrap();
+                let entry = guard.get_mut(&key).unwrap().entry.as_mut().unwrap();
+                entry.fingerprint.url = foreign_url.into();
+                entry.snapshot.url = foreign_url.into();
+                entry.snapshot.conversation_count = Some(999);
+            }
+            let before = sub_fetch_totals(&forge);
+            let current = fetch_shared_snapshot_cached(&forge, &repo, 42, &cache, &key)
+                .await
+                .expect("refetch on current forge");
+            assert_eq!(current.url, first.url);
+            assert_eq!(current.conversation_count, first.conversation_count);
+            for ((method, before), (_, after)) in before.iter().zip(sub_fetch_totals(&forge)) {
+                assert_eq!(after - before, 1, "{method}: foreign cache was not reused");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deprecated_provider_preference_does_not_interrupt_monitor_poll() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let dir = crate::test_support::test_tempdir("monitor-provider-switch-");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let registry =
+            Arc::new(crate::settings_registry::SettingsRegistry::load(&config_path).unwrap());
+        let svc = svc.with_settings_registry(registry.clone());
+        let monitor = register(&svc, &ws, &owner).await;
+        let before = svc.store.get_pr_monitor(&monitor.monitor_id).await.unwrap();
+        forge.edit(|state| state.conversation_comments += 1);
+        forge.set_on_get_pr(Some(Box::new(move |_| {
+            registry
+                .apply(&[("sourceControl.activeProvider".into(), json!("gitlab"))])
+                .unwrap();
+        })));
+
+        svc.poll_pr_monitors().await;
+
+        let after = svc.store.get_pr_monitor(&monitor.monitor_id).await.unwrap();
+        assert_ne!(after.last_snapshot, before.last_snapshot);
+        assert!(after.last_polled_at.is_some());
+        assert_eq!(after.state, before.state);
+    }
+
+    #[tokio::test]
+    async fn one_instance_rate_limit_preserves_other_instance_polling_and_cache() {
+        let (_db, _root, svc, limited_forge, limited_workspace, limited_agent) = setup().await;
+        let dir = crate::test_support::test_tempdir("monitor-instance-isolation-");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let registry = Arc::new(crate::SettingsRegistry::load(&config_path).unwrap());
+        registry
+            .apply(&[(
+                "sourceControl.gitlab.instanceUrl".into(),
+                json!("https://git.example.test"),
+            )])
+            .unwrap();
+        let svc = svc.with_settings_registry(registry);
+        let gh = svc.with_source_control_scope("https://github.com");
+        let first = register(&gh, &limited_workspace, &limited_agent).await;
+        let (healthy_workspace, healthy_agent) = sibling_workspace(&svc, "agent-gitlab").await;
+        let mut healthy_record = svc.store.get_workspace(&healthy_workspace).await.unwrap();
+        healthy_record.pr_url = Some("https://git.example.test/o/r/-/merge_requests/42".into());
+        svc.store.update_workspace(&healthy_record).await.unwrap();
+        let healthy_forge = StubForge::new();
+        healthy_forge.edit(|state| state.pr_url_override = healthy_record.pr_url.clone());
+        let gl = svc
+            .with_source_control_scope("https://git.example.test")
+            .with_source_control(Arc::new(healthy_forge.clone()));
+        let second = register(&gl, &healthy_workspace, &healthy_agent).await;
+        limited_forge.edit(|state| state.rate_limit_get_pr = true);
+        healthy_forge.edit(|state| state.conversation_comments += 1);
+        gh.sweep_pr_monitors_on_connection(false, vec![first.clone()])
+            .await;
+        assert!(gh.sweeps_rate_limited());
+        assert!(!gl.sweeps_rate_limited());
+        let paused_row = svc.store.get_pr_monitor(&first.monitor_id).await.unwrap();
+        let before_poll = svc.store.get_pr_monitor(&second.monitor_id).await.unwrap();
+        assert!(paused_row
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("rate limited"));
+        assert!(
+            before_poll.last_error.is_none(),
+            "another host's pause must not annotate this monitor"
+        );
+        let before = healthy_forge.fetches();
+        gl.sweep_pr_monitors_on_connection(false, vec![before_poll])
+            .await;
+        assert_eq!(healthy_forge.fetches(), before + 1);
+        assert_eq!(gl.pr_monitor_fetch_cache_len(), 1);
+        assert_eq!(gh.pr_monitor_fetch_cache_len(), 0);
+        let after_poll = svc.store.get_pr_monitor(&second.monitor_id).await.unwrap();
+        assert_ne!(after_poll.last_snapshot, second.last_snapshot);
+        assert!(after_poll.last_error.is_none());
+        assert!(gh.monitor_rate_limit_paused_until(&first).await.is_some());
+        assert!(gl.monitor_rate_limit_paused_until(&second).await.is_none());
+        let wire = gl
+            .pr_monitor_list_op(&healthy_workspace, None)
+            .await
+            .unwrap();
+        assert!(wire["monitors"][0].get("pausedUntil").is_none());
+    }
+
     /// Quiet PR: three consecutive sweeps issue three `get_pr` reads but
     /// exactly ONE set of sub-reads — the first sweep fetches fully and the
     /// next two reuse it because the fingerprint did not move.
@@ -7434,6 +7683,144 @@ mod tests {
         let slot = guard.get(&key).expect("slot");
         assert!(slot.entry.is_none(), "superseded result not cached");
         assert_eq!(slot.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn connection_rotation_detaches_cache_from_in_flight_fetch() {
+        let (_db, _root, svc, forge, _workspace, _owner) = setup().await;
+        let old = svc.with_source_control_scope("https://github.com");
+        let for_hook = svc.clone();
+        forge.set_on_get_pr(Some(Box::new(move |_| {
+            for_hook.invalidate_source_control_connection("https://github.com");
+        })));
+        let repo = RepoRef::new("o", "r");
+        let key = pr_key_for(&repo, 42);
+        fetch_shared_snapshot_cached(&forge, &repo, 42, &old.pr_monitor_fetch_cache, &key)
+            .await
+            .unwrap();
+        let fresh = svc.with_source_control_scope("https://github.com");
+        assert_eq!(
+            old.pr_monitor_fetch_cache_len(),
+            1,
+            "late result can only reach its detached cache"
+        );
+        assert_eq!(
+            fresh.pr_monitor_fetch_cache_len(),
+            0,
+            "new account never sees the old result"
+        );
+        forge.set_on_get_pr(None);
+        let before = sub_fetch_totals(&forge);
+        fetch_shared_snapshot_cached(&forge, &repo, 42, &fresh.pr_monitor_fetch_cache, &key)
+            .await
+            .unwrap();
+        for ((method, before), (_, after)) in before.iter().zip(sub_fetch_totals(&forge)) {
+            assert_eq!(
+                after - before,
+                1,
+                "{method} must be fetched for the new connection generation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_change_during_awaited_pr_fetch_skips_workspace_and_root_persistence() {
+        let (_db, root, svc, forge, workspace_id, _owner) = setup().await;
+        let repository = root.path().join("origin-race");
+        std::fs::create_dir(&repository).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "feature"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ]);
+        git(&["remote", "add", "origin", "https://github.com/o/r.git"]);
+        let mut workspace = svc.store.get_workspace(&workspace_id).await.unwrap();
+        workspace.worktree_path = None;
+        workspace.repository_path = Some(repository.to_string_lossy().into_owned());
+        workspace.pr_number = Some(42);
+        workspace.pr_url = Some("https://github.com/o/r/pull/42".into());
+        workspace.pr_status = None;
+        svc.store.update_workspace(&workspace).await.unwrap();
+        let hook_path = repository.clone();
+        forge.set_on_get_pr(Some(Box::new(move |_| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&hook_path)
+                .args([
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://other.example/o/r.git"
+                ])
+                .status()
+                .unwrap()
+                .success());
+        })));
+        assert_eq!(
+            svc.refresh_workspace_pr(&workspace_id).await.unwrap(),
+            crate::pr_ops::PrRefreshOutcome::Skipped
+        );
+        assert!(svc
+            .store
+            .get_workspace(&workspace_id)
+            .await
+            .unwrap()
+            .pr_status
+            .is_none());
+        git(&["remote", "set-url", "origin", "https://github.com/o/r.git"]);
+        let git_root = intent_core::WorkspaceGitRoot {
+            id: intent_core::WorkspaceGitRootId::new(),
+            workspace_id: workspace_id.clone(),
+            path: repository.to_string_lossy().into_owned(),
+            source: intent_core::WorkspaceGitRootSource::Agent,
+            repo_owner: Some("o".into()),
+            repo_name: Some("r".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: Some(42),
+            pr_url: Some("https://github.com/o/r/pull/42".into()),
+            pr_status: None,
+            pull_requests: None,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        svc.store
+            .upsert_workspace_git_root(&git_root)
+            .await
+            .unwrap();
+        let provider: Arc<dyn intent_sourcecontrol::SourceControl> = Arc::new(forge);
+        assert_eq!(
+            svc.refresh_git_root_pr(git_root.clone(), &provider)
+                .await
+                .unwrap(),
+            crate::pr_ops::PrRefreshOutcome::Skipped
+        );
+        assert!(svc
+            .store
+            .get_workspace_git_root(&git_root.id)
+            .await
+            .unwrap()
+            .pr_status
+            .is_none());
     }
 
     // -----------------------------------------------------------------------
