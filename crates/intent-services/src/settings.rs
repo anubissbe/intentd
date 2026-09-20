@@ -1286,13 +1286,48 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             256.0,
         ),
         // --- Group B: source control ----------------------------------------
+        object(
+            "sourceControl.connections",
+            "Source control connections",
+            "Independent forge connections keyed by canonical instance URL",
+            "sourceControl",
+            Some(json!({})),
+        ),
         enumerated(
             "sourceControl.activeProvider",
             "Source-control provider",
             "Active forge implementation",
             "sourceControl",
-            &["github"],
+            &["github", "gitlab"],
             "github",
+        ),
+        string(
+            "sourceControl.gitlab.instanceUrl",
+            "GitLab instance URL",
+            "GitLab.com or self-hosted GitLab instance URL",
+            "sourceControl",
+            Some("https://gitlab.com"),
+        ),
+        enumerated(
+            "sourceControl.gitlab.tokenSource",
+            "GitLab token source",
+            "auto tries the instance-bound stored token, environment variables, then glab",
+            "sourceControl",
+            &["auto", "explicit", "env", "glab-cli"],
+            "auto",
+        ),
+        string(
+            "sourceControl.gitlab.tokenHost",
+            "GitLab token instance",
+            "Instance URL to which the stored GitLab token belongs",
+            "sourceControl",
+            None,
+        ),
+        secret(
+            "sourceControl.gitlab.token",
+            "GitLab token",
+            "Personal access token for the configured GitLab instance",
+            "sourceControl",
         ),
         enumerated(
             "sourceControl.github.tokenSource",
@@ -2423,6 +2458,31 @@ impl<'a> SettingsService<'a> {
             planned.push((def, value));
         }
 
+        // Bind PAT and instance in the SAME secret-store record. The public
+        // tokenHost setting is only input at credential save time: changing it
+        // later cannot rebind an old PAT, and registry-before-secret writes
+        // cannot briefly send the previous PAT to a newly selected instance.
+        let gitlab_token_host = planned
+            .iter()
+            .find(|(def, _)| def.path == "sourceControl.gitlab.tokenHost")
+            .and_then(|(_, value)| value.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                self.registry
+                    .and_then(|reg| reg.get("sourceControl.gitlab.tokenHost"))
+                    .and_then(|value| value.as_str().map(str::to_string))
+            });
+        if planned.iter().any(|(def, value)| {
+            def.path == "sourceControl.gitlab.token" && value.as_str() != Some(REDACTED_PLACEHOLDER)
+        }) && gitlab_token_host
+            .as_deref()
+            .is_none_or(|host| host.trim().is_empty())
+        {
+            return Err(Error::InvalidParams(
+                "Saving a GitLab token requires sourceControl.gitlab.tokenHost".into(),
+            ));
+        }
+
         // Keep validated entries only when persisting them would change the
         // observable setting state. For TOML-backed keys, origin is part of
         // that state: writing an effective default while the key is absent is
@@ -2440,6 +2500,11 @@ impl<'a> SettingsService<'a> {
                     let desired = match &value {
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
+                    };
+                    let desired = if def.path == "sourceControl.gitlab.token" {
+                        json!({ "token": desired, "instanceUrl": gitlab_token_host }).to_string()
+                    } else {
+                        desired
                     };
                     self.secrets.load(def.path).await?.as_deref() == Some(desired.as_str())
                 }
@@ -2502,6 +2567,12 @@ impl<'a> SettingsService<'a> {
                     let secret_value = match &value {
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
+                    };
+                    let secret_value = if def.path == "sourceControl.gitlab.token" {
+                        json!({ "token": secret_value, "instanceUrl": gitlab_token_host })
+                            .to_string()
+                    } else {
+                        secret_value
                     };
                     self.secrets
                         .store(def.path, &secret_value)

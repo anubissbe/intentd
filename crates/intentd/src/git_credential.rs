@@ -4,9 +4,9 @@
 //! Speaks the line-oriented git-credential protocol on stdin/stdout: git
 //! writes `key=value` attribute lines terminated by a blank line (or EOF), and
 //! a `get` operation answers with `username=`/`password=` lines. Only `get`
-//! for `protocol=https` + `host=github.com` is answered — everything else
-//! (including `store`/`erase`, other hosts, a daemon that is not running, the
-//! gate being off, or no token) prints nothing and exits 0 so git falls
+//! for `protocol=https` can be answered by a registered instance; other
+//! operations, unregistered hosts, a stopped daemon, disabled gates and missing
+//! tokens print nothing and exit 0 so git falls
 //! through to its remaining helpers/prompt rules. The credential comes from
 //! the running daemon over the UDS `system.gitCredential` control RPC
 //! (UDS-only by design; never exposed over WSS). The token value is never
@@ -61,6 +61,8 @@ async fn credential_for(
         "pid": std::process::id(),
         "protocol": attrs.get("protocol"),
         "host": attrs.get("host"),
+        "path": attrs.get("path"),
+        "username": attrs.get("username"),
     });
     let response = tokio::time::timeout(
         rpc_timeout,
@@ -90,12 +92,9 @@ pub(crate) fn parse_attributes(reader: impl BufRead) -> BTreeMap<String, String>
     attrs
 }
 
-/// The answer gate: only a `get` operation for `protocol=https` on
-/// `host=github.com` (case-insensitive, exact host — no subdomains, no
-/// explicit port) is eligible. `store`/`erase` and anything else are no-ops.
-/// A git-supplied `username` (an explicit identity in the remote URL, e.g.
-/// `https://alice@github.com/...`) must match the daemon's fixed helper
-/// identity — otherwise stay silent so the user's own credentials/prompt win.
+/// The local syntax gate accepts only `get` for a well-formed HTTPS
+/// authority. The daemon resolves registered host/port/path and checks the
+/// requested username against the provider identity before granting a secret.
 pub(crate) fn should_answer(operation: &str, attrs: &BTreeMap<String, String>) -> bool {
     if operation != "get" {
         return false;
@@ -103,12 +102,15 @@ pub(crate) fn should_answer(operation: &str, attrs: &BTreeMap<String, String>) -
     let protocol_ok = attrs
         .get("protocol")
         .is_some_and(|p| p.eq_ignore_ascii_case("https"));
-    let host_ok = attrs
-        .get("host")
-        .is_some_and(|h| h.eq_ignore_ascii_case("github.com"));
+    let host_ok = attrs.get("host").is_some_and(|host| {
+        !host.is_empty()
+            && host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-:[]".contains(&byte))
+    });
     let username_ok = attrs
         .get("username")
-        .is_none_or(|u| u == intent_git::auth::TOKEN_USERNAME);
+        .is_none_or(|u| !u.chars().any(char::is_control));
     protocol_ok && host_ok && username_ok
 }
 

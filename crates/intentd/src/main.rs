@@ -2341,6 +2341,7 @@ async fn cmd_serve(
     ));
 
     let control = Arc::new(DaemonControl {
+        credential_services: services.clone(),
         manager: manager.clone(),
         shutdown: shutdown_notify.clone(),
         ws_runtime: runtime.clone(),
@@ -2742,6 +2743,7 @@ async fn cmd_serve(
 /// count are read live on each status call. The runtime fields (`ws_server`,
 /// `ws_runtime`) allow settings-driven start/stop without daemon restart.
 struct DaemonControl {
+    credential_services: Services,
     manager: Arc<AgentManager>,
     shutdown: Arc<tokio::sync::Notify>,
     /// Runtime state for settings-driven listener control (§5.12). Holds the
@@ -4007,11 +4009,31 @@ impl SystemControl for DaemonControl {
     fn git_credential(
         &self,
         client_pid: Option<u64>,
+        host: String,
+        path: Option<String>,
+        username: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + '_>>
     {
         Box::pin(async move {
-            let credential =
-                intent_services::github_git_credential(Some(&self.settings_registry)).await;
+            let url = format!(
+                "https://{host}/{}",
+                path.as_deref().unwrap_or("").trim_start_matches('/')
+            );
+            let credential = self
+                .credential_services
+                .git_credential_for_child_url(&url)
+                .await
+                .filter(|credential| {
+                    username
+                        .as_deref()
+                        .is_none_or(|username| username == credential.username())
+                })
+                .map(|credential| {
+                    (
+                        credential.username().to_string(),
+                        credential.password().to_string(),
+                    )
+                });
             // Audit trail (monorepo#884): record every grant/denial with the
             // helper's self-reported pid. The token value is never logged.
             match &credential {

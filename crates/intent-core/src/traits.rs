@@ -3893,6 +3893,71 @@ pub trait WorkspaceApi: Send + Sync {
     // number])` directly. Backed by the same `intent-sourcecontrol` engine.
     // ------------------------------------------------------------------------
 
+    /// Return an isolated explicit-addressing context for one forge connection.
+    fn source_control_scoped(
+        &self,
+        target: serde_json::Value,
+    ) -> BoxFuture<'_, Result<std::sync::Arc<dyn WorkspaceApi>>> {
+        let _ = target;
+        Box::pin(async {
+            Err(Error::Internal(
+                "Source-control connections are not supported".into(),
+            ))
+        })
+    }
+
+    fn source_control_connections_list(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async {
+            Err(Error::Internal(
+                "Source-control connections are not supported".into(),
+            ))
+        })
+    }
+    fn source_control_connections_configure(
+        &self,
+        input: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = input;
+        Box::pin(async {
+            Err(Error::Internal(
+                "Source-control connections are not supported".into(),
+            ))
+        })
+    }
+    fn source_control_connections_disconnect(
+        &self,
+        connection_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = connection_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "Source-control connections are not supported".into(),
+            ))
+        })
+    }
+    fn source_control_auth_status(
+        &self,
+        connection_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = connection_id;
+        Box::pin(async {
+            Err(Error::Internal(
+                "Source-control connections are not supported".into(),
+            ))
+        })
+    }
+    fn source_control_resolve(
+        &self,
+        target: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = target;
+        Box::pin(async {
+            Err(Error::Internal(
+                "Source-control connections are not supported".into(),
+            ))
+        })
+    }
+
     /// `github.pulls.create`: open a PR with `head` sent **verbatim** (no
     /// `owner:branch` login prefix) — `{ pull }` (PROTOCOL §5.27).
     #[expect(clippy::too_many_arguments)]

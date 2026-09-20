@@ -218,13 +218,13 @@ async fn propose_sibling(
     create_params.insert("initialAgent".to_string(), Value::Object(initial_agent));
     create_params.insert("idempotencyKey".to_string(), json!(idempotency_key));
 
-    let github_url = match (
-        workspace.repository_owner.as_deref(),
-        workspace.repository_name.as_deref(),
-    ) {
-        (Some(owner), Some(name)) => Some(format!("https://github.com/{owner}/{name}")),
-        _ => None,
-    };
+    // A slug cannot identify a forge. Ask the daemon for this workspace's
+    // registered origin rather than manufacturing a github.com URL.
+    let github_url = api
+        .source_control_resolve(json!({"workspaceId":workspace_id.as_str()}))
+        .await
+        .ok()
+        .and_then(|resolved| resolved["repo"]["htmlUrl"].as_str().map(str::to_owned));
     let mut workspace_create = serde_json::Map::new();
     workspace_create.insert("mode".to_string(), json!("sibling"));
     workspace_create.insert("title".to_string(), json!(title));

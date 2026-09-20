@@ -32,8 +32,8 @@ pub enum RemoteBranch {
 /// [`RemoteBranch::Present`]/[`RemoteBranch::Missing`]; an unreachable remote
 /// (network/auth failure) is surfaced as an `Err`, preserving the TS distinction
 /// between "branch missing → local-only" and "remote unreachable → error".
-/// `token` is an optional caller-resolved GitHub token used as the final
-/// credential-chain step for HTTPS github.com remotes (see [`crate::auth`]).
+/// `token` is an optional caller-resolved instance-bound credential used as the final
+/// credential-chain step for matching HTTPS forge remotes (see [`crate::auth`]).
 ///
 /// # Errors
 ///
@@ -42,12 +42,22 @@ pub fn ls_remote_has_branch(
     worktree_path: &Path,
     remote: &str,
     branch: &str,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
 ) -> Result<RemoteBranch> {
     let repo = Repository::open(worktree_path).map_err(map_git_err)?;
     let mut remote_handle = repo.find_remote(remote).map_err(map_git_err)?;
+    if let Some(credential) = token {
+        let url = remote_handle.url().map_err(map_git_err)?;
+        let branches =
+            crate::ls_remote::ls_remote_blocking(url, Some(credential), Some(worktree_path))?;
+        return Ok(if branches.branches.iter().any(|name| name == branch) {
+            RemoteBranch::Present
+        } else {
+            RemoteBranch::Missing
+        });
+    }
     let connection = remote_handle
-        .connect_auth(Direction::Fetch, Some(remote_callbacks(token)), None)
+        .connect_auth(Direction::Fetch, Some(remote_callbacks(None)), None)
         .map_err(map_git_err)?;
     let target = format!("refs/heads/{branch}");
     let present = connection

@@ -11,14 +11,12 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 
 use intent_core::{parse_iso, Error, PullRequestInfo, PullRequestStatus, Result, Workspace};
 use intent_sourcecontrol::{
     CheckRun, CheckState, MergeMethod, MergeRequirementSignals, Page, PageParams, PrObservation,
     PrQuery, PrState, PullRequest, RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread,
     ReviewThreadComment, ReviewVerdict, RollupCheck, RollupCheckKind, SourceControl,
-    SourceControlRegistry, SourceControlSettings,
 };
 use time::OffsetDateTime;
 
@@ -43,23 +41,6 @@ pub(crate) fn map_sc_err(e: intent_sourcecontrol::Error) -> Error {
     }
 }
 
-/// Resolve the active [`SourceControl`]: the injected handle (tests / explicit
-/// wiring) else the registry-built provider from default settings (token from
-/// env / `gh` / keychain, §7.3). A missing token yields `Internal` (graceful).
-/// Async because the keychain / `gh` lookups run on the blocking pool with
-/// bounded timeouts so a wedged OS keychain or hung child never blocks the
-/// async runtime.
-pub(crate) async fn resolve_source_control(
-    injected: Option<Arc<dyn SourceControl>>,
-) -> Result<Arc<dyn SourceControl>> {
-    match injected {
-        Some(sc) => Ok(sc),
-        None => SourceControlRegistry::from_settings(&SourceControlSettings::default())
-            .await
-            .map_err(map_sc_err),
-    }
-}
-
 /// The workspace's forge repository ([`Workspace::repo`]) for its active
 /// provider, or [`NO_ACTIVE_PR`] when either slug half is unset (§7.6).
 pub(crate) fn repo_of(ws: &Workspace) -> Result<RepoRef> {
@@ -68,11 +49,17 @@ pub(crate) fn repo_of(ws: &Workspace) -> Result<RepoRef> {
 }
 
 /// Parse the `ws.pr.snapshot` cross-repo override: an `"owner/name"` slug
-/// with exactly one `/` and both halves non-empty.
+/// with a namespace (which may contain subgroups) and a non-empty name.
 pub(crate) fn parse_repo_slug(slug: &str) -> Result<(String, String)> {
     let trimmed = slug.trim();
-    if let Some((owner, name)) = trimmed.split_once('/') {
-        if !owner.is_empty() && !name.is_empty() && !name.contains('/') {
+    if let Some((owner, name)) = trimmed.rsplit_once('/') {
+        if !owner.is_empty()
+            && !name.is_empty()
+            && !owner
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            && !matches!(name, "." | "..")
+        {
             return Ok((owner.to_string(), name.to_string()));
         }
     }
@@ -414,18 +401,22 @@ pub(crate) async fn refresh_stale_pool_entries(
     let Some(items) = list.as_deref() else {
         return (false, None);
     };
-    let mut candidates: Vec<(Option<OffsetDateTime>, u64)> = items
+    let mut candidates: Vec<(Option<OffsetDateTime>, u64, String)> = items
         .iter()
         .filter(|p| p.status != PullRequestStatus::Merged && !exclude.contains(&p.number))
-        .map(|p| (parse_iso(&p.updated_at), p.number))
+        .map(|p| (parse_iso(&p.updated_at), p.number, p.url.clone()))
         .collect();
     candidates.sort();
     candidates.truncate(MAX_STALE_POOL_REFETCHES);
     let mut changed = false;
-    for (_, number) in candidates {
+    for (_, number, expected_url) in candidates {
         match tokio::time::timeout(per_entry_timeout, sc.get_pr(repo_ref, number)).await {
             Ok(Ok(pr)) => {
-                changed |= upsert_pr_info(list, &build_pr_info(&pr));
+                // Pools may contain URLs from another repository or provider.
+                // A matching number alone must never overwrite such an entry.
+                if same_pr_url(&expected_url, &pr.url) {
+                    changed |= upsert_pr_info_by_url(list, &build_pr_info(&pr));
+                }
             }
             Ok(Err(intent_sourcecontrol::Error::RateLimited(detail))) => {
                 return (changed, Some(detail));
@@ -519,7 +510,7 @@ pub(crate) fn build_status_summary(
         } else if mergeable == Some(true) && mergeable_state == "clean" {
             parts.push("✅ PR is mergeable with no conflicts.".to_string());
         } else if mergeable_state == "unknown" || mergeable.is_none() {
-            parts.push("⏳ GitHub is still computing mergeability.".to_string());
+            parts.push("⏳ The forge is still computing mergeability.".to_string());
         }
         if mergeable_state == "blocked" {
             parts.push(
@@ -1473,8 +1464,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_repo_slug_keeps_nested_gitlab_namespace() {
+        assert_eq!(
+            parse_repo_slug("group/subgroup/project").unwrap(),
+            ("group/subgroup".into(), "project".into())
+        );
+    }
+
+    #[test]
     fn parse_repo_slug_rejects_malformed_slugs() {
-        for bad in ["", " ", "acme", "acme/", "/widgets", "a/b/c"] {
+        for bad in [
+            "", " ", "acme", "acme/", "/widgets", "a//b", "a/../b", "a/.",
+        ] {
             let err = parse_repo_slug(bad).unwrap_err();
             assert!(
                 matches!(&err, Error::InvalidParams(m) if m.contains("owner/name")),
@@ -1789,7 +1790,7 @@ mod tests {
         );
         assert_eq!(
             build_status_summary("draft", None, "blocked"),
-            "📝 PR is a draft. ⏳ GitHub is still computing mergeability. 🔒 PR is blocked (e.g., required reviews or branch protection rules not met)."
+            "📝 PR is a draft. ⏳ The forge is still computing mergeability. 🔒 PR is blocked (e.g., required reviews or branch protection rules not met)."
         );
         assert_eq!(
             build_status_summary("open", Some(true), "weird"),

@@ -89,6 +89,11 @@ pub(crate) fn hit_repo(scope: &[RepoRef], html_url: &str) -> RepoRef {
 /// {repo}/...`); `None` when the path carries fewer than two segments.
 fn repo_from_html_url(html_url: &str) -> Option<RepoRef> {
     let rest = html_url.split_once("://").map_or(html_url, |(_, r)| r);
+    let path = rest.split_once('/')?.1;
+    if let Some((project_path, _)) = path.split_once("/-/") {
+        let (owner, name) = project_path.rsplit_once('/')?;
+        return Some(RepoRef::new(owner, name));
+    }
     let mut segments = rest.split('/').skip(1).filter(|s| !s.is_empty());
     let owner = segments.next()?;
     let repo = segments.next()?;
@@ -307,6 +312,21 @@ pub(crate) fn review_thread_to_json(t: &ReviewThread) -> Value {
 mod tests {
     use super::*;
     use intent_sourcecontrol::ReviewThreadComment;
+
+    #[test]
+    fn gitlab_search_hits_keep_all_namespace_segments() {
+        let scope = [
+            RepoRef::new("group/subgroup", "one"),
+            RepoRef::new("group/another", "two"),
+        ];
+        assert_eq!(
+            hit_repo(
+                &scope,
+                "https://git.euraika.net/group/another/two/-/merge_requests/7"
+            ),
+            scope[1]
+        );
+    }
 
     fn pr(state: PrState, draft: bool) -> PullRequest {
         PullRequest {

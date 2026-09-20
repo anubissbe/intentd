@@ -10,6 +10,8 @@ description = "Git wrappers: status/stage/commit/branches and worktree create + 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.9.86" }
 git2 = { workspace = true }
+url = "2"
+sha2 = "0.11"
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

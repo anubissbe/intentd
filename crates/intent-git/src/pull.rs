@@ -30,7 +30,7 @@ const POP_CONFLICT_MSG: &str = "Pull succeeded but your local changes conflict w
 
 /// Pull `branch_name` from `origin` for the repository at `repo_path`. See the
 /// module docs for the fetch-only vs pull-with-rebase split and the auto-stash
-/// workflow. `token` is an optional caller-resolved GitHub token forwarded to
+/// workflow. `token` is an optional caller-resolved instance-bound credential forwarded to
 /// the fetch step (see [`crate::fetch::fetch`]). Returns the outcome rather
 /// than an `Err` for the expected failure paths (matching the TS contract).
 ///
@@ -40,7 +40,7 @@ const POP_CONFLICT_MSG: &str = "Pull succeeded but your local changes conflict w
 pub fn pull_branch(
     repo_path: &Path,
     branch_name: &str,
-    token: Option<&str>,
+    token: Option<&crate::auth::GitCredential>,
 ) -> Result<GitPullResult> {
     let mut repo = Repository::open(repo_path).map_err(map_git_err)?;
     let current = crate::status::current_branch(&repo);

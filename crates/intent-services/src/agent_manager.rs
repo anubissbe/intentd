@@ -8521,11 +8521,9 @@ impl AgentManager {
         // intact). Gated on the opt-out setting and best-effort — setting off
         // or an unresolvable daemon binary path leaves the child env
         // untouched, and the spawn never fails on it.
-        let git_credential_expose = settings
-            .source_control
-            .github
-            .expose_git_credential_to_children;
-        inject_git_credential_env(&mut opts.extra_env, opts.cwd, git_credential_expose);
+        let git_credential_instances =
+            crate::terminal_ops::child_git_credential_instances(&settings.source_control);
+        inject_git_credential_env(&mut opts.extra_env, opts.cwd, &git_credential_instances);
         // Commit identity for `git commit` run by the agent's own tools
         // (intent-hq/intent#4142) — ungated: identity is not a secret.
         inject_git_identity_env(&mut opts.extra_env, opts.cwd);
@@ -10017,16 +10015,21 @@ fn rebuild_spawn_opts<'a>(
 fn inject_git_credential_env(
     extra_env: &mut BTreeMap<String, String>,
     cwd: Option<&Path>,
-    expose: bool,
+    instances: &[String],
 ) {
-    if !expose {
+    if instances.is_empty() {
         return;
     }
     let Some(intentd) = crate::daemon_exe_path() else {
         return;
     };
     let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
-    for (key, value) in intent_git::auth::daemon_helper_env(&intentd, cwd, inherited.as_deref()) {
+    for (key, value) in intent_git::auth::daemon_helpers_for_instances(
+        &intentd,
+        instances,
+        cwd,
+        inherited.as_deref(),
+    ) {
         extra_env.entry(key).or_insert(value);
     }
 }
@@ -15481,7 +15484,7 @@ mod rebuild_spawn_opts_tests {
     #[test]
     fn inject_git_credential_env_on_off_matrix() {
         let mut env = BTreeMap::new();
-        inject_git_credential_env(&mut env, None, true);
+        inject_git_credential_env(&mut env, None, &["https://github.com".to_string()]);
         assert_eq!(
             env.keys().map(String::as_str).collect::<Vec<_>>(),
             vec![intent_git::auth::GIT_CONFIG_PARAMETERS_ENV]
@@ -15498,7 +15501,7 @@ mod rebuild_spawn_opts_tests {
         );
 
         let mut env = BTreeMap::new();
-        inject_git_credential_env(&mut env, None, false);
+        inject_git_credential_env(&mut env, None, &[]);
         assert!(env.is_empty(), "setting off must not inject");
     }
 
@@ -15510,7 +15513,7 @@ mod rebuild_spawn_opts_tests {
             intent_git::auth::GIT_CONFIG_PARAMETERS_ENV.to_string(),
             "caller-set".to_string(),
         )]);
-        inject_git_credential_env(&mut env, None, true);
+        inject_git_credential_env(&mut env, None, &["https://github.com".to_string()]);
         assert_eq!(
             env[intent_git::auth::GIT_CONFIG_PARAMETERS_ENV],
             "caller-set"

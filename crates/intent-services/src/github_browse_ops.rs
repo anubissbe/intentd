@@ -50,7 +50,16 @@ pub(crate) fn github_repo_from_gitmodules_url(url: &str) -> Option<RepoRef> {
 /// repo identity (first occurrence wins), excluding `parent` itself
 /// (case-insensitive, via [`RepoRef`] equality), capped at
 /// [`RELATED_REPOS_CAP`]. Unparsable content simply yields no entries.
+#[cfg(test)]
 pub(crate) fn related_repos_from_gitmodules(content: &str, parent: &RepoRef) -> Vec<RelatedRepo> {
+    related_repos_from_gitmodules_with(content, parent, github_repo_from_gitmodules_url)
+}
+
+pub(crate) fn related_repos_from_gitmodules_with(
+    content: &str,
+    parent: &RepoRef,
+    parse_repo: impl Fn(&str) -> Option<RepoRef>,
+) -> Vec<RelatedRepo> {
     let mut out: Vec<RelatedRepo> = Vec::new();
     let mut section: Option<(Option<String>, Option<String>)> = None;
 
@@ -62,7 +71,7 @@ pub(crate) fn related_repos_from_gitmodules(content: &str, parent: &RepoRef) -> 
         let (Some(path), Some(url)) = (path, url) else {
             return;
         };
-        let Some(repo) = github_repo_from_gitmodules_url(&url) else {
+        let Some(repo) = parse_repo(&url) else {
             return;
         };
         if repo == *parent || out.iter().any(|r| r.repo == repo) {

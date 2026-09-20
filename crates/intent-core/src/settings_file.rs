@@ -467,8 +467,33 @@ impl Default for AuthSettings {
 pub struct SourceControlSettings {
     /// `sourceControl.activeProvider` — active forge implementation.
     pub active_provider: SourceControlProvider,
+    /// Connections keyed by canonical full instance URL; provider selection follows each repository.
+    pub connections: BTreeMap<String, SourceControlConnectionSettings>,
     /// `[sourceControl.github]` — GitHub client config.
     pub github: GithubSettings,
+    /// Self-hosted or GitLab.com client configuration.
+    pub gitlab: GitlabSettings,
+}
+
+/// Non-secret configuration for one independent forge instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct SourceControlConnectionSettings {
+    pub provider: SourceControlProvider,
+    pub token_source: String,
+    pub enabled: bool,
+    pub expose_git_credential_to_children: bool,
+}
+
+impl Default for SourceControlConnectionSettings {
+    fn default() -> Self {
+        Self {
+            provider: SourceControlProvider::Github,
+            token_source: "auto".into(),
+            enabled: true,
+            expose_git_credential_to_children: true,
+        }
+    }
 }
 
 /// `sourceControl.activeProvider` values.
@@ -477,6 +502,38 @@ pub struct SourceControlSettings {
 pub enum SourceControlProvider {
     #[default]
     Github,
+    Gitlab,
+}
+
+/// GitLab connection settings. The PAT itself is stored separately as a secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct GitlabSettings {
+    pub instance_url: String,
+    pub token_source: GitlabTokenSource,
+    /// Instance URL to which the stored token belongs; changing instanceUrl alone
+    /// must never send an existing token to a different server.
+    pub token_host: Option<String>,
+}
+
+impl Default for GitlabSettings {
+    fn default() -> Self {
+        Self {
+            instance_url: "https://gitlab.com".to_string(),
+            token_source: GitlabTokenSource::Auto,
+            token_host: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitlabTokenSource {
+    #[default]
+    Auto,
+    Explicit,
+    Env,
+    GlabCli,
 }
 
 /// Default `sourceControl.github.oauthClientId`: the intent-hq OAuth App
@@ -1298,6 +1355,52 @@ impl SettingsFile {
         fn bad(key: &str, msg: &str) -> Error {
             Error::InvalidInput(format!("invalid config.toml at `{key}`: {msg}"))
         }
+        for (instance, connection) in &self.source_control.connections {
+            let canonical = crate::source_control_instance::normalize(instance).map_err(|_| {
+                bad(
+                    "sourceControl.connections",
+                    "instance IDs must be valid HTTPS URLs",
+                )
+            })?;
+            if &canonical != instance {
+                return Err(bad(
+                    "sourceControl.connections",
+                    "instance IDs must use canonical URLs without a trailing slash",
+                ));
+            }
+            let valid_source = match connection.provider {
+                SourceControlProvider::Github => {
+                    if instance != "https://github.com" {
+                        return Err(bad(
+                            "sourceControl.connections",
+                            "GitHub requires https://github.com",
+                        ));
+                    }
+                    matches!(
+                        connection.token_source.as_str(),
+                        "auto" | "explicit" | "env" | "gh-cli"
+                    )
+                }
+                SourceControlProvider::Gitlab => {
+                    if instance == "https://github.com" {
+                        return Err(bad(
+                            "sourceControl.connections",
+                            "github.com is reserved for GitHub",
+                        ));
+                    }
+                    matches!(
+                        connection.token_source.as_str(),
+                        "auto" | "explicit" | "env" | "glab-cli"
+                    )
+                }
+            };
+            if !valid_source {
+                return Err(bad(
+                    "sourceControl.connections",
+                    "tokenSource is not supported by this provider",
+                ));
+            }
+        }
         let v = self.notifications.volume;
         if !(0.0..=1.0).contains(&v) {
             return Err(bad(
@@ -1618,6 +1721,13 @@ enabled = true
 [sourceControl]
 # Source-control provider -- active forge implementation: "github".
 activeProvider = "github"
+
+[sourceControl.gitlab]
+# GitLab instance URL (HTTPS; HTTP is reserved for loopback development).
+instanceUrl = "https://gitlab.com"
+# Token source: auto, explicit, env, or glab-cli. PATs live in the secret store.
+tokenSource = "auto"
+# tokenHost binds a stored PAT to its instance URL; set with the token.
 
 [sourceControl.github]
 # GitHub token source -- where the GitHub token comes from: "auto" (secrets

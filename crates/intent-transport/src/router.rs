@@ -417,6 +417,23 @@ fn encode_dispatch_result(
     }
 }
 
+async fn dispatch_source_control(
+    api: &dyn WorkspaceApi,
+    operation: &str,
+    params: &Map<String, Value>,
+) -> Result<Value, RpcErr> {
+    let scoped = api
+        .source_control_scoped(Value::Object(params.clone()))
+        .await
+        .map_err(domain_to_rpc)?;
+    Box::pin(dispatch(
+        scoped.as_ref(),
+        &format!("github.{operation}"),
+        params,
+    ))
+    .await
+}
+
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
 async fn dispatch(
     api: &dyn WorkspaceApi,
@@ -424,6 +441,71 @@ async fn dispatch(
     params: &Map<String, Value>,
 ) -> Result<Value, RpcErr> {
     match method {
+        "sourceControl.repos.list" => dispatch_source_control(api, "repos.list", params).await,
+        "sourceControl.repos.search" => dispatch_source_control(api, "repos.search", params).await,
+        "sourceControl.repos.get" => dispatch_source_control(api, "repos.get", params).await,
+        "sourceControl.repoConfig.get" => {
+            dispatch_source_control(api, "repoConfig.get", params).await
+        }
+        "sourceControl.relatedRepos.list" => {
+            dispatch_source_control(api, "relatedRepos.list", params).await
+        }
+        "sourceControl.branches.list" => {
+            dispatch_source_control(api, "branches.list", params).await
+        }
+        "sourceControl.branches.listCached" => {
+            dispatch_source_control(api, "branches.listCached", params).await
+        }
+        "sourceControl.pulls.create" => dispatch_source_control(api, "pulls.create", params).await,
+        "sourceControl.pulls.get" => dispatch_source_control(api, "pulls.get", params).await,
+        "sourceControl.pulls.list" => dispatch_source_control(api, "pulls.list", params).await,
+        "sourceControl.pulls.search" => dispatch_source_control(api, "pulls.search", params).await,
+        "sourceControl.pulls.merge" => dispatch_source_control(api, "pulls.merge", params).await,
+        "sourceControl.pulls.updateBranch" => {
+            dispatch_source_control(api, "pulls.updateBranch", params).await
+        }
+        "sourceControl.issues.get" => dispatch_source_control(api, "issues.get", params).await,
+        "sourceControl.issues.list" => dispatch_source_control(api, "issues.list", params).await,
+        "sourceControl.issues.search" => {
+            dispatch_source_control(api, "issues.search", params).await
+        }
+        "sourceControl.getUser" => dispatch_source_control(api, "getUser", params).await,
+        "sourceControl.listReviewComments" => {
+            dispatch_source_control(api, "listReviewComments", params).await
+        }
+        "sourceControl.replyReviewComment" => {
+            dispatch_source_control(api, "replyReviewComment", params).await
+        }
+        "sourceControl.getReviewThreads" => {
+            dispatch_source_control(api, "getReviewThreads", params).await
+        }
+        "sourceControl.resolveThread" => {
+            dispatch_source_control(api, "resolveThread", params).await
+        }
+        "sourceControl.unresolveThread" => {
+            dispatch_source_control(api, "unresolveThread", params).await
+        }
+        "sourceControl.connections.list" => api
+            .source_control_connections_list()
+            .await
+            .map_err(domain_to_rpc),
+        "sourceControl.connections.configure" => api
+            .source_control_connections_configure(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
+        "sourceControl.connections.disconnect" => api
+            .source_control_connections_disconnect(require_str_param(params, "connectionId")?)
+            .await
+            .map_err(domain_to_rpc),
+        "sourceControl.authStatus" => api
+            .source_control_auth_status(require_str_param(params, "connectionId")?)
+            .await
+            .map_err(domain_to_rpc),
+        "sourceControl.resolve" => api
+            .source_control_resolve(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
+
         "workspace.list" => {
             let include_archived = params
                 .get("includeArchived")

@@ -255,6 +255,9 @@ pub trait SystemControl: Send + Sync {
     fn git_credential(
         &self,
         client_pid: Option<u64>,
+        host: String,
+        path: Option<String>,
+        username: Option<String>,
     ) -> Pin<Box<dyn Future<Output = Option<GitCredential>> + Send + '_>>;
 }
 
@@ -272,6 +275,8 @@ pub(crate) enum SystemMethod {
         pid: Option<u64>,
         protocol: Option<String>,
         host: Option<String>,
+        path: Option<String>,
+        username: Option<String>,
     },
 }
 
@@ -344,6 +349,8 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
                 pid,
                 protocol: text("protocol"),
                 host: text("host"),
+                path: text("path"),
+                username: text("username"),
             }
         }
         _ => return None,
@@ -457,12 +464,16 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
     v
 }
 
-/// The daemon-side scope gate for `system.gitCredential` (monorepo#884): only
-/// `protocol=https` + `host=github.com` (case-insensitive, exact host) may
-/// receive the credential. Mirrors the helper's own client-side gate.
+/// Reject malformed or non-HTTPS requests before invoking the daemon's
+/// registry-backed authority/path/identity credential resolver.
 pub(crate) fn git_credential_scope_ok(protocol: Option<&str>, host: Option<&str>) -> bool {
     protocol.is_some_and(|p| p.eq_ignore_ascii_case("https"))
-        && host.is_some_and(|h| h.eq_ignore_ascii_case("github.com"))
+        && host.is_some_and(|host| {
+            !host.is_empty()
+                && host
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b".-:[]".contains(&byte))
+        })
 }
 
 /// Handle a classified `system.*` request: build the response frame (or `None`
@@ -544,20 +555,29 @@ pub(crate) async fn handle(
             pid,
             protocol,
             host,
+            path,
+            username,
         } => {
             // Defense in depth (monorepo#884): the daemon re-checks the
             // helper's scope gate, so an arbitrary local UDS caller cannot
-            // obtain the credential for anything but https://github.com. A
+            // bypass the registry authority and path binding. A
             // scope miss is indistinguishable from "no token" on the wire.
-            if git_credential_scope_ok(protocol.as_deref(), host.as_deref()) {
-                let credential = control.git_credential(pid).await.map(
+            if git_credential_scope_ok(protocol.as_deref(), host.as_deref())
+                && path.as_deref().is_none_or(|path| {
+                    !path.chars().any(char::is_control) && !path.contains(['?', '#', '\\'])
+                })
+                && username
+                    .as_deref()
+                    .is_none_or(|value| !value.chars().any(char::is_control))
+            {
+                let credential = control.git_credential(pid, host.unwrap_or_default(), path, username).await.map(
                     |(username, password)| json!({ "username": username, "password": password }),
                 );
                 Ok(json!({ "credential": credential }))
             } else {
                 tracing::debug!(
                     client_pid = pid,
-                    "git credential request denied (scope is not https://github.com)"
+                    "git credential request denied (invalid HTTPS scope)"
                 );
                 Ok(json!({ "credential": Value::Null }))
             }

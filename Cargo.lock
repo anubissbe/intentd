@@ -2213,6 +2213,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "url",
  "uuid",
  "windows-sys 0.61.2",
 ]
@@ -2226,9 +2227,11 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2361,6 +2364,7 @@ dependencies = [
  "http",
  "intent-core",
  "octocrab",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",

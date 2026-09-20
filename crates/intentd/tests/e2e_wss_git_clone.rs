@@ -487,7 +487,7 @@ where
 const E2E_TOKEN: &str = "e2e-825-stored-token-value";
 
 /// Materialise a stub `git` in `dir` that records its argv plus the
-/// `INTENT_GIT_GITHUB_TOKEN` and `GIT_CONFIG_PARAMETERS` env vars to capture
+/// `INTENT_GIT_SCOPED_PASSWORD` and `GIT_CONFIG_PARAMETERS` env vars to capture
 /// files, then fails with the auth-shaped stderr `GIT_TERMINAL_PROMPT=0`
 /// produces for a private HTTPS repo. Returns the PATH value (stub dir first)
 /// for the daemon.
@@ -496,7 +496,7 @@ fn make_stub_git(dir: &Path, capture: &Path) -> String {
     let script = format!(
         "#!/bin/sh\n\
          for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"{capture}.argv\"\n\
-         printf '%s' \"${{INTENT_GIT_GITHUB_TOKEN-}}\" > \"{capture}.token\"\n\
+         printf '%s' \"${{INTENT_GIT_SCOPED_PASSWORD-}}\" > \"{capture}.token\"\n\
          printf '%s' \"${{GIT_CONFIG_PARAMETERS-}}\" > \"{capture}.params\"\n\
          echo \"fatal: could not read Username for 'https://github.com': terminal prompts disabled\" >&2\n\
          exit 128\n",
@@ -560,7 +560,7 @@ async fn boot_with_stub_git() -> (Daemon, u16, Arc<ClientConfig>, PathBuf) {
 /// Regression for monorepo#825 (credential injection): a `git.clone` of a
 /// private HTTPS github.com repo offers the stored token to the child git via
 /// the env-backed credential helper — the helper config travels in
-/// `GIT_CONFIG_PARAMETERS`, the token bytes only in `INTENT_GIT_GITHUB_TOKEN`
+/// `GIT_CONFIG_PARAMETERS`, the token bytes only in `INTENT_GIT_SCOPED_PASSWORD`
 /// (neither in argv) — and the auth-shaped failure is classified as
 /// `errorCode: "auth-required"` on `git:clone:done` with no token leaking
 /// into any wire frame.
@@ -643,7 +643,7 @@ async fn git_clone_injects_stored_token_and_classifies_auth_failure() {
         .expect("stub git captured token env");
     assert_eq!(
         token, E2E_TOKEN,
-        "stored token travels via INTENT_GIT_GITHUB_TOKEN"
+        "stored token travels via INTENT_GIT_SCOPED_PASSWORD"
     );
 }
 

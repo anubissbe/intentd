@@ -16096,6 +16096,8 @@ pub(crate) mod pr {
     #[derive(Default)]
     pub(crate) struct StubForge {
         fail_threads: bool,
+        /// A successful HTTP response whose merge is still pending/refused.
+        merge_not_completed: bool,
         /// When set, `get_review_threads` fails with `RateLimited` (the
         /// GraphQL quota is exhausted), exercising the checklist's
         /// quota-exhaustion propagation instead of the REST fallback.
@@ -16481,9 +16483,13 @@ pub(crate) mod pr {
             _: MergeOptions,
         ) -> ScResult<MergeOutcome> {
             Ok(MergeOutcome {
-                merged: true,
-                message: format!("Merged via {method:?}"),
-                sha: Some("mergedsha".into()),
+                merged: !self.merge_not_completed,
+                message: if self.merge_not_completed {
+                    "Merge has not completed".into()
+                } else {
+                    format!("Merged via {method:?}")
+                },
+                sha: (!self.merge_not_completed).then(|| "mergedsha".into()),
             })
         }
         async fn mergeability(&self, _: &RepoRef, _: u64) -> ScResult<Mergeability> {
@@ -17617,12 +17623,14 @@ pub(crate) mod pr {
         // scopes the lookup (no "No active PR" guard), and the resolved repo
         // is echoed back.
         let (_t, svc, ws) = setup(false, false).await;
-        let v = svc
-            .pr_state(ws, 42, Some("acme/widgets".into()))
-            .await
-            .expect("snapshot");
-        assert_eq!(v["repo"], "acme/widgets");
-        assert_eq!(v["prNumber"], 42);
+        for repo in ["acme/widgets", "acme/subgroup/widgets"] {
+            let v = svc
+                .pr_state(ws.clone(), 42, Some(repo.into()))
+                .await
+                .expect("snapshot");
+            assert_eq!(v["repo"], repo);
+            assert_eq!(v["prNumber"], 42);
+        }
     }
 
     /// `pausedUntil` on the snapshot describes the global rate-limit gate as
@@ -17674,7 +17682,7 @@ pub(crate) mod pr {
     #[intent_test_macros::daemon_test]
     async fn state_snapshot_rejects_malformed_repo_arg() {
         let (_t, svc, ws) = setup(false, true).await;
-        for bad in ["acme", "acme/", "/widgets", "a/b/c", " "] {
+        for bad in ["acme", "acme/", "/widgets", "a//c", "a/../c", "a/./c", " "] {
             let err = svc
                 .pr_state(ws.clone(), 42, Some(bad.into()))
                 .await
@@ -18471,6 +18479,30 @@ pub(crate) mod pr {
         assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
     }
 
+    #[intent_test_macros::daemon_test]
+    async fn merge_not_completed_never_marks_the_workspace_merged() {
+        let (_t, svc, ws) = setup_with(
+            StubForge {
+                merge_not_completed: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await;
+        let before = svc.store().get_workspace(&ws).await.unwrap();
+        let result = svc
+            .accept_changes_merge_pr(ws.clone(), 42, Some("squash".into()), None, None)
+            .await
+            .expect("negative merge response");
+        assert_eq!(result["success"], false);
+        assert_eq!(result["steps"][0]["status"], "failed");
+        let after = svc.store().get_workspace(&ws).await.unwrap();
+        assert_eq!(after.pr_status, before.pr_status);
+        assert_eq!(after.active_pull_request, before.active_pull_request);
+        assert_eq!(after.pull_requests, before.pull_requests);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
     /// Undoing a commit that renamed a file re-attributes BOTH sides of the
     /// rename (monorepo#4594): the soft reset leaves a staged `R`, which the
     /// display status collapses under the new path only, but attribution is
@@ -19090,6 +19122,8 @@ pub(crate) mod pr {
 
     /// Bus-wired service plus a seeded workspace whose worktree is `worktree`.
     /// The bus persists `gitRoot:*` events to the durable log we assert on.
+    /// Inject a forge so sweeps use their supplied stub and never discover
+    /// real credentials from the developer's environment or configured CLIs.
     async fn sweep_setup(worktree: &std::path::Path) -> (TempDb, Services, intent_core::Workspace) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -19098,7 +19132,9 @@ pub(crate) mod pr {
         ws.worktree_path = Some(worktree.to_string_lossy().into_owned());
         store.insert_workspace(&ws).await.unwrap();
         let bus = crate::EventBus::new(store.clone());
-        let svc = Services::new(store).with_event_bus(bus);
+        let svc = Services::new(store)
+            .with_event_bus(bus)
+            .with_source_control(Arc::new(StubForge::default()));
         (tmp, svc, ws)
     }
 
@@ -28745,8 +28781,8 @@ mod known_repo {
 
     /// `workspace.create` derives `repository_owner` and `repository_name` from
     /// the `origin` remote URL when the caller omits them (STAB-64). Caller-
-    /// supplied values always win; non-github remotes leave owner unset; missing
-    /// remotes fall back to basename for name. Strict host check rejects
+    /// supplied values always win; unregistered remotes leave owner unset;
+    /// missing remotes fall back to basename for name. Strict host check rejects
     /// github.com.evil.com and similar substring attacks.
     #[intent_test_macros::daemon_test]
     async fn create_workspace_derives_owner_and_name_from_origin_remote() {
@@ -28826,8 +28862,8 @@ mod known_repo {
             "ssh remote derives name"
         );
 
-        // Non-github remote → owner stays None, name falls back to basename.
-        let gitlab_repo = make_repo("https://gitlab.com/myorg/myrepo.git");
+        // The built-in GitLab connection preserves nested namespace ownership.
+        let gitlab_repo = make_repo("https://gitlab.com/myorg/platform/myrepo.git");
         let gitlab_ws = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -28839,18 +28875,40 @@ mod known_repo {
             .await
             .expect("create gitlab");
         assert_eq!(
-            gitlab_ws.workspace.repository_owner, None,
-            "non-github remote leaves owner unset"
+            gitlab_ws.workspace.repository_owner.as_deref(),
+            Some("myorg/platform"),
+            "registered GitLab remote derives the complete namespace"
         );
-        // The basename fallback still fires because the remote didn't parse.
+        assert_eq!(
+            gitlab_ws.workspace.repository_name.as_deref(),
+            Some("myrepo"),
+            "registered GitLab remote derives the project name"
+        );
+
+        // An unregistered forge still falls back to the local directory name.
+        let unknown_repo = make_repo("https://forge.unregistered.invalid/myorg/myrepo.git");
+        let unknown_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(unknown_repo.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create unregistered forge");
+        assert_eq!(
+            unknown_ws.workspace.repository_owner, None,
+            "unregistered remote leaves owner unset"
+        );
         assert!(
-            gitlab_ws
+            unknown_ws
                 .workspace
                 .repository_name
                 .as_deref()
                 .unwrap()
                 .starts_with("intentd-origin-"),
-            "non-github remote falls back to basename for name"
+            "unregistered remote falls back to basename for name"
         );
 
         // No origin remote → owner stays None, name falls back to basename.
