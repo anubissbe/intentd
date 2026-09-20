@@ -27,7 +27,7 @@ use intent_core::events::{
 };
 use intent_core::{
     extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, AgentLite, ConversationProjection,
-    Event, Note, NoteId, NoteListProjection, Workspace, WorkspaceApi, WorkspaceId,
+    Error, Event, Note, NoteId, NoteListProjection, Workspace, WorkspaceApi, WorkspaceId,
     SLIM_PAGE_BUDGET_BYTES,
 };
 use serde_json::{json, Map, Value};
@@ -609,7 +609,8 @@ pub(crate) fn trace_chat_snapshot(scope: &str, subscription_id: &str, snapshot: 
 }
 
 /// Record a chat forwarder loop exiting. `reason` is a fixed vocabulary:
-/// `client_closed` (the outbound lane is gone) or `bus_closed`.
+/// `client_closed` (the outbound lane is gone), `bus_closed`, or
+/// `membership_revoked` (the subscriber lost the agent's workspace).
 pub(crate) fn trace_chat_forwarder_exit(scope: &str, subscription_id: &str, reason: &'static str) {
     tracing::info!(
         target: LIFECYCLE_TARGET,
@@ -790,7 +791,7 @@ pub(crate) async fn chat_snapshot(
     since_message_id: Option<&str>,
     projection: Option<ConversationProjection>,
 ) -> Value {
-    let mut snapshot = match api
+    let (mut snapshot, overlay) = match api
         .agent_get_conversation(
             agent_id.clone(),
             None,
@@ -803,19 +804,35 @@ pub(crate) async fn chat_snapshot(
         )
         .await
     {
-        Ok(v) => v,
-        Err(_) => json!({
-            "agentId": agent_id.as_str(),
-            "messages": [],
-            "truncated": false,
-            "totalMessages": 0,
-            "nextToken": Value::Null,
-        }),
+        Ok(v) => (v, true),
+        // A refused read (a non-member's guarded page, multiplayer w3 — or an
+        // unknown agent) serves the empty page WITHOUT the live overlay: the
+        // in-flight turn and activity flags are not membership-gated, so
+        // overlaying them would leak the live turn the persisted page just
+        // refused. A transient read error keeps the overlay only for an
+        // administrator: for a collaborator the guarded read is the ONLY
+        // membership check on this path, and a failure inside the guard
+        // itself (store error) has verified nothing.
+        Err(err) => {
+            let refused = matches!(err, Error::Forbidden(_) | Error::NotFound(_));
+            (
+                json!({
+                    "agentId": agent_id.as_str(),
+                    "messages": [],
+                    "truncated": false,
+                    "totalMessages": 0,
+                    "nextToken": Value::Null,
+                }),
+                !refused && !crate::context::is_non_administrator_caller(),
+            )
+        }
     };
     if let Some(since) = since_message_id {
         apply_resume_filter(&mut snapshot, since);
     }
-    overlay_live_state(api, agent_id, &mut snapshot, projection).await;
+    if overlay {
+        overlay_live_state(api, agent_id, &mut snapshot, projection).await;
+    }
     snapshot
 }
 
@@ -1785,7 +1802,10 @@ pub(crate) async fn channel_delta(
         // generic arm is unreachable for `Note`; full rows keep it faithful.
         Channel::Note => note_delta(api, workspace_id, event, None).await,
         Channel::Agent => agent_delta(api, event).await,
-        Channel::Workspace => workspace_delta(api, event).await,
+        // The workspace channel's tombstone scoping is stateful (the
+        // forwarder threads the subscriber's visible-id set); this generic
+        // arm is the unscoped administrator form.
+        Channel::Workspace => workspace_delta(api, event, None).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,
         // The task channel uses the stateful [`task_delta`] mapper directly in
         // the forwarder: it tracks the spec's task-link set across deltas so a
@@ -2014,6 +2034,22 @@ fn agent_list_row(mut agent: AgentLite) -> Option<Value> {
     serde_json::to_value(agent).ok()
 }
 
+/// The workspace ids a `workspace` channel subscriber has been shown so far,
+/// seeded from the snapshot rows — `id` of each — and maintained by
+/// [`workspace_delta`]. Only a non-administrator forwarder tracks one
+/// (multiplayer w3): the channel is global, so without it a
+/// `workspace:deleted` tombstone would disclose the id of a workspace the
+/// subscriber was never a member of.
+pub(crate) fn visible_workspace_ids(snapshot: &Value) -> HashSet<String> {
+    snapshot
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Map a `workspace` channel event by re-reading the [`Workspace`]. The channel
 /// is global, so the id comes from `data.workspaceId` (falling back to the
 /// event's `workspaceId`). `workspace:created` → `added`, `workspace:deleted` →
@@ -2044,7 +2080,17 @@ fn agent_list_row(mut agent: AgentLite) -> Option<Value> {
 /// from workspace-channel updates — and `agentSummary` is allowlisted and
 /// counted inside the row budget (the budget golden's worst case carries a
 /// ten-agent summary).
-pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Option<Value> {
+///
+/// With `visible` (a non-administrator subscriber), a `workspace:deleted`
+/// tombstone is emitted only for a workspace previously shown to this
+/// subscriber, and every successful re-read records the id as shown; the
+/// subscriber's own unshare removes it. Without it (administrator) every
+/// tombstone is emitted as before.
+pub(crate) async fn workspace_delta(
+    api: &dyn WorkspaceApi,
+    event: &Event,
+    visible: Option<&mut HashSet<String>>,
+) -> Option<Value> {
     let workspace_id = WorkspaceId::from(
         event
             .data
@@ -2056,9 +2102,19 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         return None;
     }
     match event.event_type.as_str() {
-        WORKSPACE_DELETED => Some(json!({ "removedIds": [workspace_id.as_str()] })),
+        WORKSPACE_DELETED => {
+            if let Some(visible) = visible {
+                if !visible.remove(workspace_id.as_str()) {
+                    return None;
+                }
+            }
+            Some(json!({ "removedIds": [workspace_id.as_str()] }))
+        }
         WORKSPACE_CREATED => {
-            let ws = api.get_workspace(workspace_id).await.ok()?;
+            let ws = api.get_workspace(workspace_id.clone()).await.ok()?;
+            if let Some(visible) = visible {
+                visible.insert(workspace_id.as_str().to_string());
+            }
             Some(json!({ "added": [workspace_list_row(ws)?] }))
         }
         WORKSPACE_UPDATED
@@ -2069,7 +2125,22 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
         | PR_LINKED
         | PR_UPDATED
         | PR_UNLINKED => {
-            let ws = api.get_workspace(workspace_id).await.ok()?;
+            // Unshare (multiplayer w3): the forwarder runs under the
+            // subscriber's caller, so the member named by
+            // `changes.removedPrincipalId` sees its own removal as a
+            // `removedIds` delta. Any other subscriber falls through to the
+            // re-read, which is `NotFound` for non-members (no delta) — a
+            // non-member workspace id is never disclosed.
+            if is_unshare_of_current_caller(event) {
+                if let Some(visible) = visible {
+                    visible.remove(workspace_id.as_str());
+                }
+                return Some(json!({ "removedIds": [workspace_id.as_str()] }));
+            }
+            let ws = api.get_workspace(workspace_id.clone()).await.ok()?;
+            if let Some(visible) = visible {
+                visible.insert(workspace_id.as_str().to_string());
+            }
             Some(json!({ "updated": [workspace_list_row(ws)?] }))
         }
         _ => None,
@@ -2087,6 +2158,23 @@ pub(crate) async fn workspace_delta(api: &dyn WorkspaceApi, event: &Event) -> Op
 fn workspace_list_row(mut ws: Workspace) -> Option<Value> {
     ws.slim_for_list();
     serde_json::to_value(ws).ok()
+}
+
+/// Whether `event` is a `workspace:updated` unshare whose
+/// `changes.removedPrincipalId` is the current request's wire principal.
+fn is_unshare_of_current_caller(event: &Event) -> bool {
+    let Some(removed) = event
+        .data
+        .get("changes")
+        .and_then(|c| c.get("removedPrincipalId"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    matches!(
+        intent_core::current_caller(),
+        Some(intent_core::Caller::Wire { principal_id, .. }) if principal_id.as_str() == removed
+    )
 }
 
 /// Map a `comment` channel event by re-reading the affected thread summary. A
