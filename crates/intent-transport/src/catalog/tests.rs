@@ -465,7 +465,7 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
 ///   the author projection), never a human row; `agent.respondPermission`
 ///   and `agent.stop` drive turn control without appending a chat row
 ///   (question answers travel as `agent.sendMessage` content).
-/// - `note.*`, `comment.*`, `task.*`, `github.*` write notes, comments and
+/// - `note.*`, `comment.*`, `task.*`, `github.*`, `sourceControl.*` write notes, comments and
 ///   forge objects — never the agent transcript; `accept-changes.*` and
 ///   `file-tracking.*` drive the worktree / PR flow the same way.
 const NON_USER_ORIGIN_METHODS: &[&str] = &[
@@ -751,6 +751,33 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "settings.reset",
     "settings.update",
     "skill.list",
+    "sourceControl.authStatus",
+    "sourceControl.branches.list",
+    "sourceControl.branches.listCached",
+    "sourceControl.connections.configure",
+    "sourceControl.connections.disconnect",
+    "sourceControl.connections.list",
+    "sourceControl.getReviewThreads",
+    "sourceControl.getUser",
+    "sourceControl.issues.get",
+    "sourceControl.issues.list",
+    "sourceControl.issues.search",
+    "sourceControl.listReviewComments",
+    "sourceControl.pulls.create",
+    "sourceControl.pulls.get",
+    "sourceControl.pulls.list",
+    "sourceControl.pulls.merge",
+    "sourceControl.pulls.search",
+    "sourceControl.pulls.updateBranch",
+    "sourceControl.relatedRepos.list",
+    "sourceControl.replyReviewComment",
+    "sourceControl.repoConfig.get",
+    "sourceControl.repos.get",
+    "sourceControl.repos.list",
+    "sourceControl.repos.search",
+    "sourceControl.resolve",
+    "sourceControl.resolveThread",
+    "sourceControl.unresolveThread",
     "specialist.create",
     "specialist.delete",
     "specialist.edit",
@@ -1081,7 +1108,8 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// or named here. The failure message prints the recomputed golden.
 ///
 /// Owner-only families: `host.*` but the two display probes, `browser.*`,
-/// `forward.*`, `terminal.*`, `script.*`, `github.*`, `linear.*`, `sentry.*`,
+/// `forward.*`, `terminal.*`, `script.*`, `github.*`, `sourceControl.*`,
+/// `linear.*`, `sentry.*`,
 /// `voice.*`, `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
 /// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`),
 /// `rules.*`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
@@ -1241,6 +1269,33 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "settings.list",
     "settings.reset",
     "settings.update",
+    "sourceControl.authStatus",
+    "sourceControl.branches.list",
+    "sourceControl.branches.listCached",
+    "sourceControl.connections.configure",
+    "sourceControl.connections.disconnect",
+    "sourceControl.connections.list",
+    "sourceControl.getReviewThreads",
+    "sourceControl.getUser",
+    "sourceControl.issues.get",
+    "sourceControl.issues.list",
+    "sourceControl.issues.search",
+    "sourceControl.listReviewComments",
+    "sourceControl.pulls.create",
+    "sourceControl.pulls.get",
+    "sourceControl.pulls.list",
+    "sourceControl.pulls.merge",
+    "sourceControl.pulls.search",
+    "sourceControl.pulls.updateBranch",
+    "sourceControl.relatedRepos.list",
+    "sourceControl.replyReviewComment",
+    "sourceControl.repoConfig.get",
+    "sourceControl.repos.get",
+    "sourceControl.repos.list",
+    "sourceControl.repos.search",
+    "sourceControl.resolve",
+    "sourceControl.resolveThread",
+    "sourceControl.unresolveThread",
     "specialist.create",
     "specialist.delete",
     "specialist.edit",
@@ -1642,6 +1697,12 @@ mod unbound_owner_only_methods {
         let dir = f.dir.path().to_string_lossy().into_owned();
         let gh = json!({ "owner": "o", "repo": "r" });
         let gh_n = json!({ "owner": "o", "repo": "r", "number": 1 });
+        let source_control = json!({ "connectionId": "https://github.com" });
+        let source_control_repo =
+            json!({ "connectionId": "https://github.com", "owner": "o", "repo": "r" });
+        let source_control_numbered = json!({
+            "connectionId": "https://github.com", "owner": "o", "repo": "r", "number": 1
+        });
         let sid = json!({ "serverId": "srv" });
         let script = json!({ "workspaceId": ws, "scriptId": "s1" });
         let term = json!({ "terminalId": "t1" });
@@ -1844,6 +1905,69 @@ mod unbound_owner_only_methods {
             ("settings.list", json!({})),
             ("settings.reset", json!({ "path": "model.defaultProvider" })),
             ("settings.update", json!({ "changes": {} })),
+            ("sourceControl.authStatus", source_control.clone()),
+            ("sourceControl.branches.list", source_control_repo.clone()),
+            (
+                "sourceControl.branches.listCached",
+                source_control_repo.clone(),
+            ),
+            (
+                "sourceControl.connections.configure",
+                json!({ "provider": "gitlab", "instanceUrl": "https://gitlab.example", "tokenSource": "explicit" }),
+            ),
+            (
+                "sourceControl.connections.disconnect",
+                source_control.clone(),
+            ),
+            ("sourceControl.connections.list", json!({})),
+            (
+                "sourceControl.getReviewThreads",
+                source_control_numbered.clone(),
+            ),
+            ("sourceControl.getUser", source_control.clone()),
+            ("sourceControl.issues.get", source_control_numbered.clone()),
+            ("sourceControl.issues.list", source_control_repo.clone()),
+            ("sourceControl.issues.search", source_control_repo.clone()),
+            (
+                "sourceControl.listReviewComments",
+                source_control_numbered.clone(),
+            ),
+            (
+                "sourceControl.pulls.create",
+                json!({ "connectionId": "https://github.com", "owner": "o", "repo": "r", "title": "t", "body": "b", "head": "h", "base": "b" }),
+            ),
+            ("sourceControl.pulls.get", source_control_numbered.clone()),
+            ("sourceControl.pulls.list", source_control_repo.clone()),
+            ("sourceControl.pulls.merge", source_control_numbered.clone()),
+            ("sourceControl.pulls.search", source_control_repo.clone()),
+            (
+                "sourceControl.pulls.updateBranch",
+                source_control_numbered.clone(),
+            ),
+            (
+                "sourceControl.relatedRepos.list",
+                source_control_repo.clone(),
+            ),
+            (
+                "sourceControl.replyReviewComment",
+                json!({ "connectionId": "https://github.com", "owner": "o", "repo": "r", "number": 1, "commentId": 1, "body": "b" }),
+            ),
+            ("sourceControl.repoConfig.get", source_control_repo.clone()),
+            ("sourceControl.repos.get", source_control_repo.clone()),
+            ("sourceControl.repos.list", source_control.clone()),
+            (
+                "sourceControl.repos.search",
+                json!({ "connectionId": "https://github.com", "query": "q" }),
+            ),
+            ("sourceControl.resolve", json!({ "workspaceId": ws })),
+            (
+                "sourceControl.resolveThread",
+                json!({ "connectionId": "https://github.com", "threadId": "t" }),
+            ),
+            (
+                "sourceControl.unresolveThread",
+                json!({ "connectionId": "https://github.com", "threadId": "t" }),
+            ),
             ("specialist.create", json!({ "id": "s", "spec": {} })),
             ("specialist.delete", json!({ "id": "s", "scope": "global" })),
             (

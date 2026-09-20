@@ -18479,7 +18479,7 @@ pub(crate) mod pr {
         assert_eq!(list[0].status, intent_core::PullRequestStatus::Merged);
     }
 
-    #[tokio::test]
+    #[intent_test_macros::daemon_test]
     async fn merge_not_completed_never_marks_the_workspace_merged() {
         let (_t, svc, ws) = setup_with(
             StubForge {
@@ -19122,6 +19122,8 @@ pub(crate) mod pr {
 
     /// Bus-wired service plus a seeded workspace whose worktree is `worktree`.
     /// The bus persists `gitRoot:*` events to the durable log we assert on.
+    /// Inject a forge so sweeps use their supplied stub and never discover
+    /// real credentials from the developer's environment or configured CLIs.
     async fn sweep_setup(worktree: &std::path::Path) -> (TempDb, Services, intent_core::Workspace) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -19130,7 +19132,9 @@ pub(crate) mod pr {
         ws.worktree_path = Some(worktree.to_string_lossy().into_owned());
         store.insert_workspace(&ws).await.unwrap();
         let bus = crate::EventBus::new(store.clone());
-        let svc = Services::new(store).with_event_bus(bus);
+        let svc = Services::new(store)
+            .with_event_bus(bus)
+            .with_source_control(Arc::new(StubForge::default()));
         (tmp, svc, ws)
     }
 
@@ -28777,8 +28781,8 @@ mod known_repo {
 
     /// `workspace.create` derives `repository_owner` and `repository_name` from
     /// the `origin` remote URL when the caller omits them (STAB-64). Caller-
-    /// supplied values always win; non-github remotes leave owner unset; missing
-    /// remotes fall back to basename for name. Strict host check rejects
+    /// supplied values always win; unregistered remotes leave owner unset;
+    /// missing remotes fall back to basename for name. Strict host check rejects
     /// github.com.evil.com and similar substring attacks.
     #[intent_test_macros::daemon_test]
     async fn create_workspace_derives_owner_and_name_from_origin_remote() {
@@ -28858,8 +28862,8 @@ mod known_repo {
             "ssh remote derives name"
         );
 
-        // Non-github remote → owner stays None, name falls back to basename.
-        let gitlab_repo = make_repo("https://gitlab.com/myorg/myrepo.git");
+        // The built-in GitLab connection preserves nested namespace ownership.
+        let gitlab_repo = make_repo("https://gitlab.com/myorg/platform/myrepo.git");
         let gitlab_ws = svc
             .create_workspace(
                 WorkspaceCreate {
@@ -28871,18 +28875,40 @@ mod known_repo {
             .await
             .expect("create gitlab");
         assert_eq!(
-            gitlab_ws.workspace.repository_owner, None,
-            "non-github remote leaves owner unset"
+            gitlab_ws.workspace.repository_owner.as_deref(),
+            Some("myorg/platform"),
+            "registered GitLab remote derives the complete namespace"
         );
-        // The basename fallback still fires because the remote didn't parse.
+        assert_eq!(
+            gitlab_ws.workspace.repository_name.as_deref(),
+            Some("myrepo"),
+            "registered GitLab remote derives the project name"
+        );
+
+        // An unregistered forge still falls back to the local directory name.
+        let unknown_repo = make_repo("https://forge.unregistered.invalid/myorg/myrepo.git");
+        let unknown_ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(unknown_repo.0.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create unregistered forge");
+        assert_eq!(
+            unknown_ws.workspace.repository_owner, None,
+            "unregistered remote leaves owner unset"
+        );
         assert!(
-            gitlab_ws
+            unknown_ws
                 .workspace
                 .repository_name
                 .as_deref()
                 .unwrap()
                 .starts_with("intentd-origin-"),
-            "non-github remote falls back to basename for name"
+            "unregistered remote falls back to basename for name"
         );
 
         // No origin remote → owner stays None, name falls back to basename.

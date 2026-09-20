@@ -184,10 +184,10 @@ async fn default_cwd(
     crate::git_ops::worktree_path(&workspace)
 }
 
-/// Environment pairs offering the daemon-managed GitHub credential to git
-/// run inside a spawned terminal, gated on
-/// `sourceControl.github.exposeGitCredentialToChildren` (monorepo#884 Phase
-/// 2.2): the github.com-scoped `intentd git-credential` helper carried by
+/// Environment pairs offering daemon-managed forge credentials to git
+/// run inside a spawned terminal, gated independently by each connection's
+/// `enabled` and `exposeGitCredentialToChildren` settings: the instance-scoped
+/// `intentd git-credential` helpers carried by
 /// `GIT_CONFIG_PARAMETERS` — **no token bytes in the child environment** (the
 /// helper fetches the credential from the daemon over UDS on each `get`, so
 /// tokens refresh live and revocation applies immediately; never raw
@@ -226,11 +226,11 @@ pub(crate) fn injected_git_env(
     env
 }
 
-/// The `exposeGitCredentialToChildren` gate. `None` (registry not wired —
+/// The legacy GitHub `exposeGitCredentialToChildren` gate. `None` (registry not wired —
 /// minimal/test compositions) reads as **off** so bare spawns never trigger
 /// token resolution; the production composition root always wires the
-/// registry, where the schema default (`true`) applies. Shared with the
-/// `system.gitCredential` UDS RPC (see [`crate::github_git_credential`]).
+/// registry, where the schema default (`true`) applies. This compatibility
+/// setting controls GitHub only; registry connections have independent gates.
 #[cfg(test)]
 pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool {
     settings.is_some_and(|r| {
@@ -1324,12 +1324,36 @@ mod tests {
         )));
     }
 
-    /// The gate short-circuits injection: no registry and setting-off both
-    /// yield no pairs.
+    /// Each connection gates only its own helper. No registry or every
+    /// connection switched off yields no injected environment pairs.
     #[test]
     fn git_credential_env_respects_gate() {
         assert!(git_credential_env(None, None).is_empty());
         let (off, _guard) = registry_with_expose(Some(false));
+        assert_eq!(
+            child_git_credential_instances(&off.snapshot().effective.source_control),
+            vec!["https://gitlab.com"]
+        );
+        // Built-in auto connections may discover host-bound credentials later;
+        // the environment contains only a helper, never a token or auth probe.
+        assert!(!git_credential_env(Some(&off), None).is_empty());
+        off.apply(&[(
+            "sourceControl.connections".into(),
+            json!({
+                "https://gitlab.com": {
+                    "provider": "gitlab",
+                    "exposeGitCredentialToChildren": false
+                },
+                "https://disabled.example": {
+                    "provider": "gitlab",
+                    "enabled": false
+                }
+            }),
+        )])
+        .unwrap();
+        assert!(
+            child_git_credential_instances(&off.snapshot().effective.source_control).is_empty()
+        );
         assert!(git_credential_env(Some(&off), None).is_empty());
     }
 
