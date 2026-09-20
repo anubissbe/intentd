@@ -1,8 +1,10 @@
 //! Provider selection (§7.4).
 //!
-//! [`SourceControlRegistry::from_settings`] builds the active
-//! [`SourceControl`] from `sourceControl.activeProvider` plus that provider's
-//! settings. v1 registers only `github`; selecting any other provider yields a
+//! [`SourceControlRegistry::from_settings`] is a standalone provider factory
+//! for callers such as CLI probes. The daemon instead resolves each repository
+//! through the connection registry in `intent-services`; it does not use this
+//! factory's `active_provider` field as a global preference.
+//! Registers `github` and `gitlab`; selecting another provider yields a
 //! typed [`Error::Config`]. A missing token yields a typed
 //! [`Error::NotConfigured`] so the daemon stays up (graceful per §8.3).
 
@@ -12,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::github::GitHubSourceControl;
+use crate::gitlab::GitLabSourceControl;
+use crate::gitlab_token::{self, GitlabTokenSource};
 use crate::token::{self, TokenSource};
 use crate::SourceControl;
 
@@ -32,15 +36,58 @@ pub struct GithubSettings {
     pub api_base_url: Option<String>,
 }
 
-/// Top-level source-control settings (`sourceControl.*`, §9.8).
+/// Settings for GitLab.com or a self-managed GitLab instance.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitlabSettings {
+    #[serde(default = "default_gitlab_instance")]
+    pub instance_url: String,
+    #[serde(default)]
+    pub token_source: GitlabTokenSource,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub token_host: Option<String>,
+}
+
+fn default_gitlab_instance() -> String {
+    "https://gitlab.com".into()
+}
+
+impl Default for GitlabSettings {
+    fn default() -> Self {
+        Self {
+            instance_url: default_gitlab_instance(),
+            token_source: GitlabTokenSource::Auto,
+            token: None,
+            token_host: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for GitlabSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitlabSettings")
+            .field("instance_url", &self.instance_url)
+            .field("token_source", &self.token_source)
+            .field("token_host", &self.token_host)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Configuration for constructing one standalone provider client.
+/// The daemon's persisted connection registry is defined in `intent-core`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceControlSettings {
-    /// Active provider id (v1 supports only `"github"`).
+    /// Provider to construct (`"github"` or `"gitlab"`).
     pub active_provider: String,
     /// GitHub provider settings.
     #[serde(default)]
     pub github: GithubSettings,
+    #[serde(default)]
+    pub gitlab: GitlabSettings,
 }
 
 impl Default for SourceControlSettings {
@@ -48,6 +95,7 @@ impl Default for SourceControlSettings {
         Self {
             active_provider: "github".to_string(),
             github: GithubSettings::default(),
+            gitlab: GitlabSettings::default(),
         }
     }
 }
@@ -73,8 +121,12 @@ impl SourceControlRegistry {
                 )?;
                 Ok(Arc::new(gh))
             }
+            "gitlab" => Ok(Arc::new(GitLabSourceControl::new(
+                &gitlab_token::resolve(&settings.gitlab).await?,
+                &settings.gitlab.instance_url,
+            )?)),
             other => Err(Error::Config(format!(
-                "unknown source-control provider {other:?} (v1 supports only \"github\")"
+                "unknown source-control provider {other:?} (supported: github, gitlab)"
             ))),
         }
     }
@@ -108,8 +160,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_provider_is_config_error() {
         let settings = SourceControlSettings {
-            active_provider: "gitlab".to_string(),
+            active_provider: "unknown-forge".to_string(),
             github: GithubSettings::default(),
+            gitlab: GitlabSettings::default(),
         };
         let result = SourceControlRegistry::from_settings(&settings).await;
         assert!(matches!(result, Err(Error::Config(_))));
@@ -123,6 +176,7 @@ mod tests {
                 token: Some("ghp_test_token".to_string()),
                 ..GithubSettings::default()
             },
+            gitlab: GitlabSettings::default(),
         };
         let sc = SourceControlRegistry::from_settings(&settings)
             .await

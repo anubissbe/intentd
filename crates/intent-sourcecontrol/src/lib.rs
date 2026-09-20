@@ -14,6 +14,8 @@ pub mod device_flow;
 pub mod error;
 pub mod gh_sync;
 pub mod github;
+pub mod gitlab;
+pub mod gitlab_token;
 pub mod model;
 pub mod registry;
 pub mod token;
@@ -23,6 +25,8 @@ use async_trait::async_trait;
 pub use device_flow::{DeviceFlow, IdentityFlow, IdentityPollStatus, PollStatus};
 pub use error::{Error, Result};
 pub use github::GitHubSourceControl;
+pub use gitlab::GitLabSourceControl;
+pub use gitlab_token::GitlabTokenSource;
 pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
     IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
@@ -31,7 +35,7 @@ pub use model::{
     ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
     ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
-pub use registry::{GithubSettings, SourceControlRegistry, SourceControlSettings};
+pub use registry::{GithubSettings, GitlabSettings, SourceControlRegistry, SourceControlSettings};
 pub use token::TokenSource;
 
 /// The provider-agnostic forge API (§7.2).
@@ -203,13 +207,14 @@ pub trait SourceControl: Send + Sync {
         Err(Error::Unsupported("branch rules".to_string()))
     }
 
-    /// Everything the PR monitor's per-poll snapshot needs, in ONE round
-    /// trip: the [`PullRequest`], the [`MergeRequirementSignals`] (minus the
+    /// Everything the PR monitor's per-poll snapshot needs, reusing each
+    /// fetched payload: the [`PullRequest`], the [`MergeRequirementSignals`] (minus the
     /// base branch's rules, see [`PrObservation`]), the submitted reviews,
     /// the review-thread tally and the conversation-comment count. Replaces
     /// the `get_pr` / `merge_requirements` / `list_reviews` /
     /// `get_review_threads` / `list_comments` sequence on hosts that can
-    /// fold it (GitHub GraphQL). `Ok(None)` — the default — means the host
+    /// fold it (one GitHub GraphQL request or bounded composed GitLab REST reads).
+    /// `Ok(None)` — the default — means the host
     /// has no folded read and callers take the per-signal reads instead;
     /// an `Err` fails the observation the same way a failing `get_pr`
     /// would, [`Error::RateLimited`] included.

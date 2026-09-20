@@ -34,6 +34,8 @@ const KNOWN_SCHEMES: [&str; 4] = ["https", "http", "ssh", "git"];
 pub struct GitRemoteUrl {
     host: String,
     path: String,
+    http_origin: Option<(bool, u16)>,
+    local_file: bool,
 }
 
 impl GitRemoteUrl {
@@ -44,6 +46,7 @@ impl GitRemoteUrl {
     #[must_use]
     pub fn parse(url: &str) -> Option<Self> {
         let trimmed = url.trim();
+        let mut http_origin = None;
         let (authority, path) = if let Some((scheme, rest)) = trimmed.split_once("://") {
             if scheme.eq_ignore_ascii_case("file") {
                 let (host, path) = rest.split_at(rest.find('/')?);
@@ -57,6 +60,8 @@ impl GitRemoteUrl {
                 return Some(Self {
                     host: host.to_string(),
                     path: path.to_string(),
+                    http_origin: None,
+                    local_file: true,
                 });
             }
             if !KNOWN_SCHEMES.iter().any(|s| scheme.eq_ignore_ascii_case(s)) {
@@ -69,6 +74,24 @@ impl GitRemoteUrl {
             }
             let path = path.split(['?', '#']).next().unwrap_or(path);
             let host_port = strip_userinfo(authority)?;
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+                let secure = scheme.eq_ignore_ascii_case("https");
+                let port = match host_port.rsplit_once(':') {
+                    Some((_, port))
+                        if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
+                    {
+                        port.parse::<u16>().ok()?
+                    }
+                    _ => {
+                        if secure {
+                            443
+                        } else {
+                            80
+                        }
+                    }
+                };
+                http_origin = Some((secure, port));
+            }
             (strip_numeric_port(host_port), path)
         } else {
             // No scheme: only the scp-like `[user@]host:path` form qualifies.
@@ -93,6 +116,8 @@ impl GitRemoteUrl {
         Some(Self {
             host: authority.to_string(),
             path: path.to_string(),
+            http_origin,
+            local_file: false,
         })
     }
 
@@ -101,6 +126,19 @@ impl GitRemoteUrl {
     #[must_use]
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// Compare forge endpoints without dropping HTTP scheme/port. SSH remotes
+    /// may use a different transport port to reach the same forge host.
+    #[must_use]
+    pub fn same_forge_host(&self, other: &Self) -> bool {
+        !self.local_file
+            && !other.local_file
+            && self.host.eq_ignore_ascii_case(&other.host)
+            && match (self.http_origin, other.http_origin) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            }
     }
 
     /// The repository path with query, fragment and trailing `/` removed.
@@ -130,6 +168,74 @@ impl GitRemoteUrl {
             return None;
         }
         repo_ref_from_segments(owner, name)
+    }
+
+    /// Repository on an explicitly trusted GitLab instance, preserving every
+    /// namespace segment. The instance path is honored for subpath installs.
+    /// Host comparison happens before inspecting the path, so a foreign URL
+    /// cannot claim a repository by embedding the trusted host in its path.
+    #[must_use]
+    pub fn gitlab_repo(&self, instance_url: &str) -> Option<RepoRef> {
+        let base = Self::parse(&format!(
+            "{}/__intent_instance",
+            instance_url.trim_end_matches('/')
+        ))?;
+        if self.local_file
+            || base.http_origin.is_none()
+            || !self.host.eq_ignore_ascii_case(&base.host)
+            || self
+                .http_origin
+                .is_some_and(|origin| Some(origin) != base.http_origin)
+        {
+            return None;
+        }
+        let base_path = base
+            .path
+            .trim_end_matches("/__intent_instance")
+            .trim_matches('/');
+        let mut path = self.path.trim_matches('/');
+        if self.http_origin.is_some() && !base_path.is_empty() {
+            path = path.strip_prefix(base_path)?.strip_prefix('/')?;
+        }
+        // Accept repository, issue and merge-request URLs without treating
+        // the /-/ UI suffix as part of the repository namespace.
+        let path = path.split("/-/").next()?;
+        let (owner, name) = path.rsplit_once('/')?;
+        if owner
+            .split('/')
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            || matches!(name, "." | "..")
+        {
+            return None;
+        }
+        repo_ref_from_segments(owner, name)
+    }
+
+    /// Identify a PR/MR or issue relative to a separately trusted repository
+    /// URL. The caller resolves that URL through its connection registry first;
+    /// this method never promotes an arbitrary host into a trusted forge.
+    #[must_use]
+    pub fn resource_number(&self, repository: &Self) -> Option<(crate::ContextLinkKind, u64)> {
+        if !self.same_forge_host(repository) {
+            return None;
+        }
+        let path = self.path.trim_matches('/');
+        let base = repository.path.trim_matches('/');
+        let suffix = path.strip_prefix(base)?.strip_prefix('/')?;
+        let suffix = suffix.strip_prefix("-/").unwrap_or(suffix);
+        let mut parts = suffix.split('/');
+        let kind = match parts.next()? {
+            "pull" | "merge_requests" => crate::ContextLinkKind::Pr,
+            "issues" => crate::ContextLinkKind::Issue,
+            _ => return None,
+        };
+        let number = parts
+            .next()?
+            .parse::<u64>()
+            .ok()
+            .filter(|number| *number > 0)?;
+        // Links to a PR's files/discussion tab still identify that same PR.
+        Some((kind, number))
     }
 
     /// Host-agnostic `owner/name` from the last two non-empty path segments,
@@ -442,5 +548,101 @@ mod tests {
         assert_eq!(parsed.owner, "Acme");
         assert_eq!(parsed.name, "Widget");
         assert_eq!(parsed, RepoRef::new("acme", "widget"));
+    }
+}
+
+#[cfg(test)]
+mod gitlab_tests {
+    use super::*;
+
+    #[test]
+    fn gitlab_http_origin_includes_scheme_and_port_but_ssh_port_is_independent() {
+        for url in [
+            "https://git.euraika.net:9443/group/project",
+            "http://git.euraika.net:8443/group/project",
+            "file://localhost/group/project",
+        ] {
+            assert!(GitRemoteUrl::parse(url)
+                .unwrap()
+                .gitlab_repo("https://git.euraika.net:8443")
+                .is_none());
+        }
+        assert!(
+            GitRemoteUrl::parse("https://git.euraika.net:443/group/project")
+                .unwrap()
+                .gitlab_repo("https://git.euraika.net")
+                .is_some()
+        );
+        assert!(
+            GitRemoteUrl::parse("ssh://git@git.euraika.net:2222/group/project")
+                .unwrap()
+                .gitlab_repo("https://git.euraika.net:8443")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn gitlab_keeps_nested_namespaces_and_checks_host() {
+        for url in [
+            "git@git.euraika.net:group/subgroup/project.git",
+            "https://git.euraika.net/group/subgroup/project/-/merge_requests/42",
+        ] {
+            assert_eq!(
+                GitRemoteUrl::parse(url)
+                    .unwrap()
+                    .gitlab_repo("https://git.euraika.net"),
+                Some(RepoRef::new("group/subgroup", "project"))
+            );
+        }
+        assert_eq!(
+            GitRemoteUrl::parse("https://evil.invalid/git.euraika.net/group/project")
+                .unwrap()
+                .gitlab_repo("https://git.euraika.net"),
+            None
+        );
+        assert_eq!(
+            GitRemoteUrl::parse("git@git.euraika.net:group/project.git")
+                .unwrap()
+                .gitlab_repo("https://git.euraika.net/gitlab"),
+            Some(RepoRef::new("group", "project"))
+        );
+        assert_eq!(
+            GitRemoteUrl::parse("https://git.euraika.net/gitlab/group/project.git")
+                .unwrap()
+                .gitlab_repo("https://git.euraika.net/gitlab"),
+            Some(RepoRef::new("group", "project"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod resource_link_tests {
+    use super::GitRemoteUrl;
+    use crate::ContextLinkKind;
+
+    #[test]
+    fn resource_links_preserve_registered_host_subpath_and_namespace() {
+        let repo = GitRemoteUrl::parse("https://git.example:8443/forge/team/sub/repo").unwrap();
+        for (suffix, kind, number) in [
+            ("/-/merge_requests/7/diffs", ContextLinkKind::Pr, 7),
+            ("/-/issues/9", ContextLinkKind::Issue, 9),
+        ] {
+            let url = GitRemoteUrl::parse(&format!(
+                "https://git.example:8443/forge/team/sub/repo{suffix}?tab=1#note"
+            ))
+            .unwrap();
+            assert_eq!(url.resource_number(&repo), Some((kind, number)));
+        }
+        for value in [
+            "https://other.example:8443/forge/team/sub/repo/-/merge_requests/7",
+            "https://git.example/forge/team/sub/repo/-/merge_requests/7",
+            "https://git.example:8443/forge/team/sub/repository/-/merge_requests/7",
+            "https://git.example:8443/forge/team/sub/repo/-/issues/0",
+        ] {
+            assert_eq!(
+                GitRemoteUrl::parse(value).unwrap().resource_number(&repo),
+                None
+            );
+        }
     }
 }

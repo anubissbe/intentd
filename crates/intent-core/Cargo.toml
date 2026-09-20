@@ -18,6 +18,7 @@ directories = { workspace = true }
 toml.workspace = true
 tracing.workspace = true
 serde_path_to_error = "0.1.20"
+url = "2"
 libc = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 

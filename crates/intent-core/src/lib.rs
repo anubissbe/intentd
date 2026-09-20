@@ -35,6 +35,7 @@ pub mod secrets;
 pub mod server_control;
 pub mod settings_file;
 pub mod slug;
+pub mod source_control_instance;
 pub mod tilde;
 pub(crate) mod traits;
 pub mod transfer;
