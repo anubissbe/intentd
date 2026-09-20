@@ -529,12 +529,19 @@
 //! `system.status.exactUpdateSupported` / `targetUpdate`. Fixed-release
 //! installs are asynchronous and never fall back to channel updates.
 //!
-//! Version 10.4 is an additive minor bump over 10.3 (method catalog
-//! unchanged): the `/tunnel` endpoint gains the client→daemon `CREDIT` frame
-//! (opcode `0x07`) and a per-stream daemon→client credit window (§1.4). A
-//! client sends `CREDIT` only to a daemon whose `client.hello`
-//! `protocolVersion` is ≥ 10.4; a pre-10.4 daemon closes the connection with
-//! `1002` on the unknown opcode.
+//! Version 10.4 is an additive minor bump over 10.3. The `/tunnel` endpoint
+//! gains the client→daemon `CREDIT` frame (opcode `0x07`) and a per-stream
+//! daemon→client credit window (§1.4); a client sends `CREDIT` only to a
+//! daemon whose `client.hello` `protocolVersion` is ≥ 10.4, and a pre-10.4
+//! daemon closes the connection with `1002` on the unknown opcode. It also
+//! adds agent memory attribution (§5.5, §5.7): the daemon-global
+//! `agent.memoryUsage` router method — one row per spawned agent the
+//! descendant-tree sampler bucketed, with its per-process rows — and two
+//! always-present `system.status` fields from the same sweep,
+//! `agentMemoryBytes` (the agent-attributed share of `childMemoryBytes`)
+//! and `agentProcessCount` (buckets with a live root pid), `null` until the
+//! first sample lands. The catalog contains 325 router methods, 53
+//! fast-path methods, and two aliases: 380 client-callable names.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
