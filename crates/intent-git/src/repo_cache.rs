@@ -225,29 +225,43 @@ pub fn cache_path_for(cache_root: &Path, owner: &str, repo: &str) -> PathBuf {
     cache_root.join(owner).join(repo)
 }
 
-// Preserve historical GitHub/local slots while isolating every HTTP forge
+// Preserve historical GitHub/local slots while isolating other network forge
 // repository by full canonical URL. A host/port/prefix collision must not let
 // another ensure replace the source between ensure and checkout hydration.
 fn cache_path_for_url(cache_root: &Path, owner: &str, repo: &str, raw: &str) -> PathBuf {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
 
-    let Ok(mut url) = url::Url::parse(raw) else {
-        return cache_path_for(cache_root, owner, repo);
-    };
-    if !matches!(url.scheme(), "http" | "https") || github_repo(raw).is_some() {
+    if github_repo(raw).is_some() {
         return cache_path_for(cache_root, owner, repo);
     }
-    let path = url
-        .path()
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .to_string();
-    url.set_path(&path);
-    url.set_query(None);
-    url.set_fragment(None);
+    let identity = match url::Url::parse(raw) {
+        Ok(mut url)
+            if matches!(url.scheme(), "http" | "https" | "ssh" | "git")
+                && url.host_str().is_some() =>
+        {
+            let path = url
+                .path()
+                .trim_end_matches('/')
+                .trim_end_matches(".git")
+                .to_string();
+            url.set_path(&path);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        }
+        _ if !raw.contains("://") && GitRemoteUrl::parse(raw).is_some() => {
+            // The shared parser distinguishes SCP remotes from local paths.
+            // Keep user/host/path intact: SSH aliases can select different accounts.
+            raw.trim()
+                .trim_end_matches('/')
+                .trim_end_matches(".git")
+                .to_string()
+        }
+        _ => return cache_path_for(cache_root, owner, repo),
+    };
     let mut key = String::with_capacity(64);
-    for byte in Sha256::digest(url.as_str().as_bytes()) {
+    for byte in Sha256::digest(identity.as_bytes()) {
         write!(key, "{byte:02x}").expect("writing a string cannot fail");
     }
     cache_path_for(&cache_root.join(".forges").join(key), owner, repo)
@@ -1948,6 +1962,36 @@ mod tests {
                 "https://GIT.EXAMPLE:443/team/project/"
             )
         );
+    }
+
+    #[test]
+    fn ssh_cache_slots_isolate_hosts_ports_and_users_without_moving_local_slots() {
+        let root = Path::new("/cache");
+        let legacy = cache_path_for(root, "team", "project");
+        let urls = [
+            "git@git.example:team/project.git",
+            "git@other.example:team/project.git",
+            "other@git.example:team/project.git",
+            "ssh://git@git.example/team/project.git",
+            "ssh://git@git.example:2222/team/project.git",
+            "ssh://git@other.example/team/project.git",
+            "git://git.example/team/project.git",
+        ];
+        let slots = urls.map(|url| cache_path_for_url(root, "team", "project", url));
+        for (index, slot) in slots.iter().enumerate() {
+            assert_ne!(slot, &legacy);
+            for other in &slots[index + 1..] {
+                assert_ne!(slot, other);
+            }
+        }
+        for local in [
+            "/srv/team/project",
+            "./git@example:team/project",
+            "file:///srv/team/project",
+            "git@github.com:team/project.git",
+        ] {
+            assert_eq!(cache_path_for_url(root, "team", "project", local), legacy);
+        }
     }
 
     /// Cache miss → a fresh clone lands at `<root>/<owner>/<repo>` with the
