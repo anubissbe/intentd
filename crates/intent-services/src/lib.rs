@@ -19767,10 +19767,20 @@ impl WorkspaceApi for Services {
                             || created_file_blocks.is_some();
                         if has_content {
                             let prompt_text = prompt.unwrap_or_default();
+                            // Principal stamp (multiplayer w2): the initial
+                            // prompt is the creating human's first message,
+                            // stamped with the bound wire caller exactly like
+                            // `agent.sendMessage` (an agent / daemon caller
+                            // stamps nothing). Stamping an absent payload
+                            // cannot fail, so this never strands the row
+                            // persisted above.
+                            let message_metadata =
+                                crate::principal_ops::stamp_principal_attribution(None)?;
                             let options = crate::agent_manager::TurnOptions {
                                 image_blocks: created_image_blocks.clone(),
                                 file_blocks: created_file_blocks.clone(),
                                 context_references: created_context_refs,
+                                message_metadata: message_metadata.clone(),
                                 ..crate::agent_manager::TurnOptions::default()
                             };
                             let send = match services.agent_manager() {
@@ -19787,7 +19797,7 @@ impl WorkspaceApi for Services {
                                             None,
                                             created_image_blocks,
                                             created_file_blocks,
-                                            None,
+                                            message_metadata,
                                         )
                                         .await
                                 }
@@ -27440,6 +27450,14 @@ impl WorkspaceApi for Services {
         metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Principal stamp (multiplayer w2): a `user` row appended by a
+            // wire caller is human-authored; any other role only has a
+            // client-supplied stamp stripped.
+            let metadata = if role == "user" {
+                crate::principal_ops::stamp_principal_attribution(metadata)?
+            } else {
+                crate::principal_ops::strip_principal_attribution(metadata)
+            };
             self.agent_append_message_op(agent_id, role, content, metadata)
                 .await
         })
@@ -27577,6 +27595,8 @@ impl WorkspaceApi for Services {
         message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            let message_metadata =
+                crate::principal_ops::stamp_principal_attribution(message_metadata)?;
             self.agent_send_to_task_op(
                 workspace_id,
                 task_note_id,
@@ -27604,6 +27624,16 @@ impl WorkspaceApi for Services {
         origin: intent_core::MessageOrigin,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Principal stamp (multiplayer w2), applied once here so the
+            // runtime path (direct persist, busy enqueue, quarantine park,
+            // auto-queue) and the store-only fallback persist the same
+            // metadata. Only a user-origin send is human-authored; an
+            // automatic/agent-origin send has a client stamp stripped.
+            let message_metadata = if origin.is_user() {
+                crate::principal_ops::stamp_principal_attribution(message_metadata)?
+            } else {
+                crate::principal_ops::strip_principal_attribution(message_metadata)
+            };
             // Attachment-reference validation (PROTOCOL §5.5) up front: the
             // runtime-manager path below never reaches
             // `agent_send_message_op`'s check.
@@ -27752,9 +27782,12 @@ impl WorkspaceApi for Services {
             )?;
             self.validate_image_block_refs("agent.editAndRegenerate", image_blocks.as_ref())
                 .await?;
+            // Principal stamp (multiplayer w2): the edited message is a
+            // fresh human-authored user row.
             let options = crate::agent_manager::TurnOptions {
                 image_blocks,
                 file_blocks,
+                message_metadata: crate::principal_ops::stamp_principal_attribution(None)?,
                 ..Default::default()
             };
             if let Some(manager) = self.agent_manager() {
@@ -27788,7 +27821,7 @@ impl WorkspaceApi for Services {
                         None,
                         options.image_blocks,
                         options.file_blocks,
-                        None,
+                        options.message_metadata,
                     )
                     .await?;
                 let mut result = result;
@@ -27812,6 +27845,11 @@ impl WorkspaceApi for Services {
         message_metadata: Option<serde_json::Value>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
+            // Principal stamp (multiplayer w2): captured on the queue entry
+            // so the drain-time persist and every `agent:queue:*` payload
+            // carry it.
+            let message_metadata =
+                crate::principal_ops::stamp_principal_attribution(message_metadata)?;
             self.agent_queue_message_op(
                 agent_id,
                 content,
@@ -28115,7 +28153,7 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         task_note_id: NoteId,
         context_message: String,
-        input: intent_core::AgentWakeOrCreateInput,
+        mut input: intent_core::AgentWakeOrCreateInput,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             if let Some(model) = input.model.as_deref() {
@@ -28124,6 +28162,10 @@ impl WorkspaceApi for Services {
             if let Some(model) = input.create.as_ref().and_then(|c| c.model.as_deref()) {
                 reject_compound_model("create.model", model)?;
             }
+            // Principal stamp (multiplayer w2) on the delivered context
+            // message, whichever branch (wake / queue / create) carries it.
+            input.message_metadata =
+                crate::principal_ops::stamp_principal_attribution(input.message_metadata)?;
             self.agent_wake_or_create_op(workspace_id, task_note_id, context_message, input)
                 .await
         })
