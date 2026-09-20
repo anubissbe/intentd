@@ -613,6 +613,90 @@ fn normalize_workspace_create_fields(
     }
 }
 
+/// Resolve explicit remote targets through the daemon's host registry. The
+/// historical owner/repo shorthand remains GitHub unless a connection is given.
+async fn normalize_registered_workspace_fields(
+    api: &Arc<dyn WorkspaceApi>,
+    params: &serde_json::Map<String, Value>,
+) -> Result<(WorkspaceCreateFields, Option<intent_core::ContextLink>), String> {
+    let mut fields = normalize_workspace_create_fields(params);
+    let connection = string_value(params, "connectionId");
+    let explicit = string_value(params, "githubUrl")
+        .or_else(|| {
+            string_value(params, "repository").filter(|value| GitRemoteUrl::parse(value).is_some())
+        })
+        .or_else(|| string_value(params, "prUrl"));
+    let candidate = explicit.or_else(|| {
+        let instance = connection.as_deref()?.trim_end_matches('/');
+        let slug = string_value(params, "repository").or_else(|| {
+            Some(format!(
+                "{}/{}",
+                string_value(params, "repositoryOwner")?,
+                string_value(params, "repositoryName")?
+            ))
+        })?;
+        Some(format!("{instance}/{slug}"))
+    });
+    let Some(candidate) = candidate else {
+        return Ok((fields, None));
+    };
+    let mut target = json!({"repoUrl":candidate});
+    if let Some(connection) = &connection {
+        target["connectionId"] = json!(connection);
+    }
+    let resolved = match api.source_control_resolve(target).await {
+        Ok(resolved) => resolved,
+        // Old/mock WorkspaceApi implementations retain their GitHub behavior.
+        // An explicit host selection must never fall back to another forge.
+        Err(error) if connection.is_some() => return Err(map_err(error)),
+        Err(_) => return Ok((fields, None)),
+    };
+    let Some(canonical) = resolved["repo"]["htmlUrl"].as_str() else {
+        return Ok((fields, None));
+    };
+    let repository = GitRemoteUrl::parse(canonical)
+        .ok_or_else(|| "Invalid resolved repository URL".to_string())?;
+    let resource = GitRemoteUrl::parse(&candidate)
+        .and_then(|remote| remote.resource_number(&repository))
+        .or_else(|| {
+            string_value(params, "prUrl")
+                .and_then(|url| GitRemoteUrl::parse(&url)?.resource_number(&repository))
+        });
+    let is_ssh =
+        candidate.starts_with("ssh://") || (!candidate.contains("://") && candidate.contains(':'));
+    // Preserve caller-selected SSH credentials/transport for project URLs.
+    fields.github_url = Some(if is_ssh && resource.is_none() {
+        candidate
+    } else {
+        canonical.to_owned()
+    });
+    fields.repo_type = "github"; // Existing wire discriminator means remote repository.
+    fields.pr_number = resource
+        .and_then(|(kind, number)| (kind == intent_core::ContextLinkKind::Pr).then_some(number));
+    let link = resource.map(|(kind, number)| {
+        let route = match (resolved["provider"].as_str(), kind) {
+            (Some("github"), intent_core::ContextLinkKind::Pr) => "pull",
+            (Some("github"), intent_core::ContextLinkKind::Issue) => "issues",
+            (_, intent_core::ContextLinkKind::Pr) => "-/merge_requests",
+            (_, intent_core::ContextLinkKind::Issue) => "-/issues",
+        };
+        intent_core::ContextLink {
+            kind,
+            number,
+            url: format!("{canonical}/{route}/{number}"),
+            owner: resolved["repo"]["owner"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            repo: resolved["repo"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        }
+    });
+    Ok((fields, link))
+}
+
 /// Serialize normalized fields as the `preview.workspaceCreate` object,
 /// omitting unset optionals (parity with TS JSON serialization dropping
 /// `undefined` values).
@@ -660,7 +744,19 @@ async fn lookup_known_repo_local_path(
     api: &Arc<dyn WorkspaceApi>,
     github_url: &str,
 ) -> Option<String> {
-    let wanted = GitRemoteUrl::parse(github_url)?.github_repo()?;
+    let remote = GitRemoteUrl::parse(github_url)?;
+    let target = api
+        .source_control_resolve(json!({"repoUrl":github_url}))
+        .await
+        .ok();
+    let wanted = if let Some(target) = &target {
+        RepoRef::new(
+            target["repo"]["owner"].as_str()?,
+            target["repo"]["name"].as_str()?,
+        )
+    } else {
+        remote.github_repo()?
+    };
     let workspaces = api.list_workspaces(true).await.ok()?;
 
     let mut strict = Vec::new();
@@ -677,6 +773,33 @@ async fn lookup_known_repo_local_path(
         };
         if path.contains("/.clones/") || path.contains("\\.clones\\") {
             continue;
+        }
+        // Rows alone do not establish a forge: the same namespace can exist
+        // on GitHub and several GitLab instances. Registered resolution uses
+        // origin first, then persisted PR provenance, and never the UI default.
+        if let Some(target) = &target {
+            let candidate = ws
+                .repository_name
+                .as_deref()
+                .is_some_and(|name| repo_name_matches(&wanted, name))
+                || path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .is_some_and(|name| repo_name_matches(&wanted, name));
+            if !candidate {
+                continue;
+            }
+            let Ok(resolved) = api
+                .source_control_resolve(json!({"workspaceId":ws.id.as_str()}))
+                .await
+            else {
+                continue;
+            };
+            if resolved["connectionId"] != target["connectionId"]
+                || resolved["repo"] != target["repo"]
+            {
+                continue;
+            }
         }
         let entry_owner = ws.repository_owner.as_deref().filter(|o| !o.is_empty());
         let entry_name = ws.repository_name.as_deref().filter(|n| !n.is_empty());
@@ -733,7 +856,7 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
         .map(|s| format!(": {s}"))
         .unwrap_or_default();
 
-    let mut fields = normalize_workspace_create_fields(&params);
+    let (mut fields, context_link) = normalize_registered_workspace_fields(api, &params).await?;
 
     // Hydrate repoPath/clonePath from repositories the daemon already knows
     // (parity with FE `hydrateWorkspaceCreateProposal`): when the caller only
@@ -819,6 +942,16 @@ async fn create(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
     let mut payload_params = params;
     payload_params.remove("title");
     payload_params.remove("statusMessage");
+    if let Some(link) = context_link {
+        let links = payload_params
+            .entry("contextLinks")
+            .or_insert_with(|| json!([]));
+        if let Some(links) = links.as_array_mut() {
+            if !links.iter().any(|entry| entry["url"] == link.url) {
+                links.insert(0, json!(link));
+            }
+        }
+    }
     if let Some(url) = &fields.github_url {
         payload_params.insert("githubUrl".to_string(), json!(url));
     }
@@ -1114,6 +1247,27 @@ mod tests {
     }
 
     impl WorkspaceApi for FakeApi {
+        fn source_control_resolve(&self, target: Value) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                let url = target["repoUrl"]
+                    .as_str()
+                    .ok_or_else(|| Error::InvalidParams("No fixture remote".into()))?;
+                let repo = GitRemoteUrl::parse(url)
+                    .and_then(|url| url.gitlab_repo("https://git.example/forge"))
+                    .ok_or_else(|| Error::InvalidParams("Unregistered fixture host".into()))?;
+                if target["connectionId"]
+                    .as_str()
+                    .is_some_and(|id| id != "https://git.example/forge")
+                {
+                    return Err(Error::InvalidParams(
+                        "Conflicting fixture connection".into(),
+                    ));
+                }
+                Ok(
+                    json!({"connectionId":"https://git.example/forge","instanceUrl":"https://git.example/forge","provider":"gitlab","repo":{"owner":repo.owner,"name":repo.name,"htmlUrl":format!("https://git.example/forge/{}/{}",repo.owner,repo.name)}}),
+                )
+            })
+        }
         fn list_workspaces(
             &self,
             _include_archived: bool,
@@ -1189,6 +1343,62 @@ mod tests {
             pending_delete_at: None,
             membership: None,
         }
+    }
+
+    #[tokio::test]
+    async fn registered_gitlab_proposals_preserve_nested_host_and_link() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        for (suffix, kind, number) in [
+            ("/-/merge_requests/17/diffs", "pr", 17),
+            ("/-/issues/21", "issue", 21),
+        ] {
+            let proposal = create(
+                &api,
+                &json!({"githubUrl":format!("https://git.example/forge/team/sub/project{suffix}")}),
+            )
+            .await
+            .unwrap();
+            let proposal = &proposal["proposal"];
+            assert_eq!(
+                proposal["preview"]["workspaceCreate"]["githubUrl"],
+                "https://git.example/forge/team/sub/project"
+            );
+            let params = &proposal["payload"]["params"];
+            assert_eq!(
+                params["githubUrl"],
+                "https://git.example/forge/team/sub/project"
+            );
+            assert_eq!(params["contextLinks"][0]["owner"], "team/sub");
+            assert_eq!(params["contextLinks"][0]["kind"], kind);
+            assert_eq!(params["contextLinks"][0]["number"], number);
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_gitlab_shorthand_and_ssh_do_not_become_github() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(FakeApi::default());
+        for (args, expected) in [
+            (
+                json!({"connectionId":"https://git.example/forge","repository":"team/sub/project"}),
+                "https://git.example/forge/team/sub/project",
+            ),
+            (
+                json!({"repository":"git@git.example:team/sub/project.git"}),
+                "git@git.example:team/sub/project.git",
+            ),
+        ] {
+            let proposal = create(&api, &args).await.unwrap();
+            assert_eq!(
+                proposal["proposal"]["payload"]["params"]["githubUrl"],
+                expected
+            );
+        }
+        assert!(create(
+            &api,
+            &json!({"connectionId":"https://other.example","repository":"team/sub/project"})
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

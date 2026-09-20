@@ -6400,6 +6400,7 @@ mod workspace_api_tool_tests {
 
     struct WorkspaceInfoMockApi {
         ws: Mutex<Workspace>,
+        resolved_source_control: Mutex<Option<Value>>,
         /// `(called, caller)`: whether `get_workspace` ran and the task-local
         /// [`intent_core::Caller`] it observed (multiplayer w1 caller binding).
         seen_caller: Mutex<(bool, Option<intent_core::Caller>)>,
@@ -6460,6 +6461,7 @@ mod workspace_api_tool_tests {
             };
             Arc::new(Self {
                 ws: Mutex::new(ws),
+                resolved_source_control: Mutex::new(None),
                 seen_caller: Mutex::new((false, None)),
                 settings_caller: Mutex::new((false, None)),
             })
@@ -6471,6 +6473,21 @@ mod workspace_api_tool_tests {
             *self.seen_caller.lock().unwrap() = (true, intent_core::current_caller());
             let snapshot = self.ws.lock().unwrap().clone();
             Box::pin(async move { Ok(snapshot) })
+        }
+
+        fn source_control_resolve(&self, target: Value) -> BoxFuture<'_, Result<Value>> {
+            assert_eq!(
+                target,
+                json!({"workspaceId":self.ws.lock().unwrap().id.as_str()})
+            );
+            let resolved = self.resolved_source_control.lock().unwrap().clone();
+            Box::pin(async move {
+                resolved.ok_or_else(|| {
+                    intent_core::Error::InvalidParams(
+                        "Repository origin has no registered source-control connection".into(),
+                    )
+                })
+            })
         }
 
         // Pin the `workspaceApi.*` output knobs to the legacy behavior (plain
@@ -6528,7 +6545,7 @@ mod workspace_api_tool_tests {
         dir
     }
 
-    fn server_with_repo(id: &str, repo: &std::path::Path) -> WorkspaceMcpServer {
+    fn api_with_repo(id: &str, repo: &std::path::Path) -> Arc<WorkspaceInfoMockApi> {
         let api = WorkspaceInfoMockApi::new(id, None);
         {
             let mut workspace = api.ws.lock().unwrap();
@@ -6536,7 +6553,15 @@ mod workspace_api_tool_tests {
             workspace.repository_owner = Some("intent-hq".to_string());
             workspace.repository_name = Some("intentd".to_string());
         }
-        WorkspaceMcpServer::new(api, WorkspaceId::from_string(id))
+        *api.resolved_source_control.lock().unwrap() = Some(json!({
+            "connectionId":"https://github.com", "provider":"github", "instanceUrl":"https://github.com",
+            "repo":{"owner":"intent-hq", "name":"intentd", "htmlUrl":"https://github.com/intent-hq/intentd"}
+        }));
+        api
+    }
+
+    fn server_with_repo(id: &str, repo: &std::path::Path) -> WorkspaceMcpServer {
+        WorkspaceMcpServer::new(api_with_repo(id, repo), WorkspaceId::from_string(id))
     }
 
     async fn call_workspace_api(srv: &WorkspaceMcpServer, code: &str) -> Value {
@@ -6620,6 +6645,62 @@ mod workspace_api_tool_tests {
         let retry_apply = request_for_apply();
         assert_eq!(first_apply, retry_apply);
         assert_eq!(first_apply["idempotencyKey"], params["idempotencyKey"]);
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_uses_registered_gitlab_origin_and_preserves_nested_namespace() {
+        let repo = git_repo();
+        let api = api_with_repo("gitlab-sibling", repo.path());
+        api.ws.lock().unwrap().repository_owner = Some("euraika/platform".into());
+        let project_url = "https://git.example/forge/euraika/platform/intentd";
+        *api.resolved_source_control.lock().unwrap() = Some(json!({
+            "connectionId":"https://git.example/forge", "provider":"gitlab", "instanceUrl":"https://git.example/forge",
+            "repo":{"owner":"euraika/platform", "name":"intentd", "htmlUrl":project_url}
+        }));
+        let server = WorkspaceMcpServer::new(api, WorkspaceId::from_string("gitlab-sibling"));
+        let result = tool_json(&call_workspace_api(&server,
+            "return await ws.workspace.proposeSibling({ title: 'GitLab sibling', initialPrompt: 'Do it.' });"
+        ).await);
+        assert_eq!(
+            result["proposal"]["preview"]["workspaceCreate"]["githubUrl"],
+            project_url
+        );
+        assert_eq!(
+            result["proposal"]["payload"]["params"]["repositoryOwner"],
+            "euraika/platform"
+        );
+        assert_eq!(
+            result["proposal"]["payload"]["params"]["repositoryPath"],
+            repo.path().to_string_lossy().as_ref()
+        );
+        assert!(
+            result["proposal"]["payload"]["params"]
+                .get("githubUrl")
+                .is_none(),
+            "local sibling creation keeps its checkout source"
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_sibling_does_not_invent_a_forge_from_repository_slug() {
+        let repo = git_repo();
+        let api = api_with_repo("unknown-forge", repo.path());
+        *api.resolved_source_control.lock().unwrap() = None;
+        let server = WorkspaceMcpServer::new(api, WorkspaceId::from_string("unknown-forge"));
+        let result = tool_json(&call_workspace_api(&server,
+            "return await ws.workspace.proposeSibling({ title: 'Local sibling', initialPrompt: 'Do it.' });"
+        ).await);
+        assert!(result["proposal"]["preview"]["workspaceCreate"]
+            .get("githubUrl")
+            .is_none());
+        assert_eq!(
+            result["proposal"]["payload"]["params"]["repositoryOwner"],
+            "intent-hq"
+        );
+        assert_eq!(
+            result["proposal"]["payload"]["params"]["repositoryPath"],
+            repo.path().to_string_lossy().as_ref()
+        );
     }
 
     #[tokio::test]
