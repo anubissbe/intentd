@@ -9160,6 +9160,17 @@ mod wsapi6_bindings_tests {
             })
         }
 
+        fn pr_mutation(
+            &self,
+            workspace_id: WorkspaceId,
+            operation: String,
+            input: Value,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({ "workspaceId": workspace_id, "operation": operation, "input": input }))
+            })
+        }
+
         fn cross_workspace_list_siblings(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
             *self.cross_list_siblings_calls.lock().unwrap() += 1;
             Box::pin(async {
@@ -9431,14 +9442,11 @@ mod wsapi6_bindings_tests {
 
     #[tokio::test]
     async fn pr_removed_methods_error_as_unknown() {
-        // The non-snapshot `ws.pr.*` surface was removed in favor of the `gh`
-        // CLI; raw `host({...})` frames for the old methods must fail with the
-        // standard unknown-binding error, not a validation or trait error.
+        // Removed legacy names still fail as unknown. Native merge and
+        // updateBranch have returned with the repository-scoped write API.
         let (srv, _api) = server();
         for method in [
             "status",
-            "merge",
-            "updateBranch",
             "listReviewComments",
             "replyToReviewComment",
             "resolveThread",
@@ -9451,6 +9459,46 @@ mod wsapi6_bindings_tests {
             assert!(
                 text(&resp).contains(&format!("unknown method `pr.{method}`")),
                 "pr.{method} must surface the unknown-binding error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pr_native_writes_forward_js_arguments_with_runtime_workspace() {
+        let (srv, _api) = server();
+        for (operation, expression, input) in [
+            (
+                "create",
+                "ws.pr.create({ title: 'New MR', workspaceId: 'spoofed' })",
+                json!({ "title": "New MR", "workspaceId": "spoofed" }),
+            ),
+            (
+                "comment",
+                "ws.pr.comment(7, 'Feedback', { repo: 'group/sub/repo' })",
+                json!({ "prNumber": 7, "body": "Feedback", "repo": "group/sub/repo" }),
+            ),
+            (
+                "review",
+                "ws.pr.review(7, 'request-changes', 'Please fix')",
+                json!({ "prNumber": 7, "verdict": "request-changes", "body": "Please fix" }),
+            ),
+            (
+                "updateBranch",
+                "ws.pr.updateBranch(7)",
+                json!({ "prNumber": 7 }),
+            ),
+            (
+                "merge",
+                "ws.pr.merge(7, { expectedHeadSha: 'reviewed-head', mergeMethod: 'squash' })",
+                json!({ "prNumber": 7, "expectedHeadSha": "reviewed-head", "mergeMethod": "squash" }),
+            ),
+        ] {
+            let resp = call(&srv, &format!("return await {expression};")).await;
+            assert_eq!(resp["result"]["isError"], json!(false), "{expression}");
+            assert_eq!(
+                body(&resp),
+                json!({ "workspaceId": "amber-forest", "operation": operation, "input": input }),
+                "{expression}"
             );
         }
     }

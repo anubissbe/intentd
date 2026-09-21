@@ -231,7 +231,7 @@ pub(crate) fn injected_git_env(
 /// token resolution; the production composition root always wires the
 /// registry, where the schema default (`true`) applies. This compatibility
 /// setting controls GitHub only; registry connections have independent gates.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool {
     settings.is_some_and(|r| {
         r.snapshot()
