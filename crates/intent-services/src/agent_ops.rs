@@ -2656,10 +2656,17 @@ impl Services {
     /// `metadata.pendingProposals`, `metadata.proposalResolutions` — read only
     /// by the open agent's UI, intent-hq/intent#5383) are stripped from list
     /// rows ([`AgentLite::strip_detail_only_fields`]) and served by
-    /// `agent.get` / `agent.getSession` only. Together these keep a
-    /// ~250-session response well under the 1 MiB outbound frame warn
-    /// threshold; the row-budget / key-allowlist goldens in `tests.rs` pin
-    /// the resulting shape.
+    /// `agent.get` / `agent.getSession` only. Together these bound each ROW
+    /// (the row-budget / key-allowlist goldens in `tests.rs` pin the
+    /// shape), and the response-level frame fit
+    /// ([`intent_core::fit_agent_list_frame`], intent-hq/intent#5531)
+    /// bounds the RESPONSE: when the serialized rows array exceeds
+    /// [`intent_core::AGENT_LIST_FRAME_BUDGET_BYTES`] — a 459-session
+    /// workspace did at 2,338 B/row with every row inside the row
+    /// contract — every row's previews are re-capped at a halved budget
+    /// until it fits (floor
+    /// [`intent_core::AGENT_LIST_PREVIEW_FLOOR_BYTES`]), so the frame stays
+    /// under the 1 MiB outbound warn threshold without a wire change.
     ///
     /// The agent channel's seq-0 snapshot goes through this op (capped,
     /// stripped rows); its per-agent deltas re-read via `agent.get` and the
@@ -2816,7 +2823,7 @@ impl Services {
                 self.active_pr_monitors_by_agent(&workspace_id).await,
             )
         };
-        Ok(sessions
+        let mut rows: Vec<AgentLite> = sessions
             .into_iter()
             .map(|s| {
                 let projection = projections.remove(&s.id.0).unwrap_or_default();
@@ -2835,7 +2842,24 @@ impl Services {
                 lite.cap_list_previews();
                 lite
             })
-            .collect())
+            .collect();
+        // Response-level frame fit (intent-hq/intent#5531): the per-row pass
+        // bounds each row, not the response — a large enough workspace still
+        // encodes past the 1 MiB frame warn with every row inside the row
+        // contract. Re-cap previews harder until the rows array fits
+        // `AGENT_LIST_FRAME_BUDGET_BYTES`; same fields, same shape.
+        if let Some(fit) = intent_core::fit_agent_list_frame(&mut rows) {
+            tracing::info!(
+                workspace = %workspace_id.0,
+                rows = rows.len(),
+                bytes_before = fit.bytes_before,
+                bytes_after = fit.bytes_after,
+                preview_budget = fit.preview_budget,
+                frame_budget = intent_core::AGENT_LIST_FRAME_BUDGET_BYTES,
+                "agent.list rows over the frame budget; previews re-capped"
+            );
+        }
+        Ok(rows)
     }
 
     /// Drop the cached agent.list message projections for `workspace_id`.
@@ -6208,7 +6232,7 @@ impl Services {
         &self,
         agent_id: AgentId,
         message_id: String,
-        content: String,
+        mut content: String,
         editing: Option<bool>,
     ) -> Result<Value> {
         // Principal stamp (multiplayer w2): an edit by a wire caller makes
@@ -6222,6 +6246,16 @@ impl Services {
             intent_core::current_caller(),
             Some(intent_core::Caller::Wire { .. })
         );
+        // Collaborator sender preamble (multiplayer): the editor's, on the
+        // same human-authored entries the restamp re-attributes. Resolved
+        // (one store read, collaborator callers only) BEFORE the queue lock
+        // is taken; applied to the replacement content below.
+        let preamble = if restamp {
+            self.collaborator_sender_preamble_for_agent(&agent_id)
+                .await?
+        } else {
+            None
+        };
         let (edited, was_editing, now_editing) = {
             let mut guard = self
                 .agent_queues
@@ -6252,6 +6286,9 @@ impl Services {
             } else {
                 None
             };
+            if let Some(preamble) = preamble.as_deref().filter(|_| human_authored) {
+                crate::principal_ops::prepend_collaborator_preamble(&mut content, preamble);
+            }
             queue[position].content = content;
             if let Some(metadata) = restamped {
                 queue[position].message_metadata = metadata;
@@ -8954,6 +8991,23 @@ impl Services {
             .as_deref()
             .and_then(first_nonempty)
             .or_else(|| task_text_msg.clone());
+        // Collaborator sender preamble (multiplayer): `agentInstructions` /
+        // `taskText` are caller-supplied free text that reaches the child's
+        // model verbatim, so a collaborator's text is annotated like every
+        // other human-authored front door — BEFORE the TASK-C wrapper below,
+        // so the preamble heads the first message. The task-note fallback is
+        // note content, not the caller's text, and stays byte-identical; the
+        // helper is a no-op for owner / administrator / agent / absent callers.
+        // The same caller-supplied text also carries the caller's principal
+        // stamp (`fromPrincipalId`, exactly what the `agent.sendMessage` front
+        // door stamps) so the served row's author resolves to the sender, not
+        // the workspace owner; the note-content fallback is left unstamped.
+        let mut message_metadata = None;
+        if let Some(text) = message.as_mut() {
+            self.annotate_collaborator_sender(&workspace_id, text)
+                .await?;
+            message_metadata = crate::principal_ops::stamp_principal_attribution(None)?;
+        }
         // Load the linked task note whenever the delegation names one: the
         // note's title/body feeds the message fallback, the child name
         // derivation, and the TASK-C reference preamble that prefixes the
@@ -9398,12 +9452,15 @@ impl Services {
                             workspace_id,
                             message,
                             None,
-                            crate::agent_manager::TurnOptions::default(),
+                            crate::agent_manager::TurnOptions {
+                                message_metadata: message_metadata.clone(),
+                                ..Default::default()
+                            },
                         )
                         .await
                 }
                 None => {
-                    self.agent_send_message_op(child, message, None, None, None, None)
+                    self.agent_send_message_op(child, message, None, None, None, message_metadata)
                         .await
                 }
             };

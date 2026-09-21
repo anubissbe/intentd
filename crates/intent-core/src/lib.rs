@@ -53,7 +53,7 @@ pub use clock::{
 };
 pub use config::Config;
 pub use discovery_cache::DiscoveryCache;
-pub use error::{CloneErrorCategory, Error, InviteErrorKind, Result};
+pub use error::{CloneErrorCategory, Error, IdentityProofErrorKind, InviteErrorKind, Result};
 pub use events::is_known_event_type;
 pub use git_remote_url::GitRemoteUrl;
 pub use ids::{
@@ -75,10 +75,11 @@ pub use model::PROPOSAL_OUTCOME_DISMISSED;
 pub use model::PROPOSAL_RESOLUTIONS_KEY;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
-    cap_json_value, format_key_bytes_table, last_tool_use_preview, note_list_slim_row,
-    serialized_key_bytes, slim_body_size, slim_heavy_body, AgentListRowScope, AgentScopeCounts,
-    ConversationProjection, NoteListProjection, AGENT_LIST_NAME_CAP_BYTES,
-    AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
+    cap_json_value, fit_agent_list_frame, format_key_bytes_table, last_tool_use_preview,
+    note_list_slim_row, serialized_key_bytes, slim_body_size, slim_heavy_body, AgentListFrameFit,
+    AgentListRowScope, AgentScopeCounts, ConversationProjection, NoteListProjection,
+    AGENT_LIST_FRAME_BUDGET_BYTES, AGENT_LIST_NAME_CAP_BYTES, AGENT_LIST_PATH_CAP_BYTES,
+    AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_PREVIEW_FLOOR_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
     AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS,
     SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
 };
@@ -131,7 +132,9 @@ pub use model::{
 pub use path_utils::prewarm_login_shell_path;
 pub use repo_ref::RepoRef;
 pub use secrets::{create_dir_private, write_private, write_private_hidden, FileSecretStore};
-pub use server_control::ServerControl;
+pub use server_control::{
+    InviteLinkBuilder, InviteLinkEnvelope, ResolvedInviteLinkEnvelope, ServerControl,
+};
 pub use settings_file::{
     FlushQueuedMessagesMode, LegacySettings, SettingsFile, DEFAULT_CONFIG_TEMPLATE,
     LEGACY_SETTINGS_PATHS,
