@@ -475,8 +475,8 @@ mod tests {
         defaults()
     }
 
-    /// The latest common body includes v2.6 plain-language guidance.
-    const COMMON_LATEST: &str = V2_6.common;
+    /// The latest common body includes v2.7 repository-scoped forge guidance.
+    const COMMON_LATEST: &str = V2_7.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;
