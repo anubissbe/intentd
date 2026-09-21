@@ -171,6 +171,7 @@ async fn boot() -> Fixture {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = requests.clone();
     let mock_instance = instance.clone();
+    let clone_root = dir.path().to_path_buf();
     let mock = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -200,6 +201,13 @@ async fn boot() -> Fixture {
                 let count = stream.read(&mut chunk).await.unwrap();
                 assert!(count > 0);
                 data.extend_from_slice(&chunk[..count]);
+            }
+            if serve_git_clone(&mut stream, &headers, &data[header_end..], &clone_root).await {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(headers.lines().next().unwrap().to_string());
+                continue;
             }
             let payload: Value = if length > 0 {
                 serde_json::from_slice(&data[header_end..header_end + length]).unwrap()
@@ -294,6 +302,189 @@ async fn boot() -> Fixture {
 async fn connect(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
     let url = format!("wss://localhost:{port}/ws?token={TOKEN}");
     common::wss_connect_with_retry(port, cfg, &url).await
+}
+
+// Model GitLab's real smart-HTTP boundary: web URLs redirect, .git URLs serve
+// Git. This catches regressions hidden by API-only or already-local fixtures.
+async fn serve_git_clone(
+    stream: &mut TcpStream,
+    headers: &str,
+    body: &[u8],
+    root: &std::path::Path,
+) -> bool {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut first = headers.lines().next().unwrap().split_whitespace();
+    let method = first.next().unwrap();
+    let target = first.next().unwrap();
+    if !target.starts_with("/clone/project") {
+        return false;
+    }
+    if let Some(suffix) = target.strip_prefix("/clone/project/") {
+        let response = format!("HTTP/1.1 301 Moved Permanently\r\nLocation: /clone/project.git/{suffix}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        stream.write_all(response.as_bytes()).await.unwrap();
+        return true;
+    }
+    let header = |name: &str| {
+        headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map_or("", |(_, value)| value.trim())
+    };
+    // Plain HTTP fixture carries no Git credentials. Private HTTPS auth and
+    // redirect isolation are exercised separately in gitlab_https_transport.
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let suffix = path.strip_prefix("/clone/project.git").unwrap();
+    let mut child = Command::new("git")
+        .arg("http-backend")
+        .env("GIT_PROJECT_ROOT", root)
+        .env("GIT_HTTP_EXPORT_ALL", "1")
+        .env("PATH_INFO", format!("/clone-project.git{suffix}"))
+        .env("REQUEST_METHOD", method)
+        .env("QUERY_STRING", query)
+        .env("CONTENT_TYPE", header("content-type"))
+        .env("CONTENT_LENGTH", body.len().to_string())
+        .env("HTTP_GIT_PROTOCOL", header("git-protocol"))
+        .env("REMOTE_USER", "oauth2")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(body).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success());
+    let end = result
+        .stdout
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .unwrap();
+    let cgi_headers = String::from_utf8_lossy(&result.stdout[..end]);
+    let body = &result.stdout[end + 4..];
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n{cgi_headers}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    true
+}
+
+#[tokio::test]
+async fn gitlab_web_url_clones_without_following_its_git_suffix_redirect() {
+    let fx = boot().await;
+    let git = |args: &[&str]| {
+        let result = std::process::Command::new("git")
+            .arg("-C")
+            .arg(fx.dir.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    git(&["init", "-b", "main", "clone-seed"]);
+    std::fs::write(
+        fx.dir.path().join("clone-seed/README.md"),
+        "GitLab clone fixture\n",
+    )
+    .unwrap();
+    git(&["-C", "clone-seed", "add", "README.md"]);
+    git(&[
+        "-C",
+        "clone-seed",
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "-m",
+        "Fixture",
+    ]);
+    git(&["clone", "--bare", "clone-seed", "clone-project.git"]);
+    let mut ws = connect(fx.port, fx.cfg.clone()).await;
+    wss_rpc(
+        &mut ws,
+        1,
+        "sourceControl.connections.configure",
+        json!({
+            "provider":"gitlab", "instanceUrl":fx.instance, "tokenSource":"explicit", "token":PAT
+        }),
+    )
+    .await;
+    for (id, cache) in [(2, false), (3, true)] {
+        if cache {
+            let before = fx.requests.lock().unwrap().len();
+            let warm = wss_rpc(
+                &mut ws,
+                20,
+                "repo.warmCache",
+                json!({
+                    "githubUrl":format!("{}/clone/project/", fx.instance)
+                }),
+            )
+            .await;
+            assert_eq!(
+                warm,
+                json!({"started":true,"owner":"clone","repo":"project"})
+            );
+            timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    let fetched = fx.requests.lock().unwrap()[before..]
+                        .iter()
+                        .any(|line| line.starts_with("POST /clone/project.git/git-upload-pack"));
+                    if fetched {
+                        break;
+                    }
+                    // timing-guard: poll the observed Git upload-pack request until the bounded deadline.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("background cache warm fetched the clone endpoint");
+        }
+        let mut params = json!({"title":"GitLab web URL", "githubUrl":format!("{}/clone/project/", fx.instance), "baseRef":"main"});
+        if !cache {
+            params["clonePath"] = json!(fx.dir.path().join("explicit-clone"));
+            params["skipIsolation"] = json!(true);
+        }
+        let created = wss_rpc(&mut ws, id, "workspace.create", params).await;
+        let workspace = &created["workspace"];
+        let checkout = workspace["worktreePath"]
+            .as_str()
+            .filter(|path| !path.is_empty())
+            .or_else(|| workspace["repositoryPath"].as_str())
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(checkout).join("README.md")).unwrap(),
+            "GitLab clone fixture\n"
+        );
+        let origin = std::process::Command::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .unwrap();
+        assert!(origin.status.success());
+        assert_eq!(
+            String::from_utf8(origin.stdout).unwrap().trim(),
+            format!("{}/clone/project.git", fx.instance)
+        );
+    }
+    let requests = fx.requests.lock().unwrap();
+    assert!(requests
+        .iter()
+        .any(|line| line.contains("/clone/project.git/info/refs?")));
+    assert!(
+        !requests
+            .iter()
+            .any(|line| line.contains("/clone/project/info/refs?")),
+        "must select the clone endpoint before sending Git credentials"
+    );
 }
 
 /// Send a JSON-RPC request and return the full response envelope (success or

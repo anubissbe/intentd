@@ -27118,7 +27118,7 @@ impl WorkspaceApi for Services {
                 }
             }
             Self::require_administrator("repo.warmCache")?;
-            let url = github_url.trim().to_string();
+            let url = credential_services.source_control_clone_url(github_url.trim());
             let Some(RepoRef { owner, name: repo }) =
                 GitRemoteUrl::parse(&url).and_then(|u| u.repo_slug())
             else {
