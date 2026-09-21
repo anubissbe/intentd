@@ -30774,7 +30774,7 @@ impl WorkspaceApi for Services {
         query: String,
         limit: Option<i64>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let injected = self.source_control.clone();
+        let services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.users.search")?;
             let query = query.trim();
@@ -30782,7 +30782,7 @@ impl WorkspaceApi for Services {
                 return Ok(serde_json::json!({ "users": [] }));
             }
             let limit = github_browse_ops::clamp_user_search_limit(limit);
-            let sc = pr_ops::resolve_source_control(injected).await?;
+            let sc = services.resolve_source_control().await?;
             let users = sc
                 .search_users(query, limit)
                 .await

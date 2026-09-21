@@ -871,7 +871,7 @@ async fn gitlab_credential_forwards_exact_host_port_path_and_identity() {
         "protocol":"https","host":"git.example:8443","path":"gitlab/team/nested/project.git","username":"oauth2"
     }})).unwrap();
     let response: Value =
-        serde_json::from_str(&handle(request, &control, true, true).await.unwrap()).unwrap();
+        serde_json::from_str(&handle(request, &control, true, true, true).await.unwrap()).unwrap();
     assert_eq!(response["result"]["credential"]["username"], "oauth2");
     assert_eq!(
         *control.credential_scope.lock().unwrap(),

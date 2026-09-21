@@ -5655,6 +5655,9 @@ impl SystemControl for BusyDaemonControl {
     fn git_credential(
         &self,
         _client_pid: Option<u64>,
+        _host: String,
+        _path: Option<String>,
+        _username: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(String, String)>> + Send + '_>>
     {
         Box::pin(async { None })
