@@ -163,6 +163,12 @@ pub(crate) static V2_6: InstructionSet = InstructionSet {
     ..V2_2
 };
 
+/// Forge-aware guidance is versioned so existing sessions keep their doctrine.
+pub(crate) static V2_7: InstructionSet = InstructionSet {
+    common: instr!("v2.7", "common"),
+    ..V2_6
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
@@ -469,8 +475,8 @@ mod tests {
         defaults()
     }
 
-    /// The latest common body includes v2.6 plain-language guidance.
-    const COMMON_LATEST: &str = V2_6.common;
+    /// The latest common body includes v2.7 repository-scoped forge guidance.
+    const COMMON_LATEST: &str = V2_7.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;

@@ -129,6 +129,17 @@ jobs:
           # fail-open default; it just never uses tinybox).
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
+            // Intent's larger and self-hosted runners are org-scoped. A
+            // same-repo PR inside a fork must use public hosted labels.
+            if (context.repo.owner !== "intent-hq") {
+              core.setOutput("linux_labels", JSON.stringify(["ubuntu-latest"]));
+              core.setOutput("check_labels", JSON.stringify(["ubuntu-latest"]));
+              core.setOutput("linux_burst", "true");
+              core.setOutput("windows_labels", JSON.stringify(["windows-latest"]));
+              core.setOutput("windows_burst", "true");
+              core.info("Fork CI: standard GitHub-hosted runners");
+              return;
+            }
             const tinybox = ["self-hosted", "Linux", "X64"];
             // The coverage jobs run the whole instrumented suite, so they
             // burst to the biggest GH-hosted Linux runner (16-core); check
@@ -277,7 +288,8 @@ jobs:
     if: github.event_name != 'push'
     needs: route
     runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
-    timeout-minutes: 15
+    # Standard hosted runners in forks have fewer cores and cold caches.
+    timeout-minutes: ${{ github.repository_owner == 'intent-hq' && 15 || 60 }}
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -692,7 +704,7 @@ jobs:
           # predates a temporary macos-14 stint and pins the required-check
           # context — do not rename it.
           - target: aarch64-apple-darwin
-            os: [self-hosted, macOS, ARM64]
+            os: ${{ fromJSON(github.repository_owner == 'intent-hq' && '["self-hosted", "macOS", "ARM64"]' || '["macos-14"]') }}
             name: build (aarch64-apple-darwin, macos-14)
           # Routed by the route job (intent-hq/intent#5518): the self-hosted
           # 5090pc runner when the probe confirms it online, the org-hosted
@@ -707,7 +719,7 @@ jobs:
           # matrix expansion and dropping the required contexts.) The name
           # below pins the required-check context — do not rename it.
           - target: x86_64-pc-windows-msvc
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || (github.repository_owner == 'intent-hq' && '["gh-windows-16x"]' || '["windows-latest"]')) }}
             name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
     # Explicit per-entry names (instead of the default matrix-value join) so
     # the required-check contexts in the main ruleset stay stable even when a
@@ -1200,14 +1212,14 @@ jobs:
     needs: route
     if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' }}
     runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
-    timeout-minutes: 30
+    timeout-minutes: ${{ github.repository_owner == 'intent-hq' && 30 || 60 }}
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
       # Same value and rationale as coverage-e2e (co-tenancy on tinybox,
       # matches the 16-core burst runner).
-      NEXTEST_TEST_THREADS: 16
+      NEXTEST_TEST_THREADS: ${{ github.repository_owner == 'intent-hq' && 16 || 4 }}
       BASE_REF: ${{ github.event.pull_request.base.ref }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
@@ -1579,6 +1591,8 @@ jobs:
         run: ./scripts/test-ci-target-slot.sh
       - name: Test changed-tests.sh
         run: ./scripts/test-changed-tests.sh
+      - name: Test CI runner routing
+        run: node --test scripts/test-ci-routing.cjs
 
   # install.ps1's Windows-only paths (intent-hq/intent#3229): the `check`
   # job's install_ps1_owner suite runs the installer's ownership check under

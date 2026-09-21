@@ -370,12 +370,6 @@ async fn gitlab_filters_and_missing_file_are_explicit() {
         .await
         .unwrap()
         .is_none());
-    assert!(matches!(
-        client
-            .merge_pr(&repo(), 7, MergeMethod::Rebase, MergeOptions::default())
-            .await,
-        Err(Error::Unsupported(_))
-    ));
     task.await.unwrap();
 }
 
@@ -724,3 +718,6 @@ async fn quota_probe_reuses_headers_even_when_request_is_throttled() {
     assert!(quota.reset_at.unwrap() >= before + 30);
     task.await.unwrap(); // Probing quota itself made no HTTP request.
 }
+
+#[path = "gitlab_http/review.rs"]
+mod review;

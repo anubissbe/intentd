@@ -2860,6 +2860,36 @@ async fn dispatch(
             let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "pr.create" => {
+            let ws = require_ws_note(params)?;
+            api.pr_mutation(ws, "create".into(), Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "pr.comment" => {
+            let ws = require_ws_note(params)?;
+            api.pr_mutation(ws, "comment".into(), Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "pr.review" => {
+            let ws = require_ws_note(params)?;
+            api.pr_mutation(ws, "review".into(), Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "pr.merge" => {
+            let ws = require_ws_note(params)?;
+            api.pr_mutation(ws, "merge".into(), Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "pr.updateBranch" => {
+            let ws = require_ws_note(params)?;
+            api.pr_mutation(ws, "updateBranch".into(), Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
         "pr.refresh" => {
             let ws = require_ws_note(params)?;
             let r = api.pr_refresh(ws).await.map_err(workspace_err)?;
@@ -3010,6 +3040,7 @@ async fn dispatch(
             let merge_method = opt_str(params, "mergeMethod");
             let commit_title = opt_str(params, "commitTitle");
             let commit_message = opt_str(params, "commitMessage");
+            let expected_head_sha = opt_str(params, "expectedHeadSha");
             let r = api
                 .github_pulls_merge(
                     owner,
@@ -3018,6 +3049,7 @@ async fn dispatch(
                     merge_method,
                     commit_title,
                     commit_message,
+                    expected_head_sha,
                 )
                 .await
                 .map_err(domain_to_rpc)?;
@@ -3587,7 +3619,14 @@ async fn dispatch(
             let commit_title = opt_str(params, "commitTitle");
             let commit_message = opt_str(params, "commitMessage");
             let r = api
-                .accept_changes_merge_pr(ws, pr_number, merge_method, commit_title, commit_message)
+                .accept_changes_merge_pr(
+                    ws,
+                    pr_number,
+                    merge_method,
+                    commit_title,
+                    commit_message,
+                    opt_str(params, "expectedHeadSha"),
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

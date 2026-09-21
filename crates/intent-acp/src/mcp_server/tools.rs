@@ -158,7 +158,7 @@ Namespaces (index — full signatures in API below):
   ws.mcp.* — external MCP tools
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
-  ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; other PR ops use `gh`
+  ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; PR/MR writes
 
 API:
   ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
@@ -316,19 +316,24 @@ API:
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
   ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment (referenced by an attachment notice in a message) into your working directory (default `.intent/attachments/`, git-ignored) and returns the relative `path` to read it from. Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
 
-  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved?`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
+  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist now. `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved?`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
     `threads.unresolved?` is omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown.
     `mergeQueueEjection?` is `{ at, reason? }` — the latest merge-queue removal event (e.g. reason `failed_checks`); absent when the PR was never ejected or the host did not report it.
     The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
     ONE monitor per PR per workspace: when ANOTHER live agent in this workspace already holds an active monitor on the PR, the call is REFUSED (not an error) and returns `{ ok: false, refused: true, reason: "already-monitored", ownerAgentId, ownerAgentName?, monitorId, repo, prNumber, instruction }` instead of `{ ok, monitor, requirements }` — the owner's agent id, its session name when it has one, and its `monitorId`. That owner receives the PR's wakes — do not re-register; instead `ws.agent.send(ownerAgentId, …)` to ask the owner either to relay the specific PR events you care about when its monitor wakes, or to relinquish the monitor with `ws.pr.unmonitor` so you can call `ws.pr.monitor` yourself; use `ws.pr.snapshot` for a one-shot read of the current state. The PR becomes registrable again once the owner's monitor is cancelled or completes. Your OWN re-register is never refused. A monitor whose owner can no longer receive wakes (its session failed, was deleted or retired, or is gone) is ORPHANED, not held: your `ws.pr.monitor` on that PR ADOPTS it instead of being refused — the same monitor row is re-armed under you (baseline refreshed, pending changes cleared; no second row), the ordinary success payload carries `adoptedFrom` (the previous owner's agent id), and you receive the PR's wakes from then on. Adoption counts against your own monitor cap like a fresh registration. PARENT TAKEOVER: a monitor held by your own DIRECT sub-agent (its `parentAgentId` is you — no grandchildren, no peers, never the reverse) is likewise ADOPTED, not refused, once that child has SETTLED — its linked task note is `complete` / `cancelled`, or it is idle with nothing pending except its PR monitors (no busy turn, queued message, unresolved blocker/discussion or question, watch, event subscription, or active hook); the same success payload with `adoptedFrom` results, and the child is told once via a queued `pr_monitor_wake` with `reason: "transferred"` and `adoptedBy` (your agent id) so it does not re-register. A child that is still working keeps its monitor: you get the ordinary refusal, whose `instruction` says when it becomes adoptable — retry when the child's task moves to `complete` / `cancelled`, or when a `ws.agent.watch` on the child delivers its monitoring-idle advisory (`childExternallyWaiting` naming only `waitingOnPrMonitors`) or `ws.agent.status` shows it idle with nothing else pending. Do NOT wait for the child's genuine completion: while it holds the monitor that completion is exactly what the watch defers, so it may never come. Retry rather than asking it to relinquish.
   ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop monitoring a PR you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
-  ws.pr.monitors() → [monitors]  // YOUR active and completed monitors: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (net changes since last report, awaiting debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`, `pausedUntil?`.
+  ws.pr.monitors() → [monitors]  // YOUR active and completed monitors. Fields: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (net changes since last report, awaiting debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`, `pausedUntil?`.
     `pausedUntil?` (RFC 3339) is present on ACTIVE rows only while the daemon's global forge rate-limit pause is closed — polling is suspended until then, `lastError` names the same deadline, and `lastSnapshot` is stale until the first post-pause poll clears both.
+  ws.pr.create({ title, body?, sourceBranch, targetBranch, draft?, repo? }) → { pullRequest }  // Open a PR/MR on the workspace origin's forge; optional repo is a nested slug on the same instance.
+  ws.pr.comment(prNumber, body, { repo?, anchor? }?) → { comment }  // Post a conversation or anchored diff comment using instance-scoped credentials.
+  ws.pr.review(prNumber, verdict, body?, { repo? }?) → { review }  // verdict: approve | request-changes | comment. GitLab verdict + summary are separate writes; a partial failure says which action succeeded.
+  ws.pr.updateBranch(prNumber, { repo? }?) → { updated }  // GitLab rebases on the target and waits for completion. Inspect an in-progress error before retrying.
+  ws.pr.merge(prNumber, { expectedHeadSha, mergeMethod?, repo? }) → { merged, message, sha }  // User-authorized merge guarded by the reviewed head. GitLab rebase merge requires fast-forward project policy; a changed head requires a fresh review and another call.
   ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount?, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, mergeable?, checks: { total, passed, failed, pending, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved?, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, mergeQueueEjection?, rulesKnown }, pausedUntil? }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, in the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback. `comments.unresolvedThreadCount` and `requirements.threads.unresolved` are omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown.
     `pausedUntil?` (RFC 3339) is present only while the daemon's global forge rate-limit pause is closed: the snapshot itself is fresh (this read is not gated), but every PR monitor's checklist is stale until that deadline.
     `requirements` is the full merge-requirements checklist — what is still needed to merge — with `failingRequired` / `pendingRequired` naming the required checks, `requiredKnown` false when the host did not report which checks are required, and `rulesKnown` false when the base branch's rules were unreadable (`approvals.needed` / `threads.resolutionRequired` then omitted). The top-level `checks` / `reviews` / `comments` blocks are the compact projection of the same read.
     This is the SAME enriched object `ws.pr.monitor` returns and monitor wakes / `ws.pr.monitors` rows carry — one canonical shape across all three surfaces — except that a snapshot registers nothing and triggers no monitoring. For PR monitoring prefer `ws.pr.monitor` — it runs the polling, debouncing and merge detection in the daemon, so you do not have to author a hook that diffs snapshots and expires while the PR sits blocked. Use `ws.pr.snapshot` when you just want the current state once.
-    These are the only `ws.pr.*` methods. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
+    For operations not exposed above, use the workspace forge's CLI: `gh` for GitHub or `glab` for GitLab. Native writes use the workspace connection; CLI authentication is separate.
 
 Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
@@ -388,7 +393,7 @@ Namespaces (index — full signatures in API below):
   ws.mcp.* — external MCP tools
   ws.crossWorkspace.* — read sibling-workspace notes
   ws.file.* — read/write workspace project files
-  ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; other PR ops use `gh`
+  ws.pr.* — pr.monitor = daemon-run PR watch (preferred); pr.snapshot = one-shot state; PR/MR writes
 
 API:
   ws.help(namespace?) → string  // Offline API docs, robust to clients that truncate this description: `ws.help()` returns the Namespaces index; `ws.help("pr")` returns the full doc lines for one namespace. Namespaces disabled in settings are omitted and error when requested.
@@ -568,19 +573,24 @@ API:
   ws.file.rename(oldPath, newPath) → { ok, oldPath, newPath }  // Renames/moves a file or directory inside the workspace.
   ws.file.getAttachment(attachmentId, destDir?) → { path, fileName, mimeType?, size, uploadedAt }  // Copies a user-uploaded attachment (referenced by an attachment notice in a message) into your working directory (default `.intent/attachments/`, git-ignored) and returns the relative `path` to read it from. Skips the copy when an identical file is already present. If the attachment's file was deleted by the user, the error says so — continue without the file instead of retrying.
 
-  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist now — `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved?`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
+  ws.pr.monitor(prNumber, { repo? }) → { ok, monitor, requirements }  // PREFERRED way to watch a PR: registers a daemon-run monitor on `prNumber` (workspace repo unless `repo: "owner/name"` overrides it) and returns the merge-requirements checklist now. `requirements` carries `state`, `isDraft`, `hasConflicts`, `isBehind`, `mergeable`, `checks` (`failingRequired` / `pendingRequired` named, `requiredKnown` false when required checks are unreported), `approvals` (`decision`, `have`, `needed?`, `changesRequested`), `threads` (`unresolved?`, `resolutionRequired?`), `mergeStateStatus?`, `mergeBlockedReason?`, `isInMergeQueue?` (true while queued), `mergeQueueEjection?` and `rulesKnown`.
     `threads.unresolved?` is omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown.
     `mergeQueueEjection?` is `{ at, reason? }` — the latest merge-queue removal event (e.g. reason `failed_checks`); absent when the PR was never ejected or the host did not report it.
     The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
     ONE monitor per PR per workspace: when ANOTHER live agent in this workspace already holds an active monitor on the PR, the call is REFUSED (not an error) and returns `{ ok: false, refused: true, reason: "already-monitored", ownerAgentId, ownerAgentName?, monitorId, repo, prNumber, instruction }` instead of `{ ok, monitor, requirements }` — the owner's agent id, its session name when it has one, and its `monitorId`. That owner receives the PR's wakes — do not re-register; instead `ws.agent.send(ownerAgentId, …)` to ask the owner either to relay the specific PR events you care about when its monitor wakes, or to relinquish the monitor with `ws.pr.unmonitor` so you can call `ws.pr.monitor` yourself; use `ws.pr.snapshot` for a one-shot read of the current state. The PR becomes registrable again once the owner's monitor is cancelled or completes. Your OWN re-register is never refused. A monitor whose owner can no longer receive wakes (its session failed, was deleted or retired, or is gone) is ORPHANED, not held: your `ws.pr.monitor` on that PR ADOPTS it instead of being refused — the same monitor row is re-armed under you (baseline refreshed, pending changes cleared; no second row), the ordinary success payload carries `adoptedFrom` (the previous owner's agent id), and you receive the PR's wakes from then on. Adoption counts against your own monitor cap like a fresh registration. PARENT TAKEOVER: a monitor held by your own DIRECT sub-agent (its `parentAgentId` is you — no grandchildren, no peers, never the reverse) is likewise ADOPTED, not refused, once that child has SETTLED — its linked task note is `complete` / `cancelled`, or it is idle with nothing pending except its PR monitors (no busy turn, queued message, unresolved blocker/discussion or question, watch, event subscription, or active hook); the same success payload with `adoptedFrom` results, and the child is told once via a queued `pr_monitor_wake` with `reason: "transferred"` and `adoptedBy` (your agent id) so it does not re-register. A child that is still working keeps its monitor: you get the ordinary refusal, whose `instruction` says when it becomes adoptable — retry when the child's task moves to `complete` / `cancelled`, or when a `ws.agent.watch` on the child delivers its monitoring-idle advisory (`childExternallyWaiting` naming only `waitingOnPrMonitors`) or `ws.agent.status` shows it idle with nothing else pending. Do NOT wait for the child's genuine completion: while it holds the monitor that completion is exactly what the watch defers, so it may never come. Retry rather than asking it to relinquish.
   ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop monitoring a PR you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
-  ws.pr.monitors() → [monitors]  // YOUR active and completed monitors: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (net changes since last report, awaiting debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`, `pausedUntil?`.
+  ws.pr.monitors() → [monitors]  // YOUR active and completed monitors. Fields: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (net changes since last report, awaiting debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`, `pausedUntil?`.
     `pausedUntil?` (RFC 3339) is present on ACTIVE rows only while the daemon's global forge rate-limit pause is closed — polling is suspended until then, `lastError` names the same deadline, and `lastSnapshot` is stale until the first post-pause poll clears both.
+  ws.pr.create({ title, body?, sourceBranch, targetBranch, draft?, repo? }) → { pullRequest }  // Open a PR/MR on the workspace origin's forge; optional repo is a nested slug on the same instance.
+  ws.pr.comment(prNumber, body, { repo?, anchor? }?) → { comment }  // Post a conversation or anchored diff comment using instance-scoped credentials.
+  ws.pr.review(prNumber, verdict, body?, { repo? }?) → { review }  // verdict: approve | request-changes | comment. GitLab verdict + summary are separate writes; a partial failure says which action succeeded.
+  ws.pr.updateBranch(prNumber, { repo? }?) → { updated }  // GitLab rebases on the target and waits for completion. Inspect an in-progress error before retrying.
+  ws.pr.merge(prNumber, { expectedHeadSha, mergeMethod?, repo? }) → { merged, message, sha }  // User-authorized merge guarded by the reviewed head. GitLab rebase merge requires fast-forward project policy; a changed head requires a fresh review and another call.
   ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, failedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount?, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, mergeable?, checks: { total, passed, failed, pending, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved?, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, mergeQueueEjection?, rulesKnown }, pausedUntil? }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, in the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback. `comments.unresolvedThreadCount` and `requirements.threads.unresolved` are omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown.
     `pausedUntil?` (RFC 3339) is present only while the daemon's global forge rate-limit pause is closed: the snapshot itself is fresh (this read is not gated), but every PR monitor's checklist is stale until that deadline.
     `requirements` is the full merge-requirements checklist — what is still needed to merge — with `failingRequired` / `pendingRequired` naming the required checks, `requiredKnown` false when the host did not report which checks are required, and `rulesKnown` false when the base branch's rules were unreadable (`approvals.needed` / `threads.resolutionRequired` then omitted). The top-level `checks` / `reviews` / `comments` blocks are the compact projection of the same read.
     This is the SAME enriched object `ws.pr.monitor` returns and monitor wakes / `ws.pr.monitors` rows carry — one canonical shape across all three surfaces — except that a snapshot registers nothing and triggers no monitoring. For PR monitoring prefer `ws.pr.monitor` — it runs the polling, debouncing and merge detection in the daemon, so you do not have to author a hook that diffs snapshots and expires while the PR sits blocked. Use `ws.pr.snapshot` when you just want the current state once.
-    These are the only `ws.pr.*` methods. For every other PR operation — create, view, comment, review threads, branch update, merge — use the `gh` CLI instead.
+    For operations not exposed above, use the workspace forge's CLI: `gh` for GitHub or `glab` for GitLab. Native writes use the workspace connection; CLI authentication is separate.
 
 Examples (the final one shows the N+1 pattern: list items first, then batch-read their details in a single Promise.all):
   return await ws.workspace.info()
@@ -696,7 +706,7 @@ const HOOK_HOST_EXEC_DOC_XREF: &str = " and `ws.host.exec`";
 /// The cross-references to `ws.pr.monitor` that live OUTSIDE its own doc
 /// lines — the `ws.pr.*` Namespaces index entry, the `ws.hook.schedule`
 /// steer, and the `ws.pr.snapshot` steer (a whole continuation line, which
-/// method-line pruning cannot reach) plus its "only method" phrasing. All are
+/// method-line pruning cannot reach). All are
 /// scrubbed when `agentFeatures.prMonitor` is off so the surviving docs never
 /// advertise a pruned method (unit tests guard every needle verbatim).
 const PR_MONITOR_INDEX_XREF: &str = "pr.monitor = daemon-run PR watch (preferred); ";
@@ -704,8 +714,6 @@ const PR_MONITOR_INDEX_SNAPSHOT_LABEL: &str = "pr.snapshot = one-shot state";
 const PR_MONITOR_INDEX_SNAPSHOT_LABEL_OFF: &str = "pr.snapshot = compact PR watch state";
 const PR_MONITOR_HOOK_XREF: &str = " For PR monitoring prefer `ws.pr.monitor` — a hook has a TTL and expires while a PR sits blocked, the monitor does not.";
 const PR_MONITOR_SNAPSHOT_XREF_LINE: &str = "    This is the SAME enriched object `ws.pr.monitor` returns and monitor wakes / `ws.pr.monitors` rows carry — one canonical shape across all three surfaces — except that a snapshot registers nothing and triggers no monitoring. For PR monitoring prefer `ws.pr.monitor` — it runs the polling, debouncing and merge detection in the daemon, so you do not have to author a hook that diffs snapshots and expires while the PR sits blocked. Use `ws.pr.snapshot` when you just want the current state once.\n";
-const PR_MONITOR_ONLY_METHODS: &str = "These are the only `ws.pr.*` methods.";
-const PR_MONITOR_ONLY_METHODS_OFF: &str = "This is the only `ws.pr.*` method.";
 
 /// Task-graph teaching scrubbed from the assembled description when
 /// `agentFeatures.taskGraph` is off (intent-hq/monorepo#2445). Docs only —
@@ -829,8 +837,7 @@ pub fn workspace_api_description(
                 1,
             )
             .replacen(PR_MONITOR_HOOK_XREF, "", 1)
-            .replacen(PR_MONITOR_SNAPSHOT_XREF_LINE, "", 1)
-            .replacen(PR_MONITOR_ONLY_METHODS, PR_MONITOR_ONLY_METHODS_OFF, 1);
+            .replacen(PR_MONITOR_SNAPSHOT_XREF_LINE, "", 1);
     }
     // Teaching scrub for `taskGraph` (intent-hq/monorepo#2445): docs only —
     // the APIs stay dispatchable — so the batch-delegate params, batch-form
@@ -1244,10 +1251,10 @@ mod tests {
         SpecialistModelOption, SpecialistModelOptions, HOOK_HOST_EXEC_DOC_XREF,
         HOOK_HOST_EXEC_INDEX_XREF, NAMESPACE_INDEX_HEADER, NAMESPACE_INDEX_HEADER_COMPACT,
         PR_MONITOR_HOOK_XREF, PR_MONITOR_INDEX_SNAPSHOT_LABEL, PR_MONITOR_INDEX_XREF,
-        PR_MONITOR_ONLY_METHODS, PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF,
-        TASK_GRAPH_BATCH_FORM_LINE, TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS,
-        TASK_GRAPH_SETCONTENT_XREF, TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION,
-        WORKSPACE_API_DESCRIPTION_CHIEF, WORKSPACE_API_SYSTEM_PROMPT_HEADING,
+        PR_MONITOR_SNAPSHOT_XREF_LINE, REPORT_TO_PARENT_ATTENTION_XREF, TASK_GRAPH_BATCH_FORM_LINE,
+        TASK_GRAPH_CONVERT_BLOCKS_GRAMMAR, TASK_GRAPH_DELEGATE_PARAMS, TASK_GRAPH_SETCONTENT_XREF,
+        TASK_GRAPH_UNBLOCKED_WAKE_XREF, WORKSPACE_API_DESCRIPTION, WORKSPACE_API_DESCRIPTION_CHIEF,
+        WORKSPACE_API_SYSTEM_PROMPT_HEADING,
     };
     use std::collections::HashSet;
 
@@ -1389,19 +1396,41 @@ mod tests {
             if line.starts_with("other =>") || line.starts_with("_ =>") {
                 break;
             }
-            let Some(rest) = line.strip_prefix('"') else {
+            let Some((patterns, _)) = line.split_once("=>") else {
                 continue;
             };
-            let Some(end) = rest.find('"') else {
-                continue;
-            };
-            let name = &rest[..end];
-            let after = rest[end + 1..].trim_start();
-            if after.starts_with("=>") {
-                out.insert(name.to_string());
+            for pattern in patterns.split('|') {
+                if let Some(name) = pattern
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|quoted| quoted.strip_suffix('"'))
+                {
+                    out.insert(name.to_string());
+                }
             }
         }
         out
+    }
+
+    #[test]
+    fn bound_methods_includes_alternative_dispatch_patterns() {
+        let source = r#"
+            match method {
+                "snapshot" => snapshot(),
+                "create" | "comment" | "review" => mutation(),
+                other => unknown(other),
+            }
+            match helper {
+                "not-a-dispatch-method" => value(),
+            }
+        "#;
+        assert_eq!(
+            bound_methods(source),
+            ["snapshot", "create", "comment", "review"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
     }
 
     // The un-gated `ws.app.question.ask` doc line appears verbatim in BOTH
@@ -2612,7 +2641,6 @@ mod tests {
                 PR_MONITOR_INDEX_SNAPSHOT_LABEL,
                 PR_MONITOR_HOOK_XREF,
                 PR_MONITOR_SNAPSHOT_XREF_LINE,
-                PR_MONITOR_ONLY_METHODS,
             ] {
                 assert!(base.contains(needle), "missing verbatim needle: {needle}");
             }
@@ -2659,7 +2687,12 @@ mod tests {
             for kept in [
                 "ws.pr.snapshot(prNumber, { repo? }?)",
                 "pr.snapshot = compact PR watch state",
-                "This is the only `ws.pr.*` method.",
+                "ws.pr.create(",
+                "ws.pr.comment(",
+                "ws.pr.review(",
+                "ws.pr.updateBranch(",
+                "ws.pr.merge(",
+                "`gh` for GitHub or `glab` for GitLab",
             ] {
                 assert!(
                     pruned.contains(kept),

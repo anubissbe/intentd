@@ -3,8 +3,8 @@
 //! The namespace exposes the read-only `pr.snapshot` (compact, diff-friendly
 //! PR state) plus the centralized PR-monitor surface — `pr.monitor` /
 //! `pr.unmonitor` / `pr.monitors`, gated by `agentFeatures.prMonitor`. Every
-//! other PR operation (create, view, comment, review threads, branch update,
-//! merge) is intentionally unbound — agents use the `gh` CLI instead. The
+//! writes resolve the workspace's origin through the same per-instance registry.
+//! Create, comment, review, branch update and reviewed-head merge reuse the service front door. The
 //! bindings only peel arguments and forward the trait's `serde_json::Value`
 //! result unchanged.
 //!
@@ -22,6 +22,11 @@ use super::{map_err, req_i64};
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.pr = {
+        create: (input) => host({ method: 'pr.create', args: input }),
+        comment: (prNumber, body, options) => host({ method: 'pr.comment', args: { ...(options || {}), prNumber, body } }),
+        review: (prNumber, verdict, body, options) => host({ method: 'pr.review', args: { ...(options || {}), prNumber, verdict, body } }),
+        updateBranch: (prNumber, options) => host({ method: 'pr.updateBranch', args: { ...(options || {}), prNumber } }),
+        merge: (prNumber, options) => host({ method: 'pr.merge', args: { ...(options || {}), prNumber } }),
         snapshot: (prNumber, options) =>
             host({ method: 'pr.snapshot', args: { prNumber, ...(options || {}) } }),
     };
@@ -58,6 +63,10 @@ pub(crate) async fn dispatch(
 ) -> Result<Value, String> {
     match method {
         "snapshot" => snapshot(api, ws, args).await,
+        "create" | "comment" | "review" | "updateBranch" | "merge" => api
+            .pr_mutation(ws.clone(), method.into(), args.clone())
+            .await
+            .map_err(map_err),
         "monitor" => monitor(api, ws, caller, args).await,
         "unmonitor" => unmonitor(api, ws, caller, args).await,
         "monitors" => monitors(api, ws, caller).await,
@@ -176,6 +185,17 @@ mod tests {
     }
 
     impl WorkspaceApi for SpyApi {
+        fn pr_mutation(
+            &self,
+            workspace_id: WorkspaceId,
+            operation: String,
+            input: Value,
+        ) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({"workspaceId":workspace_id,"operation":operation,"input":input}))
+            })
+        }
+
         fn pr_monitor_start(
             &self,
             _workspace_id: WorkspaceId,
@@ -307,5 +327,16 @@ mod tests {
             off.contains("snapshot:"),
             "ws.pr.snapshot was wrongly dropped"
         );
+    }
+    #[tokio::test]
+    async fn native_mutations_keep_runtime_workspace_and_input_on_shared_service() {
+        let (_, api, ws) = spy();
+        for operation in ["create", "comment", "review", "updateBranch", "merge"] {
+            let input = json!({"prNumber":7,"body":"feedback","repo":"group/sub/project","workspaceId":"other"});
+            let result = dispatch(&api, &ws, None, operation, &input).await.unwrap();
+            assert_eq!(result["workspaceId"], "ws-pr");
+            assert_eq!(result["operation"], operation);
+            assert_eq!(result["input"], input);
+        }
     }
 }

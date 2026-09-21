@@ -171,12 +171,12 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Direct member add: +2 router methods (`principal.list`, the owner-only
 /// roster of credentialed guests; `workspace.members.add`, the owner-only
 /// direct attach of one of them).
-const EXPECTED_TOTAL_METHODS: usize = 414;
+const EXPECTED_TOTAL_METHODS: usize = 419;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// This includes both git.diffs and git.commits (the canonical forms) even
 /// though git.diff→git.diffs and git.log→git.commits are listed as aliases.
-const EXPECTED_ROUTER_METHODS: usize = 356;
+const EXPECTED_ROUTER_METHODS: usize = 361;
 
 /// Golden count: fast-path methods (intercepted before router).
 const EXPECTED_FASTPATH_METHODS: usize = 56;
@@ -719,8 +719,13 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.update",
     "note.updateMetadata",
     "pairing.getInfo",
+    "pr.comment",
+    "pr.create",
+    "pr.merge",
     "pr.refresh",
+    "pr.review",
     "pr.status",
+    "pr.updateBranch",
     "prMonitor.cancel",
     "prMonitor.flush",
     "prMonitor.list",
@@ -1272,6 +1277,11 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "metrics.clearAgentStats",
     "metrics.getAllWorkspaceStats",
     "pairing.getInfo",
+    "pr.comment",
+    "pr.create",
+    "pr.merge",
+    "pr.review",
+    "pr.updateBranch",
     "prMonitor.cancel",
     "prMonitor.flush",
     "principal.list",
@@ -1874,6 +1884,26 @@ mod unbound_owner_only_methods {
             ("github.resolveThread", json!({ "threadId": "t" })),
             ("github.revoke", json!({})),
             ("github.unresolveThread", json!({ "threadId": "t" })),
+            (
+                "pr.comment",
+                json!({"workspaceId":ws,"prNumber":7,"title":"Fixture","sourceBranch":"feature","targetBranch":"main","body":"Test","verdict":"approve","expectedHeadSha":"abc"}),
+            ),
+            (
+                "pr.create",
+                json!({"workspaceId":ws,"prNumber":7,"title":"Fixture","sourceBranch":"feature","targetBranch":"main","body":"Test","verdict":"approve","expectedHeadSha":"abc"}),
+            ),
+            (
+                "pr.merge",
+                json!({"workspaceId":ws,"prNumber":7,"title":"Fixture","sourceBranch":"feature","targetBranch":"main","body":"Test","verdict":"approve","expectedHeadSha":"abc"}),
+            ),
+            (
+                "pr.review",
+                json!({"workspaceId":ws,"prNumber":7,"title":"Fixture","sourceBranch":"feature","targetBranch":"main","body":"Test","verdict":"approve","expectedHeadSha":"abc"}),
+            ),
+            (
+                "pr.updateBranch",
+                json!({"workspaceId":ws,"prNumber":7,"title":"Fixture","sourceBranch":"feature","targetBranch":"main","body":"Test","verdict":"approve","expectedHeadSha":"abc"}),
+            ),
             ("github.users.search", json!({ "query": "q" })),
             ("hook.cancel", json!({ "workspaceId": ws, "hookId": "h1" })),
             ("hook.runNow", json!({ "workspaceId": ws, "hookId": "h1" })),

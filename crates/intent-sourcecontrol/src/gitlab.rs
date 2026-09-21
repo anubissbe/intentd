@@ -24,6 +24,9 @@ use crate::{
     Error, Result, SourceControl,
 };
 
+mod actions;
+mod search;
+
 const MAX_PAGES: u32 = 100;
 const PIPELINE_CHECK: &str = "GitLab pipeline";
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -78,7 +81,9 @@ impl GitLabSourceControl {
             .api
             .join(path)
             .map_err(|_| Error::Config("invalid GitLab endpoint".into()))?;
-        if url.origin() != self.api.origin() || !url.path().starts_with(self.api.path()) {
+        if url.origin() != self.api.origin()
+            || (!url.path().starts_with(self.api.path()) && path != "../graphql")
+        {
             return Err(Error::Config(
                 "GitLab endpoint escaped configured instance".into(),
             ));
@@ -234,7 +239,12 @@ impl GitLabSourceControl {
         let checks = self.mr_checks(repo, head, policy).await?;
         Ok(MergeRequirementSignals {
             merge_state_status: optional(head, "detailed_merge_status"),
-            review_decision: approvals.and_then(approval_decision),
+            review_decision: if head["detailed_merge_status"] == "requested_changes" {
+                Some(ReviewDecision::ChangesRequested)
+            } else {
+                approvals.and_then(approval_decision)
+            },
+            is_in_merge_queue: self.merge_train_state(repo, head, policy).await?,
             checks,
             checks_known: policy
                 .is_some_and(|p| p["only_allow_merge_if_pipeline_succeeds"].is_boolean()),
@@ -744,8 +754,8 @@ impl SourceControl for GitLabSourceControl {
         ScCapabilities {
             draft_prs: true,
             squash_merge: true,
-            rebase_merge: false,
-            review_required_changes: false,
+            rebase_merge: true,
+            review_required_changes: true,
             check_runs: true,
             issues: true,
         }
@@ -876,9 +886,6 @@ impl SourceControl for GitLabSourceControl {
         to_pr(self.get(&mr(repo, number)).await?)
     }
     async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Page<PullRequest>> {
-        if !query.extra_repos.is_empty() {
-            return Err(Error::Unsupported("GitLab multi-project MR search".into()));
-        }
         let mut params = vec![("scope".into(), "all".into())];
         if let Some(state) = query.state {
             params.push((
@@ -901,31 +908,43 @@ impl SourceControl for GitLabSourceControl {
                 params.push((key.into(), value));
             }
         }
+        let mut involves = None;
         if let Some(involvement) = query.involvement {
             let user = self.get_user().await?;
             let key = match involvement {
                 PrInvolvement::Created => "author_username",
-                PrInvolvement::Assigned => "assignee_username",
+                PrInvolvement::Assigned => "assignee_username[]",
                 PrInvolvement::ReviewRequested => "reviewer_username",
                 PrInvolvement::Involves => {
-                    return Err(Error::Unsupported("GitLab involves-me MR search".into()))
+                    involves = Some(user.login.clone());
+                    ""
                 }
             };
-            params.push((key.into(), user.login));
+            if !key.is_empty() {
+                params.push((key.into(), user.login));
+            }
         }
-        map_page(
-            self.page(
-                &format!("{}/merge_requests", project(repo)),
+        let page = PageParams {
+            limit: query.limit.unwrap_or(30),
+            cursor: query.cursor,
+        };
+        let result = if !query.extra_repos.is_empty() || involves.is_some() {
+            self.search_projects(
+                repo,
+                &query.extra_repos,
+                "merge_requests",
                 params,
-                PageParams {
-                    limit: query.limit.unwrap_or(30),
-                    cursor: query.cursor,
-                },
+                page,
+                involves.as_deref(),
             )
-            .await?,
-            to_pr,
-        )
+            .await?
+        } else {
+            self.page(&format!("{}/merge_requests", project(repo)), params, page)
+                .await?
+        };
+        map_page(result, to_pr)
     }
+
     async fn update_pr(&self, repo: &RepoRef, number: u64, patch: PrPatch) -> Result<PullRequest> {
         let mut body = json!({});
         if let Some(draft) = patch.draft {
@@ -962,14 +981,28 @@ impl SourceControl for GitLabSourceControl {
         method: MergeMethod,
         options: MergeOptions,
     ) -> Result<MergeOutcome> {
-        if method == MergeMethod::Rebase {
-            return Err(Error::Unsupported(
-                "GitLab merge strategy is a project setting; rebase merge is not supported".into(),
+        let mut current = self.get_pr(repo, number).await?;
+        if options
+            .expected_head_sha
+            .as_ref()
+            .is_some_and(|sha| current.head_sha.as_ref() != Some(sha))
+        {
+            return Err(Error::Conflict(
+                "Merge request head changed since review; refresh and review before merging".into(),
             ));
         }
-        let head = self
-            .get_pr(repo, number)
-            .await?
+        if method == MergeMethod::Rebase {
+            let policy = self.get(&project(repo)).await?;
+            if policy["merge_method"] != "ff" {
+                return Err(Error::Config("Rebase merge requires GitLab's fast-forward project merge method; the project policy was not changed".into()));
+            }
+            let reviewed = current.head_sha.clone();
+            current = self.rebase_branch(repo, number).await?;
+            if current.head_sha != reviewed {
+                return Ok(MergeOutcome { merged: false, sha: current.head_sha, message: "Rebase completed. Review the updated head and merge again; no merge was performed.".into() });
+            }
+        }
+        let head = current
             .head_sha
             .ok_or_else(|| Error::Conflict("GitLab MR head SHA is not ready".into()))?;
         let mut body = json!({"sha": head, "squash": method == MergeMethod::Squash});
@@ -1020,8 +1053,8 @@ impl SourceControl for GitLabSourceControl {
             required_checks_passed: checks_passed,
         })
     }
-    async fn update_branch(&self, _repo: &RepoRef, _number: u64) -> Result<()> {
-        Err(Error::Unsupported("GitLab branch update cannot faithfully emulate a base-branch merge; rebase explicitly in Git".into()))
+    async fn update_branch(&self, repo: &RepoRef, number: u64) -> Result<()> {
+        self.rebase_branch(repo, number).await.map(|_| ())
     }
     async fn submit_review(
         &self,
@@ -1031,9 +1064,19 @@ impl SourceControl for GitLabSourceControl {
         body: Option<String>,
     ) -> Result<Review> {
         match verdict {
-            ReviewVerdict::RequestChanges => Err(Error::Unsupported(
-                "GitLab request-changes reviews are not supported by this adapter".into(),
-            )),
+            ReviewVerdict::RequestChanges => {
+                let user = self.get_user().await?;
+                self.request_changes(repo, number).await?;
+                let note = self
+                    .review_summary(repo, number, body.as_deref(), "change request")
+                    .await?;
+                Ok(Review {
+                    author: user.login,
+                    verdict,
+                    body: note.as_ref().map(|n| n.body.clone()),
+                    submitted_at: note.map(|n| n.created_at).unwrap_or_default(),
+                })
+            }
             ReviewVerdict::Comment => {
                 let body =
                     body.ok_or_else(|| Error::Config("a comment review needs text".into()))?;
@@ -1046,12 +1089,6 @@ impl SourceControl for GitLabSourceControl {
                 })
             }
             ReviewVerdict::Approve => {
-                if body.as_deref().is_some_and(|text| !text.is_empty()) {
-                    return Err(Error::Unsupported(
-                        "GitLab approval with a body is not atomic; post the comment separately"
-                            .into(),
-                    ));
-                }
                 let head = self
                     .get_pr(repo, number)
                     .await?
@@ -1069,10 +1106,13 @@ impl SourceControl for GitLabSourceControl {
                     .iter()
                     .find(|entry| entry["user"]["username"] == user.login)
                     .ok_or_else(|| Error::Decode("GitLab did not confirm the approval".into()))?;
+                let note = self
+                    .review_summary(repo, number, body.as_deref(), "approval")
+                    .await?;
                 Ok(Review {
                     author: user.login,
                     verdict,
-                    body: None,
+                    body: note.map(|n| n.body),
                     submitted_at: optional(approval, "approved_at").unwrap_or_default(),
                 })
             }
@@ -1082,6 +1122,10 @@ impl SourceControl for GitLabSourceControl {
         approval_reviews(&self.get(&format!("{}/approvals", mr(repo, number))).await?)
     }
     async fn review_decision(&self, repo: &RepoRef, number: u64) -> Result<Option<ReviewDecision>> {
+        let head = self.get(&mr(repo, number)).await?;
+        if head["detailed_merge_status"] == "requested_changes" {
+            return Ok(Some(ReviewDecision::ChangesRequested));
+        }
         Ok(approval_decision(
             &self.get(&format!("{}/approvals", mr(repo, number))).await?,
         ))
@@ -1389,11 +1433,6 @@ impl SourceControl for GitLabSourceControl {
         )
     }
     async fn list_issues(&self, repo: &RepoRef, query: IssueQuery) -> Result<Page<Issue>> {
-        if !query.extra_repos.is_empty() {
-            return Err(Error::Unsupported(
-                "GitLab multi-project issue search".into(),
-            ));
-        }
         let mut params = vec![("scope".into(), "all".into())];
         if let Some(state) = query.state {
             params.push((
@@ -1411,18 +1450,39 @@ impl SourceControl for GitLabSourceControl {
         if let Some(search) = query.search {
             params.push(("search".into(), search));
         }
-        map_page(
-            self.page(
-                &format!("{}/issues", project(repo)),
+        let mut involves = None;
+        if let Some(involvement) = query.involvement {
+            let user = self.get_user().await?;
+            match involvement {
+                PrInvolvement::Created => params.push(("author_username".into(), user.login)),
+                PrInvolvement::Assigned => params.push(("assignee_username[]".into(), user.login)),
+                PrInvolvement::Involves => involves = Some(user.login),
+                PrInvolvement::ReviewRequested => {
+                    return Err(Error::Config(
+                        "Issues have no review-requested filter".into(),
+                    ))
+                }
+            }
+        }
+        let page = PageParams {
+            limit: query.limit.unwrap_or(30),
+            cursor: query.cursor,
+        };
+        let result = if !query.extra_repos.is_empty() || involves.is_some() {
+            self.search_projects(
+                repo,
+                &query.extra_repos,
+                "issues",
                 params,
-                PageParams {
-                    limit: query.limit.unwrap_or(30),
-                    cursor: query.cursor,
-                },
+                page,
+                involves.as_deref(),
             )
-            .await?,
-            to_issue,
-        )
+            .await?
+        } else {
+            self.page(&format!("{}/issues", project(repo)), params, page)
+                .await?
+        };
+        map_page(result, to_issue)
     }
 }
 

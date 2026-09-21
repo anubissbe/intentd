@@ -3840,8 +3840,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.status`: the active PR's state, mergeability, and summary. Requires an
-    /// active PR; otherwise `-32603` (PROTOCOL §5.7).
+    /// Repository-scoped, owner-authorized PR/MR writes (PROTOCOL §5.7).
+    fn pr_mutation(
+        &self,
+        workspace_id: WorkspaceId,
+        operation: String,
+        input: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, operation, input);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_mutation not implemented".into(),
+            ))
+        })
+    }
+
+    /// `pr.status`: active PR state, mergeability and summary; requires an active PR.
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = workspace_id;
         Box::pin(async {
@@ -4080,6 +4094,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.pulls.merge`: `PUT /repos/{owner}/{repo}/pulls/{number}/merge`
     /// → `{ merged, message, sha? }`.
+    #[expect(clippy::too_many_arguments)] // Preserve the existing flat legacy RPC signature.
     fn github_pulls_merge(
         &self,
         owner: String,
@@ -4088,6 +4103,7 @@ pub trait WorkspaceApi: Send + Sync {
         merge_method: Option<String>,
         commit_title: Option<String>,
         commit_message: Option<String>,
+        expected_head_sha: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             owner,
@@ -4096,6 +4112,7 @@ pub trait WorkspaceApi: Send + Sync {
             merge_method,
             commit_title,
             commit_message,
+            expected_head_sha,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -6010,6 +6027,7 @@ pub trait WorkspaceApi: Send + Sync {
         merge_method: Option<String>,
         commit_title: Option<String>,
         commit_message: Option<String>,
+        expected_head_sha: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -6017,6 +6035,7 @@ pub trait WorkspaceApi: Send + Sync {
             merge_method,
             commit_title,
             commit_message,
+            expected_head_sha,
         );
         Box::pin(async {
             Err(Error::Internal(

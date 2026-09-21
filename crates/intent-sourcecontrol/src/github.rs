@@ -1771,6 +1771,9 @@ impl SourceControl for GitHubSourceControl {
         if let Some(message) = options.commit_message {
             body.insert("commit_message".into(), json!(message));
         }
+        if let Some(sha) = options.expected_head_sha {
+            body.insert("sha".into(), json!(sha));
+        }
         let route = Self::repo_path(repo, &format!("/pulls/{number}/merge"));
         let v: Value = self.client.put(route, Some(&Value::Object(body))).await?;
         Ok(MergeOutcome {
@@ -2074,7 +2077,7 @@ impl SourceControl for GitHubSourceControl {
         let per_page = rest_per_page(query.limit.unwrap_or(30));
         let page_no = rest_page(query.cursor.as_deref());
         let search = search_term(query.search.as_deref());
-        if search.is_some() || !query.extra_repos.is_empty() {
+        if search.is_some() || !query.extra_repos.is_empty() || query.involvement.is_some() {
             // The `/issues` listing cannot express free text or a multi-repo
             // scope, so route those queries through `/search/issues` (mirror
             // of the `list_prs` involvement branch).
@@ -2085,7 +2088,19 @@ impl SourceControl for GitHubSourceControl {
             let items = self
                 .search_issues_scoped(
                     &scope,
-                    |repos| build_issue_search_query(repos, state, labels, search),
+                    |repos| {
+                        let mut q = build_issue_search_query(repos, state, labels, search);
+                        if let Some(involvement) = query.involvement {
+                            let key = match involvement {
+                                PrInvolvement::Created => "author",
+                                PrInvolvement::Assigned => "assignee",
+                                PrInvolvement::Involves => "involves",
+                                PrInvolvement::ReviewRequested => "review-requested",
+                            };
+                            let _ = write!(q, " {key}:@me");
+                        }
+                        q
+                    },
                     per_page,
                     page_no,
                 )
