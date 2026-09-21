@@ -186,6 +186,26 @@ async fn boot() -> Fixture {
                     break;
                 }
             }
+            let header_end = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let headers = String::from_utf8(data[..header_end].to_vec()).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while data.len() < header_end + length {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                data.extend_from_slice(&chunk[..count]);
+            }
+            let payload: Value = if length > 0 {
+                serde_json::from_slice(&data[header_end..header_end + length]).unwrap()
+            } else {
+                Value::Null
+            };
             let request = String::from_utf8(data).unwrap();
             let line = request.lines().next().unwrap().to_string();
             captured.lock().unwrap().push(line.clone());
@@ -213,7 +233,30 @@ async fn boot() -> Fixture {
             } else {
                 mock_instance.clone()
             };
-            let body = if path == "/github/user" {
+            let body = if path == "/api/graphql" {
+                assert_eq!(
+                    payload["variables"]["input"]["projectPath"],
+                    "euraika/platform/widget"
+                );
+                assert_eq!(payload["variables"]["input"]["iid"], "7");
+                json!({"data":{"mergeRequestRequestChanges":{"errors":[],"mergeRequest":{"iid":"7"}}}})
+            } else if path.ends_with("/merge_requests/7/notes") {
+                assert_eq!(payload["body"], "Review feedback");
+                json!({"id":12,"body":"Review feedback","author":{"username":"bert-fixture"},"created_at":"2026-09-21T10:00:00Z"})
+            } else if path.ends_with("/merge_requests/7/rebase") {
+                assert!(line.starts_with("PUT "));
+                json!({"rebase_in_progress":true})
+            } else if path.ends_with("/merge_requests/7/merge") {
+                assert_eq!(payload["sha"], "abc123");
+                assert_eq!(payload["squash"], true);
+                json!({"state":"merged","merge_commit_sha":"merged123"})
+            } else if path.ends_with("/merge_requests") && line.starts_with("POST ") {
+                assert_eq!(
+                    payload,
+                    json!({"title":"Native create","description":"Review feedback","source_branch":"feature","target_branch":"main"})
+                );
+                json!({"iid":8,"title":"Native create","state":"opened","created_at":"2026-09-21T10:00:00Z","updated_at":"2026-09-21T10:00:00Z","source_branch":"feature","target_branch":"main","author":{"username":"bert-fixture"},"web_url":format!("{response_instance}/euraika/platform/widget/-/merge_requests/8")})
+            } else if path == "/github/user" {
                 json!({"id":1,"login":"github-fixture","avatar_url":"https://github.com/avatar.png","html_url":"https://github.com/github-fixture"})
             } else if path == "/github/user/repos" {
                 json!([{"id":42,"name":"widget","full_name":"euraika/widget","owner":{"login":"euraika"},"default_branch":"main","private":true,"html_url":"https://github.com/euraika/widget"}])
@@ -221,7 +264,7 @@ async fn boot() -> Fixture {
                 json!({"id": 12, "username": if raw_path.starts_with("/second/") { "second-fixture" } else { "bert-fixture" }, "name": "Bert", "avatar_url": null})
             } else if path.ends_with("/merge_requests/7") {
                 json!({"id": 99, "iid": 7, "project_id": 42, "title": "GitLab native MR", "description": "Fixture", "state": "opened", "draft": false,
-                    "source_branch": "feature", "target_branch": "main", "sha": "abc123", "detailed_merge_status": "mergeable", "has_conflicts": false,
+                    "source_branch": "feature", "target_branch": "main", "sha": "abc123", "rebase_in_progress": false, "detailed_merge_status": "mergeable", "has_conflicts": false,
                     "author": {"username": "bert-fixture"}, "web_url": format!("{response_instance}/euraika/platform/widget/-/merge_requests/7"),
                     "created_at": "2026-09-19T12:00:00Z", "updated_at": "2026-09-19T12:01:00Z"})
             } else if path.ends_with("/repository/branches") {
@@ -625,4 +668,36 @@ async fn gitlab_merge_request_url_creates_workspace_with_native_context() {
         conflict.get("error").is_some(),
         "same host does not authorize replacing a workspace's repository"
     );
+    let created_pr = wss_rpc(&mut ws, 10, "pr.create", json!({"workspaceId":workspace["id"],"title":"Native create","body":"Review feedback","sourceBranch":"feature","targetBranch":"main"})).await;
+    assert_eq!(created_pr["pullRequest"]["number"], 8);
+    let comment = wss_rpc(
+        &mut ws,
+        11,
+        "pr.comment",
+        json!({"workspaceId":workspace["id"],"prNumber":7,"body":"Review feedback"}),
+    )
+    .await;
+    assert_eq!(comment["comment"]["body"], "Review feedback");
+    let review = wss_rpc(&mut ws, 12, "pr.review", json!({"workspaceId":workspace["id"],"prNumber":7,"verdict":"request-changes","body":"Review feedback"})).await;
+    assert_eq!(review["review"]["verdict"], "request-changes");
+    let updated = wss_rpc(
+        &mut ws,
+        13,
+        "pr.updateBranch",
+        json!({"workspaceId":workspace["id"],"prNumber":7}),
+    )
+    .await;
+    assert_eq!(updated["updated"], true);
+    let stale = wss_rpc_envelope(&mut ws, 14, "pr.merge", json!({"workspaceId":workspace["id"],"prNumber":7,"expectedHeadSha":"old","mergeMethod":"squash"})).await;
+    assert!(stale.get("error").is_some());
+    let merged = wss_rpc(&mut ws, 15, "pr.merge", json!({"workspaceId":workspace["id"],"prNumber":7,"expectedHeadSha":"abc123","mergeMethod":"squash"})).await;
+    assert_eq!(merged["merged"], true);
+    let unknown = wss_rpc_envelope(
+        &mut ws,
+        16,
+        "pr.comment",
+        json!({"workspaceId":"missing","prNumber":7,"body":"must never reach the forge"}),
+    )
+    .await;
+    assert!(unknown.get("error").is_some());
 }

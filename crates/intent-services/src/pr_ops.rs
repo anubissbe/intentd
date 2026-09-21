@@ -1133,6 +1133,116 @@ pub(crate) fn merge_requirements(
 /// still yields a usable checklist. The one exception is quota exhaustion:
 /// [`Error::RateLimited`] from ANY sub-read propagates (see
 /// [`merge_requirements_for_pr`]).
+/// Shared owner-authorized front door for native desktop and agent PR/MR writes.
+impl crate::Services {
+    pub(crate) async fn perform_pr_mutation(
+        &self,
+        workspace_id: intent_core::WorkspaceId,
+        operation: &str,
+        input: serde_json::Value,
+    ) -> intent_core::Result<serde_json::Value> {
+        use intent_sourcecontrol::{CommentAnchor, MergeOptions, NewPullRequest, ReviewVerdict};
+        use serde::Deserialize;
+        use serde_json::json;
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Input {
+            repo: Option<String>,
+            pr_number: Option<u64>,
+            title: Option<String>,
+            body: Option<String>,
+            source_branch: Option<String>,
+            target_branch: Option<String>,
+            #[serde(default)]
+            draft: bool,
+            verdict: Option<ReviewVerdict>,
+            anchor: Option<CommentAnchor>,
+            merge_method: Option<String>,
+            expected_head_sha: Option<String>,
+        }
+        let input: Input = serde_json::from_value(input).map_err(|_| {
+            intent_core::Error::InvalidParams("Invalid PR operation parameters".into())
+        })?;
+        let required = |value: Option<String>, name: &str| {
+            value
+                .filter(|v| !v.trim().is_empty())
+                .ok_or_else(|| intent_core::Error::InvalidParams(format!("{name} is required")))
+        };
+        self.require_owner(&workspace_id, "pr mutation").await?;
+        let ws = self.store.get_workspace(&workspace_id).await?;
+        self.ensure_workspace_source_control(&ws).await?;
+        let repo = if let Some(slug) = input.repo {
+            let (owner, name) = parse_repo_slug(&slug)?;
+            intent_sourcecontrol::RepoRef::new(owner, name)
+        } else {
+            repo_of(&ws)?
+        };
+        let sc = self.resolve_workspace_source_control(&ws).await?;
+        if operation == "create" {
+            let pr = sc
+                .create_pr(
+                    &repo,
+                    NewPullRequest {
+                        title: required(input.title, "title")?,
+                        body: input.body,
+                        source_branch: required(input.source_branch, "sourceBranch")?,
+                        target_branch: required(input.target_branch, "targetBranch")?,
+                        draft: input.draft,
+                    },
+                )
+                .await
+                .map_err(map_sc_err)?;
+            return Ok(json!({"pullRequest": pr}));
+        }
+        let number = input
+            .pr_number
+            .filter(|n| *n > 0)
+            .ok_or_else(|| intent_core::Error::InvalidParams("prNumber must be positive".into()))?;
+        match operation {
+            "comment" => sc
+                .add_comment(&repo, number, &required(input.body, "body")?, input.anchor)
+                .await
+                .map(|comment| json!({"comment":comment}))
+                .map_err(map_sc_err),
+            "review" => sc
+                .submit_review(
+                    &repo,
+                    number,
+                    input.verdict.ok_or_else(|| {
+                        intent_core::Error::InvalidParams("verdict is required".into())
+                    })?,
+                    input.body,
+                )
+                .await
+                .map(|review| json!({"review":review}))
+                .map_err(map_sc_err),
+            "updateBranch" => sc
+                .update_branch(&repo, number)
+                .await
+                .map(|()| json!({"updated":true}))
+                .map_err(map_sc_err),
+            "merge" => {
+                let sha = required(input.expected_head_sha, "expectedHeadSha")?;
+                sc.merge_pr(
+                    &repo,
+                    number,
+                    validate_merge_method(input.merge_method.as_deref())?,
+                    MergeOptions {
+                        expected_head_sha: Some(sha),
+                        ..MergeOptions::default()
+                    },
+                )
+                .await
+                .map(|outcome| json!(outcome))
+                .map_err(map_sc_err)
+            }
+            _ => Err(intent_core::Error::InvalidParams(
+                "Unknown PR operation".into(),
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn fetch_merge_requirements(
     sc: &dyn SourceControl,

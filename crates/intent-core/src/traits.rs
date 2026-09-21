@@ -3840,8 +3840,22 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `pr.status`: the active PR's state, mergeability, and summary. Requires an
-    /// active PR; otherwise `-32603` (PROTOCOL §5.7).
+    /// Repository-scoped, owner-authorized PR/MR writes (PROTOCOL §5.7).
+    fn pr_mutation(
+        &self,
+        workspace_id: WorkspaceId,
+        operation: String,
+        input: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, operation, input);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::pr_mutation not implemented".into(),
+            ))
+        })
+    }
+
+    /// `pr.status`: active PR state, mergeability and summary; requires an active PR.
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = workspace_id;
         Box::pin(async {

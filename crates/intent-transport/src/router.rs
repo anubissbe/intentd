@@ -2860,6 +2860,36 @@ async fn dispatch(
             let r = api.pr_status(ws).await.map_err(domain_to_rpc)?;
             Ok(r)
         }
+        "pr.create" => {
+            let ws = require_ws_note(params)?;
+            api.pr_mutation(ws, "create".into(), Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "pr.comment" => {
+            let ws = require_ws_note(params)?;
+            api.pr_mutation(ws, "comment".into(), Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "pr.review" => {
+            let ws = require_ws_note(params)?;
+            api.pr_mutation(ws, "review".into(), Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "pr.merge" => {
+            let ws = require_ws_note(params)?;
+            api.pr_mutation(ws, "merge".into(), Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "pr.updateBranch" => {
+            let ws = require_ws_note(params)?;
+            api.pr_mutation(ws, "updateBranch".into(), Value::Object(params.clone()))
+                .await
+                .map_err(domain_to_rpc)
+        }
         "pr.refresh" => {
             let ws = require_ws_note(params)?;
             let r = api.pr_refresh(ws).await.map_err(workspace_err)?;

@@ -29581,6 +29581,18 @@ impl WorkspaceApi for Services {
     // workspace (else `-32603`). Pure mapping/aggregation lives in `pr_ops`.
     // ========================================================================
 
+    fn pr_mutation(
+        &self,
+        workspace_id: WorkspaceId,
+        operation: String,
+        input: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.perform_pr_mutation(workspace_id, &operation, input)
+                .await
+        })
+    }
+
     fn pr_status(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         let source_control_services = self.clone();

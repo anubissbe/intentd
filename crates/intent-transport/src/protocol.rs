@@ -624,10 +624,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Protocol version exposed on the wire (§5.17, §5.7).
-// 10.4 adds 27 repository-scoped sourceControl connection/browse methods,
+// 10.5 adds workspace-scoped PR mutations and 27 repository-scoped sourceControl connection/browse methods,
 // plus path/username attributes for the UDS Git credential helper. Legacy
 // github.* remains GitHub-specific. 356 router + 56 fast-path + 2 aliases.
-pub const PROTOCOL_VERSION: &str = "10.4";
+pub const PROTOCOL_VERSION: &str = "10.5";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

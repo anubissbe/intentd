@@ -163,6 +163,12 @@ pub(crate) static V2_6: InstructionSet = InstructionSet {
     ..V2_2
 };
 
+/// Forge-aware guidance is versioned so existing sessions keep their doctrine.
+pub(crate) static V2_7: InstructionSet = InstructionSet {
+    common: instr!("v2.7", "common"),
+    ..V2_6
+};
+
 /// Utility agents that don't get the workspace instruction layer (port of
 /// `UTILITY_AGENTS`).
 fn is_utility_agent(agent_type: &str) -> bool {
