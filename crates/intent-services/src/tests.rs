@@ -32992,7 +32992,6 @@ mod file_ops_service {
         }
     }
 
-    #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
     /// Containment integration test: delegate an agent with isolation=cow, perform a
     /// file write through the agent-scoped ops path (`caller_agent_id` → `resolve_root`),
     /// and assert the write landed in the sandbox and the user's directory is untouched.
