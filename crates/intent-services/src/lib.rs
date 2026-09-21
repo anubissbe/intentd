@@ -29969,6 +29969,7 @@ impl WorkspaceApi for Services {
         merge_method: Option<String>,
         commit_title: Option<String>,
         commit_message: Option<String>,
+        expected_head_sha: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let source_control_services = self.clone();
         Box::pin(async move {
@@ -29982,6 +29983,7 @@ impl WorkspaceApi for Services {
                     number,
                     method,
                     intent_sourcecontrol::MergeOptions {
+                        expected_head_sha,
                         commit_title,
                         commit_message,
                     },
@@ -30117,6 +30119,7 @@ impl WorkspaceApi for Services {
                 .list_issues(
                     &repo_ref,
                     intent_sourcecontrol::IssueQuery {
+                        involvement: None,
                         state: Some(state),
                         labels,
                         search: None,
@@ -30153,14 +30156,9 @@ impl WorkspaceApi for Services {
         let source_control_services = self.clone();
         Box::pin(async move {
             Self::require_administrator("github.issuesSearch")?;
-            // Validate `filter` against the issues value set from PROTOCOL §5
-            // (no PR-only `review-requested`). The host-agnostic engine
-            // cannot express `@me` involvement for issues (v1 limitation —
-            // that needs an involvement clause on `IssueQuery`); a free-text
-            // `query` and/or `repos` extras route through the engine's
-            // `GET /search/issues` path, and without either the search
-            // degrades to the repo-issue listing filtered by state.
+            // Issues share the involvement filters except review-requested.
             github_ops::parse_issue_filter(filter.as_deref())?;
+            let involvement = github_ops::parse_pr_involvement(filter.as_deref())?;
             let search = github_ops::normalize_search_query(query);
             let state = match state {
                 Some(s) => github_ops::parse_issue_state(Some(s.as_str()))?,
@@ -30175,6 +30173,7 @@ impl WorkspaceApi for Services {
                 .list_issues(
                     &repo_ref,
                     intent_sourcecontrol::IssueQuery {
+                        involvement,
                         state: Some(state),
                         labels: None,
                         search,
@@ -31862,6 +31861,7 @@ impl WorkspaceApi for Services {
         merge_method: Option<String>,
         commit_title: Option<String>,
         commit_message: Option<String>,
+        expected_head_sha: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let svc = self.clone();
         Box::pin(async move {
@@ -31872,6 +31872,7 @@ impl WorkspaceApi for Services {
                 merge_method,
                 commit_title,
                 commit_message,
+                expected_head_sha,
             )
             .await
         })
@@ -33192,6 +33193,7 @@ impl Services {
         merge_method: Option<String>,
         commit_title: Option<String>,
         commit_message: Option<String>,
+        expected_head_sha: Option<String>,
     ) -> Result<serde_json::Value> {
         let method = pr_ops::validate_merge_method(merge_method.as_deref())?;
         let mut ws = self.store.get_workspace(&workspace_id).await.map_err(|_| {
@@ -33201,6 +33203,7 @@ impl Services {
         self.ensure_workspace_source_control(&ws).await?;
         let sc = self.resolve_workspace_source_control(&ws).await?;
         let options = intent_sourcecontrol::MergeOptions {
+            expected_head_sha,
             commit_title,
             commit_message,
         };

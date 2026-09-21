@@ -929,3 +929,64 @@ async fn pr_observation_counts_match_the_per_signal_reads_past_their_ceilings() 
     );
     assert_eq!(tally.unresolved, paged_unresolved);
 }
+
+#[tokio::test]
+async fn issue_involvement_filters_reach_the_github_search_api() {
+    use intent_sourcecontrol::PrInvolvement;
+    for (involvement, qualifier) in [
+        (PrInvolvement::Created, "author:@me"),
+        (PrInvolvement::Assigned, "assignee:@me"),
+        (PrInvolvement::Involves, "involves:@me"),
+    ] {
+        let mock = spawn_mock_with(Arc::new(move |request| {
+            let target = request_target(request);
+            assert!(target.starts_with("/search/issues?"), "{target}");
+            assert!(target.contains(qualifier), "{target}");
+            assert!(target.contains("repo:team/project"), "{target}");
+            (200, json!({"items": [], "total_count": 0}).to_string())
+        }))
+        .await;
+        let result = GitHubSourceControl::new("fixture-token", Some(&mock.base_uri))
+            .unwrap()
+            .list_issues(
+                &RepoRef::new("team", "project"),
+                IssueQuery {
+                    involvement: Some(involvement),
+                    ..IssueQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.items.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn github_merge_sends_the_reviewed_sha_guard() {
+    use intent_sourcecontrol::{MergeMethod, MergeOptions};
+    let mock = spawn_mock_with(Arc::new(|request| {
+        assert!(request.starts_with("PUT /repos/team/project/pulls/7/merge "));
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["sha"], "reviewed-head");
+        assert_eq!(body["merge_method"], "squash");
+        (
+            200,
+            json!({"merged":true,"message":"Merged","sha":"result-sha"}).to_string(),
+        )
+    }))
+    .await;
+    let result = GitHubSourceControl::new("fixture-token", Some(&mock.base_uri))
+        .unwrap()
+        .merge_pr(
+            &RepoRef::new("team", "project"),
+            7,
+            MergeMethod::Squash,
+            MergeOptions {
+                expected_head_sha: Some("reviewed-head".into()),
+                ..MergeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.merged);
+}

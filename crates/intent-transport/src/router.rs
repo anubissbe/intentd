@@ -3010,6 +3010,7 @@ async fn dispatch(
             let merge_method = opt_str(params, "mergeMethod");
             let commit_title = opt_str(params, "commitTitle");
             let commit_message = opt_str(params, "commitMessage");
+            let expected_head_sha = opt_str(params, "expectedHeadSha");
             let r = api
                 .github_pulls_merge(
                     owner,
@@ -3018,6 +3019,7 @@ async fn dispatch(
                     merge_method,
                     commit_title,
                     commit_message,
+                    expected_head_sha,
                 )
                 .await
                 .map_err(domain_to_rpc)?;
@@ -3587,7 +3589,14 @@ async fn dispatch(
             let commit_title = opt_str(params, "commitTitle");
             let commit_message = opt_str(params, "commitMessage");
             let r = api
-                .accept_changes_merge_pr(ws, pr_number, merge_method, commit_title, commit_message)
+                .accept_changes_merge_pr(
+                    ws,
+                    pr_number,
+                    merge_method,
+                    commit_title,
+                    commit_message,
+                    opt_str(params, "expectedHeadSha"),
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(r)

@@ -18803,7 +18803,7 @@ pub(crate) mod pr {
 
         // mergePR via the stubbed forge.
         let mg = svc
-            .accept_changes_merge_pr(ws.clone(), 7, Some("squash".into()), None, None)
+            .accept_changes_merge_pr(ws.clone(), 7, Some("squash".into()), None, None, None)
             .await
             .expect("merge");
         assert_eq!(mg["success"], true);
@@ -18835,7 +18835,7 @@ pub(crate) mod pr {
         .await;
         let before = svc.store().get_workspace(&ws).await.unwrap();
         let result = svc
-            .accept_changes_merge_pr(ws.clone(), 42, Some("squash".into()), None, None)
+            .accept_changes_merge_pr(ws.clone(), 42, Some("squash".into()), None, None, None)
             .await
             .expect("negative merge response");
         assert_eq!(result["success"], false);
@@ -19314,6 +19314,7 @@ pub(crate) mod pr {
                 "r".into(),
                 42,
                 Some("squash".into()),
+                None,
                 None,
                 None,
             )

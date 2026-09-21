@@ -4080,6 +4080,7 @@ pub trait WorkspaceApi: Send + Sync {
 
     /// `github.pulls.merge`: `PUT /repos/{owner}/{repo}/pulls/{number}/merge`
     /// → `{ merged, message, sha? }`.
+    #[expect(clippy::too_many_arguments)] // Preserve the existing flat legacy RPC signature.
     fn github_pulls_merge(
         &self,
         owner: String,
@@ -4088,6 +4089,7 @@ pub trait WorkspaceApi: Send + Sync {
         merge_method: Option<String>,
         commit_title: Option<String>,
         commit_message: Option<String>,
+        expected_head_sha: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             owner,
@@ -4096,6 +4098,7 @@ pub trait WorkspaceApi: Send + Sync {
             merge_method,
             commit_title,
             commit_message,
+            expected_head_sha,
         );
         Box::pin(async {
             Err(Error::Internal(
@@ -6010,6 +6013,7 @@ pub trait WorkspaceApi: Send + Sync {
         merge_method: Option<String>,
         commit_title: Option<String>,
         commit_message: Option<String>,
+        expected_head_sha: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (
             workspace_id,
@@ -6017,6 +6021,7 @@ pub trait WorkspaceApi: Send + Sync {
             merge_method,
             commit_title,
             commit_message,
+            expected_head_sha,
         );
         Box::pin(async {
             Err(Error::Internal(

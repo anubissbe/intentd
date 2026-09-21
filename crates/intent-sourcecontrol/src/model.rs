@@ -222,6 +222,8 @@ pub struct PrQuery {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeOptions {
+    /// Head the user reviewed; providers reject a stale merge atomically.
+    pub expected_head_sha: Option<String>,
     pub commit_title: Option<String>,
     pub commit_message: Option<String>,
 }
@@ -352,6 +354,7 @@ pub struct Issue {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueQuery {
+    pub involvement: Option<PrInvolvement>,
     pub state: Option<String>,
     pub labels: Option<String>,
     /// Free-text search term; a non-blank value routes the listing through

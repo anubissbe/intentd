@@ -69,6 +69,15 @@ pub(crate) fn hit_repo(scope: &[RepoRef], html_url: &str) -> RepoRef {
     if scope.len() <= 1 {
         return primary;
     }
+    if let Some((project_url, _)) = html_url.split_once("/-/") {
+        if let Some(hit) = scope
+            .iter()
+            .filter(|repo| project_url.ends_with(&format!("/{}/{}", repo.owner, repo.name)))
+            .max_by_key(|repo| repo.owner.len())
+        {
+            return hit.clone();
+        }
+    }
     let Some(parsed) = repo_from_html_url(html_url) else {
         tracing::debug!(
             html_url,
@@ -569,6 +578,21 @@ mod tests {
         // Unparsable URLs fall back to the addressed repo.
         assert_eq!(hit_repo(&scope, "").name, "intent");
         assert_eq!(hit_repo(&scope, "https://github.com/only").name, "intent");
+    }
+
+    #[test]
+    fn attributes_gitlab_hits_without_installation_prefix_in_namespace() {
+        let scope = [
+            RepoRef::new("team", "first"),
+            RepoRef::new("team/platform", "camiel"),
+        ];
+        assert_eq!(
+            hit_repo(
+                &scope,
+                "https://git.example:8443/gitlab/team/platform/camiel/-/issues/7"
+            ),
+            scope[1]
+        );
     }
 
     #[test]
