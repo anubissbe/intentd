@@ -697,10 +697,10 @@ async fn wss_rpc_raw(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Va
     .expect("response timeout")
 }
 
-/// Protocol v5.0 regression (monorepo#1506): the 11 removed `pr.*` methods
-/// fall through the router match to the normal unknown-method path — `-32601
-/// Method not found` over the wire — while `pr.status` / `pr.refresh` stay
-/// recognized (asserted by the other tests in this file).
+/// Protocol v5.0 regression (monorepo#1506): the nine legacy `pr.*` methods
+/// that remain retired return `-32601 Method not found` over the wire.
+/// Protocol v10.5 restored `pr.merge` / `pr.updateBranch` as native writes;
+/// those are checked with the other supported writes below.
 #[intent_test_macros::daemon_test]
 async fn removed_pr_methods_return_method_not_found_over_wss() {
     let fx = boot(StubForge::default()).await;
@@ -712,8 +712,6 @@ async fn removed_pr_methods_return_method_not_found_over_wss() {
         "pr.listReviewComments",
         "pr.getReviews",
         "pr.listCheckRuns",
-        "pr.merge",
-        "pr.updateBranch",
         "pr.postComment",
         "pr.replyToReviewComment",
         "pr.resolveThread",
@@ -734,6 +732,37 @@ async fn removed_pr_methods_return_method_not_found_over_wss() {
         assert_eq!(
             err["message"], "Method not found",
             "{method} error envelope: {resp}"
+        );
+    }
+}
+
+/// Native protocol v10.5 writes must reach parameter validation over WSS,
+/// rather than fall through to the retired-method path. Successful writes
+/// against a synthetic forge are covered in `e2e_wss_gitlab`.
+#[intent_test_macros::daemon_test]
+async fn native_pr_write_methods_validate_params_over_wss() {
+    let fx = boot(StubForge::default()).await;
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    for (id, method) in [
+        "pr.create",
+        "pr.comment",
+        "pr.review",
+        "pr.merge",
+        "pr.updateBranch",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let resp = wss_rpc_raw(
+            &mut rpc,
+            i64::try_from(id).expect("value fits in i64") + 1,
+            method,
+            json!({}),
+        )
+        .await;
+        assert_eq!(
+            resp["error"]["code"], -32602,
+            "{method} must validate its required workspace: {resp}"
         );
     }
 }
